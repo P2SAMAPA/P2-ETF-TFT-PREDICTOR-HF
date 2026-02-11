@@ -17,15 +17,14 @@ from polygon import RESTClient
 
 ETFS = ['TLT', 'VCLT', 'TBT', 'VNQ', 'SLV', 'GLD', 'PFF', 'MBB']
 
+# Updated: Use only reliably supported Polygon tickers (indices + futures + ETFs as proxies)
 SIGNAL_TICKERS = [
-    'I:VIX',          # VIX
-    'I:MOVE',         # MOVE index
-    'I:SKEW',         # SKEW index
-    'I:PCALL',        # Put/Call ratio
-    'I:US10Y',        # 10Y Treasury
-    'I:US2Y',         # 2Y Treasury
-    'BAMLH0A0HYM2',   # ICE BofA US High Yield Index Option-Adjusted Spread
-    'C:HG'            # Copper futures (for Gold/Copper ratio)
+    '^VIX',         # CBOE VIX index
+    'MOVE',         # MOVE index (if available; fallback empty if not)
+    'IEF',          # iShares 7-10 Year Treasury → proxy for ~10Y yield moves
+    'SHY',          # iShares 1-3 Year Treasury   → proxy for ~2Y/short end
+    'HYG',          # iShares High Yield Corp Bond → for credit spread proxy
+    'HG=F'          # Copper futures (continuous)
 ]
 
 ALL_TICKERS = ETFS + SIGNAL_TICKERS
@@ -36,7 +35,7 @@ ALL_TICKERS = ETFS + SIGNAL_TICKERS
 
 @st.cache_data(ttl=3600)  # cache 1 hour
 def fetch_data(start_date: str, end_date: str) -> pd.DataFrame:
-    client = RESTClient()  # API key should be in secrets.toml or env
+    client = RESTClient()  # API key from secrets.toml or env
     data = {}
     for ticker in ALL_TICKERS:
         try:
@@ -45,30 +44,51 @@ def fetch_data(start_date: str, end_date: str) -> pd.DataFrame:
             df['date'] = pd.to_datetime(df['timestamp'], unit='ms').dt.date
             df = df.set_index('date')[['close']].rename(columns={'close': ticker})
             data[ticker] = df
+            st.info(f"Fetched {ticker} successfully ({len(df)} rows)")
         except Exception as e:
-            st.warning(f"Failed to fetch {ticker}: {e}")
+            st.warning(f"Failed to fetch {ticker}: {str(e)}. Using empty series.")
+            data[ticker] = pd.Series(name=ticker)  # empty → avoids KeyError later
+
+    if not data:
+        st.error("No data fetched at all. Check Polygon API key and connectivity.")
+        return pd.DataFrame()
+
     combined = pd.concat(data.values(), axis=1).sort_index()
     combined.index = pd.to_datetime(combined.index)
-    return combined.dropna(how='all')
+    return combined
 
 # ────────────────────────────────────────────────
-# Feature Engineering
+# Feature Engineering – using proxies
 # ────────────────────────────────────────────────
 
 def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    df['10Y_2Y_spread'] = df['I:US10Y'] - df['I:US2Y']
-    df['Credit_Spread'] = df['BAMLH0A0HYM2']
-    df['Gold_Copper_ratio'] = df['GLD'] / df['C:HG']
 
-    # Lags and moving averages
+    # Proxy for 10Y-2Y spread: longer-duration ETF minus shorter-duration
+    if 'IEF' in df.columns and 'SHY' in df.columns:
+        df['10Y_2Y_proxy'] = df['IEF'] - df['SHY']   # level difference (price proxy for yield curve)
+        # Alternative: returns diff → df['10Y_2Y_proxy_ret'] = df['IEF'].pct_change() - df['SHY'].pct_change()
+
+    # Credit spread proxy: high-yield ETF minus Treasury ETF
+    if 'HYG' in df.columns and 'IEF' in df.columns:
+        df['Credit_Spread_proxy'] = df['HYG'] - df['IEF']
+
+    # Gold / Copper ratio
+    if 'GLD' in df.columns and 'HG=F' in df.columns:
+        df['Gold_Copper_ratio'] = df['GLD'] / df['HG=F']
+
+    # Lags and moving averages on all available columns
     for col in df.columns:
-        for lag in [1, 3, 5, 10]:
-            df[f'{col}_lag{lag}'] = df[col].shift(lag)
-        df[f'{col}_ma5']  = df[col].rolling(5).mean()
-        df[f'{col}_ma20'] = df[col].rolling(20).mean()
+        if col in ETFS + ['^VIX', 'MOVE']:  # focus on key signals + ETFs
+            for lag in [1, 3, 5, 10]:
+                df[f'{col}_lag{lag}'] = df[col].shift(lag)
+            df[f'{col}_ma5']  = df[col].rolling(5).mean()
+            df[f'{col}_ma20'] = df[col].rolling(20).mean()
 
-    return df.dropna()
+    # Fill gaps (macro data can be sparse) → forward then backward
+    df = df.ffill().bfill()
+
+    return df.dropna(how='all')  # keep rows with at least some data
 
 # ────────────────────────────────────────────────
 # LSTM Dataset & Model
@@ -85,8 +105,8 @@ class TimeSeriesDataset(Dataset):
 
     def __getitem__(self, idx):
         return (
-            torch.tensor(self.X[idx:idx+self.seq_len], dtype=torch.float32),
-            torch.tensor(self.y[idx+self.seq_len],   dtype=torch.float32)
+            torch.tensor(self.X[idx:idx + self.seq_len], dtype=torch.float32),
+            torch.tensor(self.y[idx + self.seq_len], dtype=torch.float32)
         )
 
 class LSTMForecaster(nn.Module):
@@ -120,12 +140,15 @@ def train_lstm(X_train, y_train, seq_len=30, epochs=40, batch_size=64):
 
     model.train()
     for epoch in range(epochs):
+        total_loss = 0
         for Xb, yb in loader:
             optimizer.zero_grad()
             pred = model(Xb)
             loss = criterion(pred, yb)
             loss.backward()
             optimizer.step()
+            total_loss += loss.item()
+        # st.write(f"Epoch {epoch+1}/{epochs} loss: {total_loss/len(loader):.6f}")
 
     return model, scaler_X, scaler_y
 
@@ -146,13 +169,13 @@ def run_backtest(df_oos, hold_days, tc_bps, retrain_every=5, seq_len=30):
         window_end = df_oos.index[i]
 
         # Retrain periodically
-        if (i == 0) or ((window_end - current_train_end).days >= retrain_every):
+        if (i == 0) or ((window_end - current_train_end).days >= retrain_every * hold_days):
             train_slice = df_full[df_full.index < window_end]
             if len(train_slice) < 200:
                 continue
             X_train = train_slice[features].values
-            y_train = train_slice[ETFS].pct_change(hold_days).dropna().values
-            if len(y_train) == 0:
+            y_train = train_slice[ETFS].pct_change(hold_days).iloc[seq_len:].values  # align
+            if len(y_train) < 10:
                 continue
             model, scX, scy = train_lstm(X_train, y_train, seq_len=seq_len)
             current_train_end = window_end
@@ -170,7 +193,7 @@ def run_backtest(df_oos, hold_days, tc_bps, retrain_every=5, seq_len=30):
             pred_scaled = model(seq_t).numpy()[0]
         pred_returns = scy.inverse_transform([pred_scaled])[0]
 
-        # Choose ETF with highest predicted return
+        # Choose ETF with highest predicted return (if positive)
         best_idx = np.argmax(pred_returns)
         best_etf = ETFS[best_idx]
         expected_ret = pred_returns[best_idx]
@@ -180,68 +203,70 @@ def run_backtest(df_oos, hold_days, tc_bps, retrain_every=5, seq_len=30):
             break
         start_price = df_oos[best_etf].iloc[i]
         end_price   = df_oos[best_etf].iloc[i + hold_days]
-        gross_ret = (end_price / start_price) - 1
+        gross_ret = (end_price / start_price) - 1 if start_price > 0 else 0
 
-        # Transaction cost (applied on entry)
+        # Transaction cost (applied on entry – simplistic)
         tc = tc_bps / 10000.0
-        net_ret = gross_ret - tc
+        net_ret = gross_ret - tc if expected_ret > 0 else 0  # only trade if predicted positive
 
         equity *= (1 + net_ret)
         equity_curve.append(equity)
         returns.append(net_ret)
-        positions.append(best_etf)
+        positions.append(best_etf if net_ret != 0 else "Cash")
 
     if not equity_curve:
         return 0.0, [], []
 
-    ann_ret = (equity ** (252 / (len(df_oos) / hold_days))) - 1 if equity > 0 else -1.0
+    days_in_period = (df_oos.index[-1] - df_oos.index[0]).days
+    ann_ret = (equity ** (365 / days_in_period)) - 1 if equity > 0 and days_in_period > 0 else -1.0
     return ann_ret, equity_curve, positions
 
 # ────────────────────────────────────────────────
 # Streamlit App
 # ────────────────────────────────────────────────
 
-st.title("ETF Momentum Forecasting Engine")
-st.caption("Long-only strategy — maximizes gross return (ignores risk)")
+st.title("ETF Macro Momentum Engine")
+st.caption("Long-only – return maximization using macro proxies & LSTM forecasts")
 
 # ── Controls ─────────────────────────────────────
 
-col1, col2, col3 = st.columns([2,2,2])
+col1, col2, col3 = st.columns(3)
 
 with col1:
     tc_bps = st.slider("Transaction costs (bps per trade)", 0, 100, 10, step=5)
 
 with col2:
-    hold_period = st.radio("Holding period", [1, 3, 5], index=2, horizontal=True)
+    hold_period = st.radio("Holding period (days)", [1, 3, 5], index=2, horizontal=True)
 
 with col3:
-    retrain_freq = st.radio("Retrain model every", [3, 5, 10], index=1, horizontal=True)
+    retrain_freq = st.radio("Retrain model every (periods)", [3, 5, 10], index=1, horizontal=True)
 
 # ── Data ─────────────────────────────────────────
 
-today = datetime(2026, 2, 11)           # as given
+today = datetime(2026, 2, 11)
 start_hist = "2010-01-01"
 oos_start  = "2021-01-01"
 
-with st.spinner("Loading market data from Polygon..."):
+with st.spinner("Loading market & macro proxy data from Polygon..."):
+    global df_full
     df_full = fetch_data(start_hist, today.strftime("%Y-%m-%d"))
     df_eng  = engineer_features(df_full)
 
 df_train = df_eng[df_eng.index < oos_start]
 df_oos   = df_eng[df_eng.index >= oos_start]
 
-st.caption(f"Training until {oos_start}  •  OOS period: {len(df_oos)} days")
+st.caption(f"Training data until {oos_start}  •  OOS period: ~{len(df_oos)} days")
 
 # ── Run backtest ─────────────────────────────────
 
 if st.button("Run Backtest", type="primary"):
-    with st.spinner(f"Running backtest — hold {hold_period}d, retrain every {retrain_freq}d..."):
-        ann_ret, equity_curve, _ = run_backtest(
+    with st.spinner(f"Backtesting – {hold_period}d hold, retrain every {retrain_freq} periods, {tc_bps} bps costs..."):
+        ann_ret, equity_curve, positions = run_backtest(
             df_oos, hold_days=hold_period, tc_bps=tc_bps,
             retrain_every=retrain_freq, seq_len=30
         )
 
-    st.subheader(f"Annualized Return (net of costs): **{ann_ret*100:.2f}%**")
+    st.subheader(f"Annualized Return (net): **{ann_ret*100:.2f}%**")
 
     if equity_curve:
         eq_series = pd.Series(equity_curve, index=df_oos.index[:len(equity_curve)])
@@ -254,10 +279,11 @@ if st.button("Run Backtest", type="primary"):
             line=dict(color='royalblue')
         ))
         fig.update_layout(
-            title=f"Equity Curve — {hold_period}-day hold, {tc_bps} bps costs",
-            yaxis_title="Cumulative Return (1 = start)",
-            xaxis_title="Date"
+            title=f"Equity Curve – {hold_period}d hold / {tc_bps} bps",
+            yaxis_title="Cumulative Wealth (1 = start)",
+            xaxis_title="Date",
+            template="plotly_dark"
         )
         st.plotly_chart(fig, use_container_width=True)
 
-    st.success("Backtest completed.")
+    st.success("Backtest finished.")

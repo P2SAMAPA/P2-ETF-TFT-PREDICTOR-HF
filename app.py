@@ -12,7 +12,7 @@ import interface
 import time
 
 # ==========================================
-# 1. THE MATH ENGINE
+# 1. THE MATH ENGINE (CLEAN OPTION A)
 # ==========================================
 class PPONetwork(nn.Module):
     def __init__(self, input_dim, action_dim):
@@ -26,13 +26,13 @@ class PPONetwork(nn.Module):
 
 def add_indicators(df, tickers):
     for t in tickers:
+        # RSI Calculation
         delta = df[t].diff()
         gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
         loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
         df[f'{t}_RSI'] = 100 - (100 / (1 + (gain / (loss + 1e-9))))
-        ema12 = df[t].ewm(span=12, adjust=False).mean()
-        ema26 = df[t].ewm(span=26, adjust=False).mean()
-        df[f'{t}_MACD'] = ema12 - ema26
+        # MACD Calculation
+        df[f'{t}_MACD'] = df[t].ewm(span=12).mean() - df[t].ewm(span=26).mean()
     return df.dropna()
 
 @st.cache_resource(ttl="1d")
@@ -53,7 +53,7 @@ def train_engine(etf_list):
     full_df = pd.concat([feat_df, vols.reindex(feat_df.index), macro, m_raw.reindex(feat_df.index).ffill()], axis=1).dropna()
     scaler = StandardScaler()
     
-    # Boundary definitions
+    # BOUNDARIES: Training stops Dec 2024, OOS starts Jan 2025
     train_end = "2024-12-31"
     oos_start = "2025-01-01"
     
@@ -74,7 +74,7 @@ def train_engine(etf_list):
 # ==========================================
 # 2. UPDATED INTERFACE EXECUTION
 # ==========================================
-st.set_page_config(page_title="Alpha Engine v7", layout="wide")
+st.set_page_config(page_title="Alpha Engine v7.1", layout="wide")
 tx_cost = st.sidebar.slider("Trading Cost (bps)", 0, 50, 10)
 
 etf_universe = ["TLT", "TBT", "VNQ", "SLV", "GLD"]
@@ -91,38 +91,38 @@ if engine:
     best_idx = np.argmax(raw_preds)
     top_pick = etf_universe[best_idx]
 
-    # --- PERFORMANCE ANALYTICS (JAN 2025 TO FEB 2026) ---
+    # --- MATH CORRECTION FOR 2025-2026 WINDOW ---
     oos_window = returns[top_pick].loc[oos_start:]
     wealth = (1 + oos_window).cumprod()
+    
+    # Exact days in the OOS window for correct annualization
     days_passed = len(oos_window)
-
-    # 1. Correct Annualization
-    # Formula: (1 + Total Return) ^ (252 / Days) - 1
     total_ret = wealth.iloc[-1] - 1
+    
+    # Formula: (1 + Total Return) ^ (252 / Actual Days) - 1
     ann_ret_val = ((1 + total_ret) ** (252 / days_passed)) - 1 if days_passed > 0 else 0
     
-    # 2. Sharpe Ratio Calculation (vs SOFR)
+    # Sharpe Ratio Calculation (vs SOFR)
     try:
         sofr = engine["fred"].get_series('SOFR', oos_start).reindex(oos_window.index).ffill()
         rf_daily = (sofr.mean() / 100) / 252
     except:
-        rf_daily = 0.05 / 252 # Fallback to 5%
+        rf_daily = 0.05 / 252 # 5% fallback
         
     excess_returns = oos_window - rf_daily
     sharpe_val = (excess_returns.mean() / excess_returns.std()) * np.sqrt(252) if excess_returns.std() != 0 else 0
 
-    # 3. Hit Ratio
+    # Hit Ratio
     hit_rate = (oos_window > 0).sum() / days_passed if days_passed > 0 else 0
 
-    # 4. Audit Table
+    # Verification Log (Fixed for 45 days)
     audit_df = pd.DataFrame({
         "Date": returns[top_pick].tail(45).index.strftime('%Y-%m-%d'),
         "Ticker": [top_pick]*45,
         "Net Return": [f"{v:.2%}" for v in returns[top_pick].tail(45).values]
     })
 
-    # --- UI LABEL FIXES ---
-    # We pass 'sharpe_val' as a string to the second argument
+    # Pass everything to the interface
     interface.render_main_output(
         top_pick, 
         f"{sharpe_val:.2f}", 

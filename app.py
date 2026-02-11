@@ -13,7 +13,7 @@ import interface
 import time
 
 # ==========================================
-# 1. THE MATH ENGINE (PPO + ENTROPY)
+# 1. THE MATH ENGINE (BACK TO STABLE VERSION)
 # ==========================================
 class PPONetwork(nn.Module):
     def __init__(self, input_dim, action_dim):
@@ -36,13 +36,12 @@ def train_engine(start_year, etf_list):
             raw_data = yf.download(etf_list, start=start_date, progress=False)['Close']
             if not raw_data.empty: break
         except:
-            time.sleep(2)
+            time.sleep(1)
     
     if raw_data is None or raw_data.empty:
-        st.error("Data download failed. Please refresh.")
         return None
 
-    # Fix: Explicitly handle pct_change and dropna
+    # Cleaning data
     returns_df = raw_data.ffill().pct_change().dropna()
     vols = returns_df.rolling(window=20).std().dropna()
     returns_df = returns_df.loc[vols.index]
@@ -50,47 +49,29 @@ def train_engine(start_year, etf_list):
     fred = Fred(api_key=os.getenv("FRED_API_KEY"))
     macro = pd.DataFrame(index=returns_df.index)
     macro['10Y2Y'] = fred.get_series('T10Y2Y', start_date).reindex(returns_df.index).ffill()
-    
     m_raw = yf.download(["^VIX", "^MOVE"], start=start_date, progress=False)['Close']
+    
     full_df = pd.concat([returns_df, vols, macro, m_raw.reindex(returns_df.index).ffill()], axis=1).dropna()
     
-    # --- DYNAMIC OOS PROTECTION ---
-    total_samples = len(full_df)
-    oos_size = 126 # 6 Months
-    # Ensure at least 252 days (1 year) for training
-    if total_samples - oos_size < 252:
-        oos_size = max(21, total_samples - 252) 
-    
+    # --- STABLE SPLIT LOGIC ---
+    oos_size = 126
+    if len(full_df) - oos_size < 100: # Safety buffer
+        oos_size = 60
+        
     train_df = full_df.iloc[:-oos_size]
     train_returns = returns_df.iloc[:-oos_size]
-    
-    # Validation for Empty Array
-    if train_df.empty:
-        st.error(f"Insufficient data for anchor {start_year}. Try an earlier year.")
-        return None
-
-    # Epoch Calculation
-    years_of_data = 2026 - start_year
-    n_epochs = int(np.clip(150 * (18 / max(years_of_data, 1)), 150, 1000))
     
     scaler = StandardScaler()
     scaled_train = scaler.fit_transform(train_df)
     
     agent = PPONetwork(scaled_train.shape[1], len(etf_list))
     optimizer = optim.Adam(agent.parameters(), lr=5e-4)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=n_epochs)
     
-    for epoch in range(n_epochs):
+    # Reverting to fixed 150 epochs for high-conviction momentum
+    for _ in range(150):
         idx = np.random.randint(0, len(scaled_train)-1, 64)
-        preds = agent(torch.FloatTensor(scaled_train[idx]))
-        targets = torch.FloatTensor(train_returns.values[idx])
-        
-        mse_loss = nn.MSELoss()(preds, targets)
-        probs = torch.softmax(preds, dim=1)
-        entropy = -torch.mean(torch.sum(probs * torch.log(probs + 1e-5), dim=1))
-        
-        loss = mse_loss - (0.02 * entropy) 
-        optimizer.zero_grad(); loss.backward(); optimizer.step(); scheduler.step()
+        loss = nn.MSELoss()(agent(torch.FloatTensor(scaled_train[idx])), torch.FloatTensor(train_returns.values[idx]))
+        optimizer.zero_grad(); loss.backward(); optimizer.step()
         
     tactical = XGBRegressor(n_estimators=100, max_depth=5, objective='reg:absoluteerror')
     tactical.fit(scaled_train[:-1], train_returns.shift(-1).dropna().mean(axis=1))
@@ -110,7 +91,6 @@ if engine:
     agent, returns, full_features = engine["agent"], engine["returns"], engine["full_features"]
     oos_size = engine["oos_size"]
 
-    # Inference
     agent.eval()
     curr_state_scaled = engine["scaler"].transform(full_features.tail(1))
     raw_preds = agent(torch.FloatTensor(curr_state_scaled)).detach().numpy()[0]
@@ -129,7 +109,7 @@ if engine:
         best = pd.DataFrame(decision_matrix).sort_values("NetVal", ascending=False).iloc[0]
         top_pick, top_horizon = best["Ticker"], f"{int(best['Horizon'])} Day" if best['Horizon'] == 1 else f"{int(best['Horizon'])} Days"
 
-    # --- PERFORMANCE ---
+    # --- 6-MONTH OOS PERFORMANCE & SHARPE (SOFR) ---
     oos_window = returns[top_pick].tail(oos_size)
     wealth = (1 + oos_window).cumprod()
     ann_return_val = (wealth.iloc[-1] ** (252 / oos_size)) - 1

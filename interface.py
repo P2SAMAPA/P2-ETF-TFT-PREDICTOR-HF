@@ -18,17 +18,16 @@ def render_main_output(top_pick, sharpe, hit_rate, ann_return, top_horizon, weal
         st.metric("TOP PREDICTION", top_pick)
     
     with c2: 
-        # UI updated: font-weight changed to normal
         st.markdown(f"""
             <div style="line-height: 1.2;">
-                <p style="font-size: 14px; color: #8892b0; margin-bottom: 0px; text-transform: uppercase;">Annualised Returns (OOS)</p>
+                <p style="font-size: 14px; color: #8892b0; margin-bottom: 0px; text-transform: uppercase;">6-Month Annualised Return (OOS)</p>
                 <p style="font-size: 38px; font-weight: normal; margin: 0px;">{ann_return}</p>
                 <p style="font-size: 14px; color: #8892b0; margin-top: -5px;">Sharpe Ratio: {sharpe}</p>
             </div>
         """, unsafe_allow_html=True)
     
     with c3: 
-        st.metric("15-DAY HIT RATIO", f"{hit_rate:.0%}")
+        st.metric("6-MONTH HIT RATIO", f"{hit_rate:.0%}")
     
     st.divider()
 
@@ -43,12 +42,12 @@ def render_main_output(top_pick, sharpe, hit_rate, ann_return, top_horizon, weal
         """, unsafe_allow_html=True)
     
     with col2:
-        st.subheader("OOS Cumulative Return")
+        st.subheader("6-Month Out-of-Sample Performance")
         fig = go.Figure()
         fig.add_trace(go.Scatter(x=wealth.index, y=wealth, mode='lines', line=dict(color='#00d4ff', width=3)))
         fig.update_layout(height=320, margin=dict(l=0, r=0, t=10, b=0), template="plotly_dark", yaxis_title="Growth of $1")
         st.plotly_chart(fig, use_container_width=True)
 
-    # Row 3: Audit Table
+    # Row 3: Audit Table (Kept to 15 days for scannability)
     st.subheader("🔍 Verification Log (Last 15 Trading Days)")
     st.table(audit_df.style.map(lambda x: f"color: {'#00d4ff' if float(str(x).strip('%')) > 0 else '#fb7185'}", subset=['Net Return']))

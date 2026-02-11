@@ -69,7 +69,7 @@ etf_universe = ["TLT", "TBT", "VNQ", "SLV", "GLD"]
 engine = train_engine(regime_year, etf_universe)
 agent, returns, full_features = engine["agent"], engine["returns"], engine["full_features"]
 
-# Inference on Current State
+# Inference
 agent.eval()
 curr_state_scaled = engine["scaler"].transform(full_features.tail(1))
 raw_preds = agent(torch.FloatTensor(curr_state_scaled)).detach().numpy()[0]
@@ -92,7 +92,7 @@ else:
 oos_window = returns[top_pick].tail(126)
 wealth = (1 + oos_window).cumprod()
 
-# Annualized Return (Compounded)
+# Annualized Return (Geometric)
 final_wealth_val = wealth.iloc[-1]
 ann_return_val = (final_wealth_val ** (252 / 126)) - 1
 ann_return_str = f"{ann_return_val:.2%}"
@@ -102,7 +102,7 @@ try:
     sofr_series = engine["fred"].get_series('SOFR', oos_window.index[0]).reindex(oos_window.index).ffill()
     rf_daily = (sofr_series.mean() / 100) / 252 
 except Exception:
-    rf_daily = 0.0525 / 252 # Fallback to 5.25% proxy
+    rf_daily = 0.0525 / 252 
 
 excess_returns = oos_window - rf_daily
 if excess_returns.std() != 0:
@@ -110,7 +110,6 @@ if excess_returns.std() != 0:
 else:
     sharpe_val = 0.0
 
-# Metrics for UI
 hit_rate = (oos_window > 0).sum() / 126
 audit_df = pd.DataFrame({
     "Date": returns[top_pick].tail(15).index.strftime('%Y-%m-%d'), 

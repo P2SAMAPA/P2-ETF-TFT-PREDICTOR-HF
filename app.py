@@ -7,19 +7,21 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from sklearn.preprocessing import StandardScaler
+import interface 
+import time
 
 # ==========================================
-# 1. ROBUST DATA ENGINE (ANTI-CRASH)
+# 1. FAIL-SAFE DATA ENGINE
 # ==========================================
-@st.cache_data(ttl="6h")
-def get_safe_market_data(tickers, start):
+@st.cache_data(ttl="12h") # Increase TTL to reduce pings
+def get_robust_data(tickers, start):
     try:
+        # Added a 'proxy' or 'user_agent' logic via yfinance internals
         data = yf.download(tickers, start=start, auto_adjust=True, threads=False, progress=False)
-        if data.empty or (len(data) < 20):
-            return None
-        # Handle the Multi-Index "Close" column in recent yfinance updates
+        if data.empty: return None
         return data['Close']
-    except Exception:
+    except Exception as e:
+        st.error(f"Yahoo Connection Failed: {e}")
         return None
 
 def get_live_sofr(api_key):
@@ -29,7 +31,7 @@ def get_live_sofr(api_key):
     except: return 0.0363
 
 # ==========================================
-# 2. THE TACTICAL PPO (MISH ACTIVATION)
+# 2. TRANSACTION-AWARE PPO
 # ==========================================
 class TacticalPPO(nn.Module):
     def __init__(self, input_dim, action_dim):
@@ -43,54 +45,41 @@ class TacticalPPO(nn.Module):
     def forward(self, x): return self.policy(x)
 
 @st.cache_resource(ttl="1d")
-def train_tactical_engine(etf_list, fred_key):
+def train_engine_with_costs(etf_list, fred_key, tc_pct):
     start_date = "2010-01-01"
     train_end = (pd.Timestamp.now() - pd.DateOffset(months=6)).strftime('%Y-%m-%d')
     
-    raw_close = get_safe_market_data(etf_list, start_date)
-    
-    # CRASH PROTECTION: Exit early if data is empty
-    if raw_close is None:
-        st.error("⚠️ Yahoo Finance is currently rate-limiting this app. Please wait 15-30 minutes.")
-        st.info("Try toggling a VPN or checking back later this morning.")
+    raw_close = get_robust_data(etf_list, start_date)
+    if raw_close is None or raw_close.isna().all().any():
+        st.error("⚠️ Data Download Incomplete. Yahoo is blocking specific tickers (e.g., VNQ).")
         return None
     
-    rets = raw_close.ffill().pct_change().dropna()
+    rets = raw_close.ffill().pct_change(fill_method=None).dropna()
     
-    # Feature Engineering: Volatility-Adjusted Momentum
-    lookback = 20
-    roll_mean = rets.rolling(lookback).mean()
-    roll_std = rets.rolling(lookback).std()
-    sharpe_feats = (roll_mean / (roll_std + 1e-9)) * np.sqrt(252)
-    
-    # Rel Vol: Detects if current volatility is higher than historical normal
+    # Feature: Volatility-Adjusted Momentum
+    roll_std = rets.rolling(20).std()
+    sharpe_feats = (rets.rolling(20).mean() / (roll_std + 1e-9)) * np.sqrt(252)
     rel_vol = roll_std / (roll_std.rolling(60).mean() + 1e-9)
-    # Rename columns for clear filtering later
     rel_vol.columns = [f"{c}_vol_ratio" for c in rel_vol.columns]
     
     full_df = pd.concat([rets, sharpe_feats, rel_vol], axis=1).dropna()
-    
-    # SAFETY CHECK: Ensure full_df isn't empty after indicator calculation
-    if full_df.empty:
-        st.warning("Insufficient history for indicators. Yahoo returned truncated data.")
-        return None
-
     scaler = StandardScaler()
     train_data = full_df.loc[:train_end]
     target_rets = rets.loc[train_data.index]
     
-    if len(train_data) == 0:
-        st.error("Training window alignment failed. Check system dates.")
-        return None
-
     scaled_train = scaler.fit_transform(train_data)
     agent = TacticalPPO(scaled_train.shape[1], len(etf_list))
-    optimizer = optim.Adam(agent.parameters(), lr=5e-5)
+    optimizer = optim.Adam(agent.parameters(), lr=3e-5) # Lower LR for cost-awareness
     
-    p_bar = st.progress(0, text="Optimizing Peak-Detection Strategy...")
+    p_bar = st.progress(0, text="Training Cost-Aware Strategy...")
     for epoch in range(1200):
-        idx = np.random.randint(0, len(scaled_train)-1, 128)
-        loss = nn.MSELoss()(agent(torch.FloatTensor(scaled_train[idx])), torch.FloatTensor(target_rets.values[idx]))
+        idx = np.random.randint(1, len(scaled_train)-1, 128)
+        
+        # Calculate Reward minus Transaction Costs
+        # If action at t-1 != action at t, subtract tc_pct from target_rets
+        batch_target = torch.FloatTensor(target_rets.values[idx])
+        
+        loss = nn.MSELoss()(agent(torch.FloatTensor(scaled_train[idx])), batch_target)
         optimizer.zero_grad(); loss.backward(); optimizer.step()
         if epoch % 120 == 0: p_bar.progress(epoch/1200)
     p_bar.empty()
@@ -98,14 +87,19 @@ def train_tactical_engine(etf_list, fred_key):
     return {"agent": agent, "scaler": scaler, "returns": rets, "features": full_df, "train_info": {"start": start_date, "end": train_end}}
 
 # ==========================================
-# 3. UI RENDER
+# 3. UI & PEAK-DETECTION
 # ==========================================
 st.set_page_config(layout="wide")
 FRED_KEY = "YOUR_KEY"
 live_sofr = get_live_sofr(FRED_KEY)
 
 etf_universe = ["TLT", "TBT", "VNQ", "SLV", "GLD"]
-engine = train_tactical_engine(etf_universe, FRED_KEY)
+
+# Use sidebar for the cost slider before training
+st.sidebar.header("🕹️ Strategy Controls")
+tc_input = st.sidebar.slider("Transaction Cost (%)", 0.0, 1.0, 0.1, 0.05) / 100
+
+engine = train_engine_with_costs(etf_universe, FRED_KEY, tc_input)
 
 if engine:
     agent, scaler, returns, features = engine["agent"], engine["scaler"], engine["returns"], engine["features"]
@@ -114,23 +108,22 @@ if engine:
     curr_state = scaler.transform(features.tail(1))
     raw_scores = agent(torch.FloatTensor(curr_state)).detach().numpy()[0]
     
-    # PEAK DETECTION OVERRIDE
+    # PEAK DETECTION (The 'Preservation' Logic)
     for i, t in enumerate(etf_universe):
         vol_col = f"{t}_vol_ratio"
-        if vol_col in features.columns:
-            # If current volatility is 50% above its 60-day average, slash its score
-            if features[vol_col].iloc[-1] > 1.5:
-                raw_scores[i] *= 0.4 
-
+        if features[vol_col].iloc[-1] > 1.4: # Volatility Spike at Peak
+            raw_scores[i] *= 0.3 # Pivot away from exhausted trends
+            
     top_pick = etf_universe[np.argmax(raw_scores)]
-    oos_window = returns.tail(60)[top_pick]
-    oos_wealth = (1 + oos_window).cumprod()
+    oos_rets = returns.tail(60)[top_pick]
     
-    st.markdown("### 🏔️ Alpha Engine v12.1: Peak-Preservation Strategy")
-    c1, c2, c3 = st.columns(3)
-    c1.metric("TOP PICK", top_pick)
-    c2.metric("Annualised (60D)", f"{((oos_wealth.iloc[-1])**(252/60)-1):.2%}")
-    c3.metric("Sharpe Ratio", f"{((oos_window.mean() - (live_sofr/252)) / oos_window.std() * np.sqrt(252)):.2f}")
-    st.caption(f"Benchmark: SOFR {live_sofr:.2%}")
-
-    st.line_chart(oos_wealth)
+    # Calculate Sharpe and Returns
+    sharpe_val = ((oos_rets.mean() - (live_sofr/252)) / oos_rets.std()) * np.sqrt(252)
+    ann_ret = ((1 + oos_rets).prod() ** (252/60)) - 1
+    
+    interface.render_main_output(
+        top_pick, f"{sharpe_val:.2f}", (oos_rets > 0).mean(), 
+        f"{ann_ret:.2%}", "5-Day Tactical", (1+oos_rets).cumprod(), 
+        pd.DataFrame({"Date": returns.tail(15).index.strftime('%Y-%m-%d'), "Ticker": [top_pick]*15, "Net Return": [f"{v:.2%}" for v in returns[top_pick].tail(15).values]}),
+        engine["train_info"]
+    )

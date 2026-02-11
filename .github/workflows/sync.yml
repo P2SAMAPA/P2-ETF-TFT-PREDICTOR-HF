@@ -1,1 +1,19 @@
-run: git push --force https://p2samapa:${{ secrets.HF_TOKEN }}@huggingface.co/spaces/p2samapa/fixedincome-etf-return-maximizer main
+name: Sync to HF
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+      - name: Push to HF
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          git push --force https://P2SAMAPA:$HF_TOKEN@huggingface.co/spaces/P2SAMAPA/FIXEDINCOME-ETF-RETURN-MAXIMIZER main || \
+          git push --force https://P2SAMAPA:$HF_TOKEN@huggingface.co/spaces/P2SAMAPA/FIXEDINCOME-ETF-RETURN-MAXIMIZER master:main

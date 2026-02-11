@@ -18,12 +18,12 @@ def render_main_output(top_pick, sharpe, hit_rate, ann_return, top_horizon, weal
         st.metric("TOP PREDICTION", top_pick)
     
     with c2: 
-        # Custom HTML to show Annualised Returns as primary and Sharpe as secondary
+        # Custom HTML for stacked return and sharpe
         st.markdown(f"""
             <div style="line-height: 1.2;">
                 <p style="font-size: 14px; color: #8892b0; margin-bottom: 0px; text-transform: uppercase;">Annualised Returns (OOS)</p>
-                <p style="font-size: 38px; font-weight: bold; margin: 0px;">{ann_return:.2%}</p>
-                <p style="font-size: 14px; color: #8892b0; margin-top: -5px;">Sharpe Ratio: {sharpe:.2f}</p>
+                <p style="font-size: 38px; font-weight: bold; margin: 0px;">{ann_return}</p>
+                <p style="font-size: 14px; color: #8892b0; margin-top: -5px;">Sharpe Ratio: {sharpe}</p>
             </div>
         """, unsafe_allow_html=True)
     
@@ -51,5 +51,4 @@ def render_main_output(top_pick, sharpe, hit_rate, ann_return, top_horizon, weal
 
     # Row 3: Audit Table
     st.subheader("🔍 Verification Log (Last 15 Trading Days)")
-    # Using .map instead of .applymap (standard for modern Pandas)
     st.table(audit_df.style.map(lambda x: f"color: {'#00d4ff' if float(str(x).strip('%')) > 0 else '#fb7185'}", subset=['Net Return']))

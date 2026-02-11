@@ -13,22 +13,16 @@ def render_main_output(top_pick, sharpe, hit_rate, ann_return, top_horizon, weal
     
     # Row 1: Metrics
     c1, c2, c3 = st.columns(3)
-    
-    with c1: 
-        st.metric("TOP PREDICTION", top_pick)
-    
+    with c1: st.metric("TOP PREDICTION", top_pick)
     with c2: 
         st.markdown(f"""
             <div style="line-height: 1.2;">
                 <p style="font-size: 14px; color: #8892b0; margin-bottom: 0px; text-transform: uppercase;">6-Month Annualised Return (OOS)</p>
                 <p style="font-size: 38px; font-weight: normal; margin: 0px;">{ann_return}</p>
-                <p style="font-size: 14px; color: #8892b0; margin-top: -5px;">Sharpe Ratio: {sharpe}</p>
+                <p style="font-size: 14px; color: #8892b0; margin-top: -5px;">Sharpe (vs SOFR): {sharpe}</p>
             </div>
         """, unsafe_allow_html=True)
-    
-    with c3: 
-        st.metric("6-MONTH HIT RATIO", f"{hit_rate:.0%}")
-    
+    with c3: st.metric("6-MONTH HIT RATIO", f"{hit_rate:.0%}")
     st.divider()
 
     # Row 2: Signal Box and Chart
@@ -40,7 +34,6 @@ def render_main_output(top_pick, sharpe, hit_rate, ann_return, top_horizon, weal
             <p style="font-size:24px; color:#8892b0; letter-spacing: 2px;">HOLDING PERIOD: {top_horizon}</p>
         </div>
         """, unsafe_allow_html=True)
-    
     with col2:
         st.subheader("6-Month Out-of-Sample Performance")
         fig = go.Figure()
@@ -48,6 +41,6 @@ def render_main_output(top_pick, sharpe, hit_rate, ann_return, top_horizon, weal
         fig.update_layout(height=320, margin=dict(l=0, r=0, t=10, b=0), template="plotly_dark", yaxis_title="Growth of $1")
         st.plotly_chart(fig, use_container_width=True)
 
-    # Row 3: Audit Table (Kept to 15 days for scannability)
+    # Row 3: Audit Table
     st.subheader("🔍 Verification Log (Last 15 Trading Days)")
     st.table(audit_df.style.map(lambda x: f"color: {'#00d4ff' if float(str(x).strip('%')) > 0 else '#fb7185'}", subset=['Net Return']))

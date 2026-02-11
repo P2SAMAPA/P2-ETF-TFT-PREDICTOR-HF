@@ -4,9 +4,9 @@ import pandas as pd
 def render_comparison_dashboard(transformer_results, regime_results, sofr_rate):
     st.title("🏔️ Alpha Engine ver1.0")
     
-    # Thursday, 12th February 2026 Header
-    st.markdown(f"### 📅 Market Forecast: Thursday, 12th February 2026")
-    st.caption(f"Risk-Free Rate (SOFR): **{sofr_rate:.2%}**")
+    # Header with US Markets Context
+    st.markdown(f"### 📅 US Markets Open: Thursday, 12th February 2026")
+    st.info(f"Current Risk-Free Rate (SOFR): **{sofr_rate:.2%}**")
 
     col1, col2 = st.columns(2)
     with col1:
@@ -21,7 +21,7 @@ def render_comparison_dashboard(transformer_results, regime_results, sofr_rate):
     st.subheader("🏆 Strategy Performance Comparison (Out-of-Sample)")
     
     comparison_data = {
-        "Metric": ["Predicted ETF", "Optimal Holding Period", "Annualised Return (%)", f"Sharpe Ratio (SOFR @ {sofr_rate:.2%})", "Hit Ratio (15 Day)", "Hit Ratio (30 Day)"],
+        "Metric": ["Predicted ETF", "Optimal Holding Period", "Annualised Return (%)", f"Sharpe Ratio (vs SOFR)", "Hit Ratio (15 Day)", "Hit Ratio (30 Day)"],
         "Transformer (Attention)": [
             transformer_results['ticker'], transformer_results['horizon'],
             f"{transformer_results['ann_return']:.2%}", f"{transformer_results['sharpe']:.2f}",
@@ -37,18 +37,15 @@ def render_comparison_dashboard(transformer_results, regime_results, sofr_rate):
 
 def render_tactical_logs(transformer_df, regime_df):
     st.divider()
-    st.subheader("📝 Prediction Logs (Last 15 Days)")
+    st.subheader("📝 Prediction Logs (Last 15 Trading Days)")
     
-    def color_coding(val):
-        color = '#2ecc71' if val > 0 else '#e74c3c' # Green for profit, Red for loss
+    def color_pnl(val):
+        color = '#2ecc71' if val > 0 else '#e74c3c'
         return f'color: {color}; font-weight: bold'
 
     tab1, tab2 = st.tabs(["Transformer Details", "Regime Switcher Details"])
     
     with tab1:
-        if not transformer_df.empty:
-            st.dataframe(transformer_df.style.applymap(color_coding, subset=['Prediction']), width='stretch')
-    
+        st.dataframe(transformer_df.style.applymap(color_pnl, subset=['Prediction']), width='stretch')
     with tab2:
-        if not regime_df.empty:
-            st.dataframe(regime_df.style.applymap(color_coding, subset=['Prediction']), width='stretch')
+        st.dataframe(regime_df.style.applymap(color_pnl, subset=['Prediction']), width='stretch')

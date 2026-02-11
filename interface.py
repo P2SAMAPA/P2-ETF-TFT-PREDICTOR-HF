@@ -1,26 +1,68 @@
 import streamlit as st
 import pandas as pd
 
-def render_main_output(top_pick, sharpe, hit_rate, ann_return, horizon, wealth_curve, audit_log, train_info, tc_drag):
-    st.title("🏔️ Alpha Engine v12.3")
+def render_comparison_dashboard(transformer_results, regime_results, tc_pct):
+    """
+    Renders the side-by-side comparison between the two model approaches.
+    """
+    st.title("🏔️ Alpha Engine v13: Model Tournament")
     
-    # Connection Status
-    st.success("✅ Connected to Polygon.io Fallback")
-
-    col1, col2, col3 = st.columns(3)
+    # --- TOP LEVEL METRICS ---
+    col1, col2 = st.columns(2)
+    
     with col1:
-        st.metric("CURRENT ROTATION", top_pick)
+        st.subheader("🤖 Model A: Transformer (Attention)")
+        st.metric("Top Pick", f"{transformer_results['ticker']} ({transformer_results['horizon']})")
+    
     with col2:
-        st.metric("Sharpe Ratio", sharpe)
-        st.caption("Benchmark: Live SOFR")
-    with col3:
-        # Show the raw return and the drag separately for clarity
-        st.metric("Net Ann. Return (Est)", ann_return, delta=f"-{tc_drag:.2%} cost drag", delta_color="inverse")
+        st.subheader("📊 Model B: Regime Switcher (XGB/RF)")
+        st.metric("Top Pick", f"{regime_results['ticker']} ({regime_results['horizon']})")
 
     st.divider()
-    st.subheader(f"Equity Curve: {top_pick} (Last 60D OOS)")
-    st.line_chart(wealth_curve)
 
-    with st.expander("ℹ️ Strategy Details"):
-        st.write(f"**Training:** {train_info['start']} to {train_info['end']}")
-        st.write("**Model:** PPO Deep Neural Net (1,000 Epochs)")
+    # --- COMPARISON TABLE ---
+    st.subheader("🏆 Strategy Performance Comparison (Out-of-Sample)")
+    
+    comparison_data = {
+        "Metric": [
+            "Predicted ETF", 
+            "Optimal Holding Period", 
+            "Ann. Return (OOS)", 
+            "Sharpe Ratio (SOFR)", 
+            "Hit Ratio (15D)", 
+            "Hit Ratio (30D)"
+        ],
+        "Transformer (Sequence)": [
+            transformer_results['ticker'],
+            transformer_results['horizon'],
+            f"{transformer_results['ann_return']:.2%}",
+            f"{transformer_results['sharpe']:.2f}",
+            f"{transformer_results['hit_15']:.1%}",
+            f"{transformer_results['hit_30']:.1%}"
+        ],
+        "Regime Switcher (XGB/RF)": [
+            regime_results['ticker'],
+            regime_results['horizon'],
+            f"{regime_results['ann_return']:.2%}",
+            f"{regime_results['sharpe']:.2f}",
+            f"{regime_results['hit_15']:.1%}",
+            f"{regime_results['hit_30']:.1%}"
+        ]
+    }
+    
+    st.table(pd.DataFrame(comparison_data))
+
+    # --- TRANSACTION COST ANALYSIS ---
+    st.sidebar.header("🕹️ Global Controls")
+    tc_input = st.sidebar.slider("Transaction Cost (%)", 0.0, 1.0, 0.1, 0.05)
+    
+    st.sidebar.info(f"Models are currently optimizing to beat a {tc_input}% drag per trade.")
+    
+    return tc_input / 100
+
+def render_verification_logs(transformer_logs, regime_logs):
+    tab1, tab2 = st.tabs(["Transformer Logs", "Regime Switcher Logs"])
+    with tab1:
+        st.dataframe(transformer_logs, use_container_width=True)
+    with tab2:
+        st.dataframe(regime_logs, use_container_width=True)

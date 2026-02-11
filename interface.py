@@ -1,47 +1,47 @@
 import streamlit as st
-import plotly.graph_objects as go
-from datetime import datetime
+import pandas as pd
 
-def render_sidebar():
-    st.sidebar.header("Model Configuration")
-    regime_year = st.sidebar.select_slider("Data Anchor", options=[2008, 2015, 2019, 2021], value=2015)
-    tx_cost_bps = st.sidebar.slider("Transaction Cost (bps)", 0, 100, 15)
-    return regime_year, tx_cost_bps
-
-def render_main_output(top_pick, sharpe, hit_rate, ann_return, top_horizon, wealth, audit_df):
-    st.markdown(f"### 🔥 High-Beta Strategy Cycle: **{datetime.now().strftime('%B %d, %Y')}**")
+def render_main_output(prediction, sharpe, hit_ratio, ann_return, horizon, wealth_curve, audit_df):
+    # Header
+    st.title(f"🔥 High-Beta Strategy Cycle: {pd.Timestamp.now().strftime('%B %d, %Y')}")
     
-    # Row 1: Metrics
-    c1, c2, c3 = st.columns(3)
-    with c1: st.metric("TOP PREDICTION", top_pick)
-    with c2: 
-        st.markdown(f"""
-            <div style="line-height: 1.2;">
-                <p style="font-size: 14px; color: #8892b0; margin-bottom: 0px; text-transform: uppercase;">6-Month Annualised Return (OOS)</p>
-                <p style="font-size: 38px; font-weight: normal; margin: 0px;">{ann_return}</p>
-                <p style="font-size: 14px; color: #8892b0; margin-top: -5px;">Sharpe (vs SOFR): {sharpe}</p>
-            </div>
-        """, unsafe_allow_html=True)
-    with c3: st.metric("6-MONTH HIT RATIO", f"{hit_rate:.0%}")
-    st.divider()
-
-    # Row 2: Signal Box and Chart
-    col1, col2 = st.columns(2)
+    # Top Row Metrics
+    col1, col2, col3 = st.columns(3)
     with col1:
-        st.markdown(f"""
-        <div style="padding:40px; border-radius:10px; border:2px solid #00d4ff; background-color:#0e1117; text-align:center;">
-            <h1 style="color:#00d4ff; margin:0; font-size:100px;">{top_pick}</h1>
-            <p style="font-size:24px; color:#8892b0; letter-spacing: 2px;">HOLDING PERIOD: {top_horizon}</p>
-        </div>
-        """, unsafe_allow_html=True)
+        st.metric("TOP PREDICTION", prediction)
     with col2:
-        st.subheader("6-Month Out-of-Sample Performance")
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(x=wealth.index, y=wealth, mode='lines', line=dict(color='#00d4ff', width=3)))
-        fig.update_layout(height=320, margin=dict(l=0, r=0, t=10, b=0), template="plotly_dark", yaxis_title="Growth of $1")
-        # Updated to fix deprecation warning
-        st.plotly_chart(fig, width="stretch")
+        st.metric("ANNUALISED RETURN (2025-26 OOS)", ann_return)
+        st.caption(f"Sharpe (vs SOFR): {sharpe}")
+    with col3:
+        st.metric("HIT RATIO (2025+)", f"{hit_ratio:.0%}")
 
-    # Row 3: Audit Table
-    st.subheader("🔍 Verification Log (Last 15 Trading Days)")
-    st.table(audit_df.style.map(lambda x: f"color: {'#00d4ff' if float(str(x).strip('%')) > 0 else '#fb7185'}", subset=['Net Return']))
+    st.markdown("---")
+
+    # Main Dashboard Area
+    left_col, right_col = st.columns([1, 1.5])
+
+    with left_col:
+        st.write("")
+        st.container(border=True).inner_content = st.markdown(
+            f"""
+            <div style="background-color: #0e1117; padding: 60px; border-radius: 10px; border: 2px solid #00d4ff; text-align: center;">
+                <h1 style="font-size: 100px; color: #00d4ff; margin: 0;">{prediction}</h1>
+                <p style="font-size: 24px; color: #8892b0; letter-spacing: 2px;">HOLDING PERIOD: {horizon}</p>
+            </div>
+            """, unsafe_allow_html=True
+        )
+
+    with right_col:
+        st.subheader("OOS Performance: Jan 2025 - Present")
+        st.line_chart(wealth_curve, height=400, use_container_width=True)
+
+    st.markdown("---")
+
+    # Corrected Verification Log Header
+    st.subheader(f"🔍 Verification Log (Last {len(audit_df)} Trading Days)")
+    
+    # Styled Table
+    st.table(audit_df.style.map(
+        lambda x: f"color: {'#00d4ff' if '-' not in str(x) else '#fb7185'}", 
+        subset=['Net Return']
+    ))

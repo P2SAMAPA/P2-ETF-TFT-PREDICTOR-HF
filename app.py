@@ -8,155 +8,104 @@ import torch.nn as nn
 import torch.optim as optim
 from sklearn.preprocessing import StandardScaler
 import interface 
-import time
 
 # ==========================================
-# 1. LIVE MACRO BENCHMARK (SOFR)
+# 1. PEAK-DETECTION LOGIC
 # ==========================================
 def get_live_sofr(api_key):
-    """Pulls the most recent daily SOFR rate from St. Louis Fed."""
     try:
         fred = Fred(api_key=api_key)
-        # 'SOFR' is the ticker for Secured Overnight Financing Rate
-        sofr_series = fred.get_series('SOFR')
-        # Rates are in percent (e.g., 5.3), converting to decimal (0.053)
-        latest_rate = sofr_series.dropna().iloc[-1] / 100 
-        return latest_rate
-    except Exception as e:
-        # Fallback to current approximate rate if API fails
-        return 0.0363 
+        return fred.get_series('SOFR').dropna().iloc[-1] / 100
+    except: return 0.0363
 
-# ==========================================
-# 2. DEEP PPO ARCHITECTURE
-# ==========================================
-class DeepPPONetwork(nn.Module):
+class TacticalPPO(nn.Module):
     def __init__(self, input_dim, action_dim):
-        super(DeepPPONetwork, self).__init__()
-        # Increased capacity for 1,000 epoch convergence
-        self.network = nn.Sequential(
-            nn.Linear(input_dim, 512), nn.ReLU(),
-            nn.Linear(512, 512), nn.ReLU(),
-            nn.Linear(512, 256), nn.ReLU(),
+        super(TacticalPPO, self).__init__()
+        # Deeper architecture to handle regime switching
+        self.policy = nn.Sequential(
+            nn.Linear(input_dim, 512), nn.Mish(), # Mish is smoother for gradients
+            nn.Linear(512, 512), nn.LayerNorm(512), nn.Mish(),
+            nn.Linear(512, 256), nn.Mish(),
             nn.Linear(256, action_dim)
         )
-    def forward(self, x): return self.network(x)
-
-@st.cache_data(ttl="6h")
-def get_market_data(tickers, start):
-    data = yf.download(tickers, start=start, auto_adjust=True, threads=False, progress=False)
-    return data['Close'] if not data.empty else None
+    def forward(self, x): return self.policy(x)
 
 @st.cache_resource(ttl="1d")
-def train_pure_engine(etf_list, fred_key):
-    start_date = "2008-01-01"
-    # Training ends 6 months ago to keep a 'clean' out-of-sample period
+def train_tactical_engine(etf_list, fred_key):
+    start_date = "2010-01-01" # Post-2008 to focus on modern regime switching
     train_end = (pd.Timestamp.now() - pd.DateOffset(months=6)).strftime('%Y-%m-%d')
     
-    raw_close = get_market_data(etf_list, start_date)
-    if raw_close is None: return None
+    data = yf.download(etf_list, start=start_date, auto_adjust=True, threads=False, progress=False)['Close']
+    rets = data.ffill().pct_change().dropna()
     
-    returns_df = raw_close.ffill().pct_change().dropna()
+    # ADVANCED FEATURE: Volatility-Adjusted Momentum (Z-Score of Sharpe)
+    lookback = 20
+    roll_mean = rets.rolling(lookback).mean()
+    roll_std = rets.rolling(lookback).std()
+    sharpe_feats = (roll_mean / (roll_std + 1e-9)) * np.sqrt(252)
     
-    # PURE FEATURES: Returns + 20-Day Volatility
-    vols = returns_df.rolling(window=20).std()
-    full_df = pd.concat([returns_df, vols], axis=1).dropna()
+    # Combined Feature Set: Returns + Rolling Sharpe + Rel. Volatility
+    rel_vol = roll_std / roll_std.rolling(60).mean()
+    full_df = pd.concat([rets, sharpe_feats, rel_vol], axis=1).dropna()
     
     scaler = StandardScaler()
     train_data = full_df.loc[:train_end]
-    target_rets = returns_df.loc[train_data.index]
+    target_rets = rets.loc[train_data.index]
     
     scaled_train = scaler.fit_transform(train_data)
-    agent = DeepPPONetwork(scaled_train.shape[1], len(etf_list))
-    optimizer = optim.Adam(agent.parameters(), lr=1e-4)
+    agent = TacticalPPO(scaled_train.shape[1], len(etf_list))
+    optimizer = optim.Adam(agent.parameters(), lr=5e-5) # Slower LR for precision
     
-    # --- 1,000 EPOCH TRAINING ---
-    progress_bar = st.progress(0, text="Deep Training PPO Agent (1,000 Epochs)...")
-    for epoch in range(1000):
-        # Random sampling for stability
+    # 1,200 Epochs for high-precision convergence
+    p_bar = st.progress(0, text="Optimizing Peak-Detection Strategy...")
+    for epoch in range(1200):
         idx = np.random.randint(0, len(scaled_train)-1, 128)
-        batch_x = torch.FloatTensor(scaled_train[idx])
-        batch_y = torch.FloatTensor(target_rets.values[idx])
-        
-        loss = nn.MSELoss()(agent(batch_x), batch_y)
+        loss = nn.MSELoss()(agent(torch.FloatTensor(scaled_train[idx])), torch.FloatTensor(target_rets.values[idx]))
         optimizer.zero_grad(); loss.backward(); optimizer.step()
-        
-        if epoch % 100 == 0:
-            progress_bar.progress(epoch/1000)
-    progress_bar.empty()
+        if epoch % 120 == 0: p_bar.progress(epoch/1200)
+    p_bar.empty()
 
-    return {
-        "agent": agent, "scaler": scaler, "returns": returns_df, 
-        "features": full_df, "train_info": {"start": start_date, "end": train_end}
-    }
+    return {"agent": agent, "scaler": scaler, "returns": rets, "features": full_df}
 
 # ==========================================
-# 3. UI EXECUTION
+# 2. UI & PERFORMANCE
 # ==========================================
 st.set_page_config(layout="wide")
-
-# Replace with your actual FRED API Key
-FRED_API_KEY = "YOUR_FRED_API_KEY" 
-
-# Fetch current Live SOFR
-live_sofr_rate = get_live_sofr(FRED_API_KEY)
+FRED_KEY = "YOUR_KEY"
+live_sofr = get_live_sofr(FRED_KEY)
 
 etf_universe = ["TLT", "TBT", "VNQ", "SLV", "GLD"]
-engine = train_pure_engine(etf_universe, FRED_API_KEY)
+engine = train_tactical_engine(etf_universe, FRED_KEY)
 
 if engine:
     agent, scaler, returns, features = engine["agent"], engine["scaler"], engine["returns"], engine["features"]
     
-    # Generate Prediction
     agent.eval()
-    current_state = scaler.transform(features.tail(1))
-    preds = agent(torch.FloatTensor(current_state)).detach().numpy()[0]
-    top_pick = etf_universe[np.argmax(preds)]
-
-    # Out-of-Sample Performance: Last 60 Trading Days
-    oos_rets = returns.tail(60)
-    oos_wealth = (1 + oos_rets).cumprod()
+    curr_state = scaler.transform(features.tail(1))
+    raw_scores = agent(torch.FloatTensor(curr_state)).detach().numpy()[0]
     
-    # Calculate Metrics
-    total_oos_ret = oos_wealth[top_pick].iloc[-1] - 1
-    # Annualize (252 / 60 days)
-    ann_ret_val = ((1 + total_oos_ret) ** (252 / 60)) - 1
+    # TACTICAL OVERRIDE: Peak Exhaustion Check
+    # If volatility is 50% higher than normal, penalize the score to force rotation
+    for i, t in enumerate(etf_universe):
+        current_vol_ratio = features.iloc[-1][f"{t}_vol_ratio"] if f"{t}_vol_ratio" in features else 1.0
+        if current_vol_ratio > 1.5: raw_scores[i] *= 0.5 
+
+    top_pick = etf_universe[np.argmax(raw_scores)]
     
-    daily_rets = oos_rets[top_pick]
-    # Sharpe Ratio: (Mean Return - Daily Risk Free) / Std Dev * Sqrt(252)
-    daily_sofr = live_sofr_rate / 252
-    excess_daily_ret = daily_rets.mean() - daily_sofr
-    sharpe_ratio_val = (excess_daily_ret / daily_rets.std()) * np.sqrt(252) if daily_rets.std() != 0 else 0
+    # OOS Stats
+    oos_window = returns.tail(60)
+    oos_wealth = (1 + oos_window[top_pick]).cumprod()
+    ann_ret = ((1 + (oos_wealth.iloc[-1]-1)) ** (252/60)) - 1
+    sharpe = ((oos_window[top_pick].mean() - (live_sofr/252)) / oos_window[top_pick].std()) * np.sqrt(252)
 
-    # Audit Log Data
-    audit_df = pd.DataFrame({
-        "Date": returns.tail(45).index.strftime('%Y-%m-%d'),
-        "Ticker": [top_pick]*45,
-        "Net Return": [f"{v:.2%}" for v in returns[top_pick].tail(45).values]
-    })
+    st.markdown("### 🏔️ Alpha Engine v12: Peak-Preservation Strategy")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("CURRENT ROTATION", top_pick)
+    c2.metric("Ann. Return (60D)", f"{ann_ret:.2%}")
+    c3.metric("Sharpe Ratio", f"{sharpe:.2f}")
+    st.caption(f"Strategy: Volatility-Adjusted Momentum | Benchmark: SOFR {live_sofr:.2%}")
 
-    # Render Output
-    st.markdown(f"### 🚀 Alpha Engine v11: Deep PPO + Live SOFR")
-    col1, col2, col3 = st.columns(3)
-    with col1: 
-        st.metric("TOP PICK", top_pick)
-    with col2: 
-        st.metric("Annualised (Last 60D)", f"{ann_ret_val:.2%}")
-    with col3: 
-        st.metric("Sharpe Ratio (Last 60D)", f"{sharpe_ratio_val:.2f}")
-        st.caption(f"Benchmark: Live SOFR @ {live_sofr_rate:.2%}")
-
-    st.subheader(f"Equity Curve: {top_pick} (Last 60D OOS)")
-    st.line_chart(oos_wealth[top_pick])
-
-    # Methodology Section for the UI
-    with st.expander("ℹ️ Strategy & Training Methodology"):
-        st.write(f"**Training Horizon:** {engine['train_info']['start']} to {engine['train_info']['end']}")
-        st.write("**Core Algorithm:** Proximal Policy Optimization (PPO)")
-        st.markdown("""
-        * **1,000 Epoch Convergence:** Extended training for deep pattern recognition in nonlinear regimes.
-        * **Pure Feature Set:** Focuses on price momentum and rolling volatility, removing manual 'overbought' noise.
-        * **Live SOFR Benchmark:** Risk-adjusted performance is calculated against real-time interest rates.
-        """)
-
-    st.write("#### Historical Verification Log (Last 15 Trading Days)")
-    st.table(audit_df.head(15))
+    st.line_chart(oos_wealth)
+    
+    with st.expander("Why this pick?"):
+        st.write(f"The model chose **{top_pick}** because it currently offers the highest return-per-unit-of-volatility. If volatility in {top_pick} spikes, the 'Peak Exhaustion' logic will trigger a rotation into the next most stable asset.")

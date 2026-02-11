@@ -1,0 +1,1 @@
+run: git push --force https://p2samapa:${{ secrets.HF_TOKEN }}@huggingface.co/spaces/p2samapa/fixedincome-etf-return-maximizer main

@@ -6,5 +6,7 @@ yfinance
 plotly
 scipy
 scikit-learn
+polygon-api-client
+setuptools
 torch
 torchvision

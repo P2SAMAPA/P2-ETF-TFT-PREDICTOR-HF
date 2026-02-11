@@ -8,14 +8,28 @@ def render_sidebar():
     tx_cost_bps = st.sidebar.slider("Transaction Cost (bps)", 0, 100, 15)
     return regime_year, tx_cost_bps
 
-def render_main_output(top_pick, sharpe, hit_rate, top_horizon, wealth, audit_df):
+def render_main_output(top_pick, sharpe, hit_rate, ann_return, top_horizon, wealth, audit_df):
     st.markdown(f"### 🔥 High-Beta Strategy Cycle: **{datetime.now().strftime('%B %d, %Y')}**")
     
     # Row 1: Metrics
     c1, c2, c3 = st.columns(3)
-    with c1: st.metric("TOP PREDICTION", top_pick)
-    with c2: st.metric("OOS SHARPE", sharpe)
-    with c3: st.metric("15-DAY HIT RATIO", f"{hit_rate:.0%}")
+    
+    with c1: 
+        st.metric("TOP PREDICTION", top_pick)
+    
+    with c2: 
+        # Custom HTML to show Annualised Returns as primary and Sharpe as secondary
+        st.markdown(f"""
+            <div style="line-height: 1.2;">
+                <p style="font-size: 14px; color: #8892b0; margin-bottom: 0px; text-transform: uppercase;">Annualised Returns (OOS)</p>
+                <p style="font-size: 38px; font-weight: bold; margin: 0px;">{ann_return:.2%}</p>
+                <p style="font-size: 14px; color: #8892b0; margin-top: -5px;">Sharpe Ratio: {sharpe:.2f}</p>
+            </div>
+        """, unsafe_allow_html=True)
+    
+    with c3: 
+        st.metric("15-DAY HIT RATIO", f"{hit_rate:.0%}")
+    
     st.divider()
 
     # Row 2: Signal Box and Chart
@@ -37,4 +51,5 @@ def render_main_output(top_pick, sharpe, hit_rate, top_horizon, wealth, audit_df
 
     # Row 3: Audit Table
     st.subheader("🔍 Verification Log (Last 15 Trading Days)")
-    st.table(audit_df.style.applymap(lambda x: f"color: {'#00d4ff' if float(x.strip('%')) > 0 else '#fb7185'}", subset=['Net Return']))
+    # Using .map instead of .applymap (standard for modern Pandas)
+    st.table(audit_df.style.map(lambda x: f"color: {'#00d4ff' if float(str(x).strip('%')) > 0 else '#fb7185'}", subset=['Net Return']))

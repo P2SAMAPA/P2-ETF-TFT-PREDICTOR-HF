@@ -1,18 +1,17 @@
 import streamlit as st
 import pandas as pd
 
-def render_comparison_dashboard(transformer_results, regime_results, tc_pct):
+def render_comparison_dashboard(transformer_results, regime_results):
     st.title("🏔️ Alpha Engine ver1.0")
     
     col1, col2 = st.columns(2)
     with col1:
         st.subheader("🤖 Model A: Transformer")
-        # Added key to metrics to prevent duplication errors
-        st.metric("Top Pick", f"{transformer_results['ticker']} ({transformer_results['horizon']})", key="m1")
+        st.metric("Top Pick", f"{transformer_results['ticker']} ({transformer_results['horizon']})")
     
     with col2:
         st.subheader("📊 Model B: Regime Switcher")
-        st.metric("Top Pick", f"{regime_results['ticker']} ({regime_results['horizon']})", key="m2")
+        st.metric("Top Pick", f"{regime_results['ticker']} ({regime_results['horizon']})")
 
     st.divider()
     st.subheader("🏆 Strategy Performance Comparison (Out-of-Sample)")
@@ -32,18 +31,10 @@ def render_comparison_dashboard(transformer_results, regime_results, tc_pct):
     }
     st.table(pd.DataFrame(comparison_data))
 
-    # The Slider fix: Add a unique key
-    st.sidebar.header("🕹️ Global Controls")
-    tc_input = st.sidebar.slider(
-        "Transaction Cost (%)", 
-        0.0, 1.0, 0.1, 0.05, 
-        key="tc_slider_unique" # <--- THIS FIXES THE ERROR
-    )
-    
-    return tc_input / 100
-
 def render_verification_logs(transformer_logs, regime_logs):
-    tab1, tab2 = st.tabs(["Transformer Logs", "Regime Switcher Logs"])
+    st.divider()
+    st.subheader("📝 Prediction Logs (Last 15 Days)")
+    tab1, tab2 = st.tabs(["Transformer Details", "Regime Switcher Details"])
     with tab1:
         st.dataframe(transformer_logs, use_container_width=True)
     with tab2:

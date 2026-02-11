@@ -39,7 +39,7 @@ def train_engine(start_year, etf_list):
     
     full_df = pd.concat([returns_df, vols, macro, m_raw.reindex(returns_df.index).ffill()], axis=1).dropna()
     
-    # --- STRICT OOS SPLIT (6 MONTHS = 126 DAYS) ---
+    # --- STRICT OOS SPLIT (6 MONTHS = 126 TRADING DAYS) ---
     oos_size = 126
     train_df = full_df.iloc[:-oos_size]
     train_returns = returns_df.iloc[:-oos_size]
@@ -57,8 +57,7 @@ def train_engine(start_year, etf_list):
     tactical = XGBRegressor(n_estimators=100, max_depth=5, objective='reg:absoluteerror')
     tactical.fit(scaled_train[:-1], train_returns.shift(-1).dropna().mean(axis=1))
     
-    # Return everything needed for inference, ensuring scaler and features are handled
-    return {"agent": agent, "scaler": scaler, "returns": returns_df, "full_features": full_df, "tactical": tactical}
+    return {"agent": agent, "scaler": scaler, "returns": returns_df, "full_features": full_df, "tactical": tactical, "fred": fred}
 
 # ==========================================
 # 2. EXECUTION FLOW
@@ -70,9 +69,9 @@ etf_universe = ["TLT", "TBT", "VNQ", "SLV", "GLD"]
 engine = train_engine(regime_year, etf_universe)
 agent, returns, full_features = engine["agent"], engine["returns"], engine["full_features"]
 
-# Scale the current state using the TRAINED scaler
-curr_state_scaled = engine["scaler"].transform(full_features.tail(1))
+# Inference
 agent.eval()
+curr_state_scaled = engine["scaler"].transform(full_features.tail(1))
 raw_preds = agent(torch.FloatTensor(curr_state_scaled)).detach().numpy()[0]
 cost_pct = tx_cost_bps / 10000
 
@@ -89,23 +88,33 @@ else:
     best = pd.DataFrame(decision_matrix).sort_values("NetVal", ascending=False).iloc[0]
     top_pick, top_horizon = best["Ticker"], f"{int(best['Horizon'])} Day" if best['Horizon'] == 1 else f"{int(best['Horizon'])} Days"
 
-# --- 6-MONTH OOS PERFORMANCE CALCULATIONS ---
-oos_window = returns[top_pick].tail(126) # 6 Months
+# --- 6-MONTH OOS PERFORMANCE & SHARPE (SOFR) ---
+oos_window = returns[top_pick].tail(126)
 wealth = (1 + oos_window).cumprod()
 
-# Annualized Return (Geometric/Compounded)
-final_wealth_val = wealth.iloc[-1]
-# Formula: (Final Wealth ^ (252 / Trading Days)) - 1
-ann_return_val = (final_wealth_val ** (252 / 126)) - 1
+# Annualized Return
+ann_return_val = (wealth.iloc[-1] ** (252 / 126)) - 1
 ann_return_str = f"{ann_return_val:.2%}"
 
-# Hit Rate over the 6-month period
-hit_rate = (oos_window > 0).sum() / 126
+# Dynamic Sharpe Calculation using SOFR
+try:
+    sofr_series = engine["fred"].get_series('SOFR', oos_window.index[0]).reindex(oos_window.index).ffill()
+    rf_daily = (sofr_series.mean() / 100) / 252 
+except Exception:
+    rf_daily = 0.0525 / 252 # Proxy 5.25% if API fails
 
+excess_returns = oos_window - rf_daily
+if excess_returns.std() != 0:
+    sharpe_val = (excess_returns.mean() / excess_returns.std()) * np.sqrt(252)
+else:
+    sharpe_val = 0.0
+
+# Metrics for UI
+hit_rate = (oos_window > 0).sum() / 126
 audit_df = pd.DataFrame({
     "Date": returns[top_pick].tail(15).index.strftime('%Y-%m-%d'), 
     "Ticker": [top_pick]*15, 
     "Net Return": [f"{v:.2%}" for v in returns[top_pick].tail(15).values]
 })
 
-interface.render_main_output(top_pick, "1.82", hit_rate, ann_return_str, top_horizon, wealth, audit_df)
+interface.render_main_output(top_pick, f"{sharpe_val:.2f}", hit_rate, ann_return_str, top_horizon, wealth, audit_df)

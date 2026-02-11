@@ -1,3 +1,15 @@
+import os
+import streamlit as st
+
+# 1. Try to get keys from Environment Variables (Hugging Face style)
+# 2. Fall back to Streamlit secrets (Local development style)
+POLYGON_API_KEY = os.environ.get("POLYGON_API_KEY") or st.secrets.get("POLYGON_API_KEY")
+FRED_API_KEY = os.environ.get("FRED_API_KEY") or st.secrets.get("FRED_API_KEY")
+
+# Safety Check: If both are missing, show a helpful message instead of crashing
+if not POLYGON_API_KEY:
+    st.error("🔑 POLYGON_API_KEY not found. Please check your Hugging Face Space Secrets.")
+    st.stop()
 import streamlit as st
 import pandas as pd
 import numpy as np

@@ -1,8 +1,8 @@
 ---
-title: Trading Engine
+title: Your Trading Engine
 emoji: 📈
 colorFrom: blue
 colorTo: green
-sdk: streamlit
-pinned: false
+sdk: docker
+app_port: 8501
 ---

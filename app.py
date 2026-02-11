@@ -81,13 +81,15 @@ else:
     best = pd.DataFrame(decision_matrix).sort_values("NetVal", ascending=False).iloc[0]
     top_pick, top_horizon = best["Ticker"], f"{int(best['Horizon'])} Day" if best['Horizon'] == 1 else f"{int(best['Horizon'])} Days"
 
-# --- CORRECTED COMPOUNDED ANNUAL RETURN LOGIC ---
+# --- CORRECTED ANNUALIZED RETURN LOGIC ---
+# Calculate wealth first so we can pull the return directly from it
 wealth = (1 + returns[top_pick].tail(120)).cumprod()
-final_wealth_value = wealth.iloc[-1]
+# Get the actual compounded return from the graph (Growth of $1 end point)
+total_compounded_return = wealth.iloc[-1] 
 n_days = len(wealth)
 
-# Calculate Annualized Return from the compounded growth shown in the graph
-ann_return_val = (final_wealth_value ** (252 / n_days)) - 1
+# Annualize the return shown in the graph: (Final Wealth ^ (252 / Days)) - 1
+ann_return_val = (total_compounded_return ** (252 / n_days)) - 1
 ann_return_str = f"{ann_return_val:.2%}"
 
 hit_rate = (returns[top_pick].tail(15) > 0).sum() / 15

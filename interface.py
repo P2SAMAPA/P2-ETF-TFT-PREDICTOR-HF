@@ -4,7 +4,7 @@ import pandas as pd
 def render_comparison_dashboard(transformer_results, regime_results, sofr_rate):
     st.title("🏔️ Alpha Engine ver1.0")
     
-    # 12th February 2026 Header with NYSE context
+    # Thursday, 12th February 2026 Header
     st.markdown(f"### 📅 Market Forecast: Thursday, 12th February 2026")
     st.caption(f"Risk-Free Rate (SOFR): **{sofr_rate:.2%}**")
 

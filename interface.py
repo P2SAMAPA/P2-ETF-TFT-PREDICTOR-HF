@@ -17,7 +17,7 @@ def render_comparison_dashboard(transformer_results, regime_results):
     st.subheader("🏆 Strategy Performance Comparison (Out-of-Sample)")
     
     comparison_data = {
-        "Metric": ["Predicted ETF", "Optimal Hold", "Ann. Return", "Sharpe", "Hit Ratio 15D", "Hit Ratio 30D"],
+        "Metric": ["Predicted ETF", "Optimal Hold", "Ann. Return", "Sharpe Ratio", "Hit Ratio 15D", "Hit Ratio 30D"],
         "Transformer": [
             transformer_results['ticker'], transformer_results['horizon'],
             f"{transformer_results['ann_return']:.2%}", f"{transformer_results['sharpe']:.2f}",
@@ -36,6 +36,7 @@ def render_verification_logs(transformer_logs, regime_logs):
     st.subheader("📝 Prediction Logs (Last 15 Days)")
     tab1, tab2 = st.tabs(["Transformer Details", "Regime Switcher Details"])
     with tab1:
-        st.dataframe(transformer_logs, use_container_width=True)
+        # Updated to use width='stretch' per 2026 Streamlit standards
+        st.dataframe(transformer_logs, width='stretch')
     with tab2:
-        st.dataframe(regime_logs, use_container_width=True)
+        st.dataframe(regime_logs, width='stretch')

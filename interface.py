@@ -18,11 +18,11 @@ def render_main_output(top_pick, sharpe, hit_rate, ann_return, top_horizon, weal
         st.metric("TOP PREDICTION", top_pick)
     
     with c2: 
-        # Custom HTML for stacked return and sharpe
+        # UI updated: font-weight changed to normal
         st.markdown(f"""
             <div style="line-height: 1.2;">
                 <p style="font-size: 14px; color: #8892b0; margin-bottom: 0px; text-transform: uppercase;">Annualised Returns (OOS)</p>
-                <p style="font-size: 38px; font-weight: bold; margin: 0px;">{ann_return}</p>
+                <p style="font-size: 38px; font-weight: normal; margin: 0px;">{ann_return}</p>
                 <p style="font-size: 14px; color: #8892b0; margin-top: -5px;">Sharpe Ratio: {sharpe}</p>
             </div>
         """, unsafe_allow_html=True)

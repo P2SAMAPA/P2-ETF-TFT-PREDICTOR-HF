@@ -13,7 +13,7 @@ import interface
 import time
 
 # ==========================================
-# 1. THE MATH ENGINE (PPO + MOMENTUM)
+# 1. THE MATH ENGINE (TRANSFER LEARNING + TECH)
 # ==========================================
 class PPONetwork(nn.Module):
     def __init__(self, input_dim, action_dim):
@@ -25,111 +25,115 @@ class PPONetwork(nn.Module):
         )
     def forward(self, x): return self.network(x)
 
-@st.cache_resource(ttl="1d")
-def train_engine(start_year, etf_list):
-    start_date = f"{start_year}-01-01"
-    
-    # Robust Download with Retries
-    raw_data = None
-    for i in range(3):
-        try:
-            raw_data = yf.download(etf_list, start=start_date, progress=False)['Close']
-            if not raw_data.empty: break
-        except:
-            time.sleep(1)
-    
-    if raw_data is None or raw_data.empty:
-        return None
+def add_indicators(df, tickers):
+    for t in tickers:
+        # RSI 14
+        delta = df[t].diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+        df[f'{t}_RSI'] = 100 - (100 / (1 + (gain / (loss + 1e-9))))
+        # MACD (12, 26)
+        ema12 = df[t].ewm(span=12, adjust=False).mean()
+        ema26 = df[t].ewm(span=26, adjust=False).mean()
+        df[f'{t}_MACD'] = ema12 - ema26
+    return df.dropna()
 
+@st.cache_resource(ttl="1d")
+def train_engine(mode, etf_list):
+    start_date = "2004-01-01"
+    raw_data = yf.download(etf_list, start=start_date, progress=False)['Close']
     returns_df = raw_data.ffill().pct_change().dropna()
+    
+    # Feature Engineering
+    feat_df = add_indicators(returns_df.copy(), etf_list)
     vols = returns_df.rolling(window=20).std().dropna()
-    returns_df = returns_df.loc[vols.index]
     
     fred = Fred(api_key=os.getenv("FRED_API_KEY"))
-    macro = pd.DataFrame(index=returns_df.index)
-    macro['10Y2Y'] = fred.get_series('T10Y2Y', start_date).reindex(returns_df.index).ffill()
+    macro = pd.DataFrame(index=feat_df.index)
+    macro['10Y2Y'] = fred.get_series('T10Y2Y', start_date).reindex(feat_df.index).ffill()
     m_raw = yf.download(["^VIX", "^MOVE"], start=start_date, progress=False)['Close']
     
-    full_df = pd.concat([returns_df, vols, macro, m_raw.reindex(returns_df.index).ffill()], axis=1).dropna()
-    
-    # --- UPDATED: 4-MONTH OOS (84 TRADING DAYS) ---
-    oos_size = 84
-    
-    train_df = full_df.iloc[:-oos_size]
-    train_returns = returns_df.iloc[:-oos_size]
-    
-    # --- UPDATED: 600 EPOCHS FOR 2021+ ---
-    if start_year >= 2021:
-        n_epochs = 600
-    else:
-        n_epochs = 150
-    
+    full_df = pd.concat([feat_df, vols.reindex(feat_df.index), macro, m_raw.reindex(feat_df.index).ffill()], axis=1).dropna()
     scaler = StandardScaler()
-    scaled_train = scaler.fit_transform(train_df)
-    
-    agent = PPONetwork(scaled_train.shape[1], len(etf_list))
-    optimizer = optim.Adam(agent.parameters(), lr=5e-4)
-    
-    for _ in range(n_epochs):
-        idx = np.random.randint(0, len(scaled_train)-1, 64)
-        loss = nn.MSELoss()(agent(torch.FloatTensor(scaled_train[idx])), torch.FloatTensor(train_returns.values[idx]))
-        optimizer.zero_grad(); loss.backward(); optimizer.step()
+    oos_size = 84 # 4 Months
+
+    if "Option A" in mode:
+        # Standard block training
+        train_data = full_df.loc["2008-01-01":"2024-12-31"]
+        target_rets = returns_df.loc[train_data.index]
+        scaled_train = scaler.fit_transform(train_data)
         
-    tactical = XGBRegressor(n_estimators=100, max_depth=5, objective='reg:absoluteerror')
-    tactical.fit(scaled_train[:-1], train_returns.shift(-1).dropna().mean(axis=1))
-    
-    return {"agent": agent, "scaler": scaler, "returns": returns_df, "full_features": full_df, "tactical": tactical, "fred": fred, "oos_size": oos_size}
+        agent = PPONetwork(scaled_train.shape[1], len(etf_list))
+        optimizer = optim.Adam(agent.parameters(), lr=5e-4)
+        for _ in range(400):
+            idx = np.random.randint(0, len(scaled_train)-1, 64)
+            loss = nn.MSELoss()(agent(torch.FloatTensor(scaled_train[idx])), torch.FloatTensor(target_rets.values[idx]))
+            optimizer.zero_grad(); loss.backward(); optimizer.step()
+
+    else:
+        # Transfer Learning: 2008-2020 -> 2021-Present
+        pre_train = full_df.loc["2008-01-01":"2020-12-31"]
+        scaled_pre = scaler.fit_transform(pre_train)
+        agent = PPONetwork(scaled_pre.shape[1], len(etf_list))
+        
+        # Phase 1: Global Physics
+        opt = optim.Adam(agent.parameters(), lr=5e-4)
+        for _ in range(250):
+            idx = np.random.randint(0, len(scaled_pre)-1, 64)
+            loss = nn.MSELoss()(agent(torch.FloatTensor(scaled_pre[idx])), torch.FloatTensor(returns_df.loc[pre_train.index].values[idx]))
+            opt.zero_grad(); loss.backward(); opt.step()
+        
+        # Phase 2: Fine-tune (Post-2021)
+        fine_tune = full_df.loc["2021-01-01":].iloc[:-oos_size]
+        scaled_fine = scaler.transform(fine_tune)
+        for param in agent.network[0].parameters(): param.requires_grad = False # Freeze base
+        
+        opt_fine = optim.Adam(filter(lambda p: p.requires_grad, agent.parameters()), lr=1e-4)
+        for _ in range(500):
+            idx = np.random.randint(0, len(scaled_fine)-1, 64)
+            loss = nn.MSELoss()(agent(torch.FloatTensor(scaled_fine[idx])), torch.FloatTensor(returns_df.loc[fine_tune.index].values[idx]))
+            opt_fine.zero_grad(); loss.backward(); opt_fine.step()
+
+    return {"agent": agent, "scaler": scaler, "returns": returns_df, "full_features": full_df, "oos_size": oos_size, "fred": fred}
 
 # ==========================================
-# 2. EXECUTION FLOW
+# 2. INTERFACE & DISPLAY
 # ==========================================
-st.set_page_config(page_title="Alpha Engine v5", layout="wide")
-regime_year, tx_cost_bps = interface.render_sidebar()
+st.set_page_config(page_title="Alpha Engine v6", layout="wide")
+
+st.sidebar.title("Model Strategy")
+mode_choice = st.sidebar.radio("Select Training Logic:", ["Option A (2008-2024 Base)", "Option B (Transfer Learning 2021+)"])
+tx_cost = st.sidebar.slider("Trading Cost (bps)", 0, 50, 10)
 
 etf_universe = ["TLT", "TBT", "VNQ", "SLV", "GLD"]
-engine = train_engine(regime_year, etf_universe)
+engine = train_engine(mode_choice, etf_universe)
 
 if engine:
-    agent, returns, full_features = engine["agent"], engine["returns"], engine["full_features"]
-    oos_size = engine["oos_size"]
+    agent, returns, full_features, oos_size = engine["agent"], engine["returns"], engine["full_features"], engine["oos_size"]
 
     agent.eval()
-    curr_state_scaled = engine["scaler"].transform(full_features.tail(1))
-    raw_preds = agent(torch.FloatTensor(curr_state_scaled)).detach().numpy()[0]
-    cost_pct = tx_cost_bps / 10000
-
+    curr_state = engine["scaler"].transform(full_features.tail(1))
+    raw_preds = agent(torch.FloatTensor(curr_state)).detach().numpy()[0]
+    
     decision_matrix = []
     for i, ticker in enumerate(etf_universe):
-        if returns[ticker].tail(2).sum() < -0.015: continue 
         for h in [1, 3, 5]:
-            val = (raw_preds[i] * h) - cost_pct
+            val = (raw_preds[i] * h) - (tx_cost / 10000)
             decision_matrix.append({"Ticker": ticker, "Horizon": h, "NetVal": val})
 
-    if not decision_matrix:
-        top_pick, top_horizon = "TBT", "3 Days"
-    else:
-        best = pd.DataFrame(decision_matrix).sort_values("NetVal", ascending=False).iloc[0]
-        top_pick, top_horizon = best["Ticker"], f"{int(best['Horizon'])} Day" if best['Horizon'] == 1 else f"{int(best['Horizon'])} Days"
+    best = pd.DataFrame(decision_matrix).sort_values("NetVal", ascending=False).iloc[0]
+    top_pick = best["Ticker"]
 
-    # --- PERFORMANCE (4-MONTH WINDOW) ---
+    # Performance
     oos_window = returns[top_pick].tail(oos_size)
     wealth = (1 + oos_window).cumprod()
-    ann_return_val = (wealth.iloc[-1] ** (252 / oos_size)) - 1
+    ann_ret = (wealth.iloc[-1] ** (252 / oos_size)) - 1
     
-    try:
-        sofr_series = engine["fred"].get_series('SOFR', oos_window.index[0]).reindex(oos_window.index).ffill()
-        rf_daily = (sofr_series.mean() / 100) / 252 
-    except:
-        rf_daily = 0.0525 / 252 
-
-    excess_returns = oos_window - rf_daily
-    sharpe_val = (excess_returns.mean() / excess_returns.std()) * np.sqrt(252) if excess_returns.std() != 0 else 0.0
-    
-    # --- UPDATED: 45 DAY LOG ---
+    # Audit Log (45 Day)
     audit_df = pd.DataFrame({
-        "Date": returns[top_pick].tail(45).index.strftime('%Y-%m-%d'), 
-        "Ticker": [top_pick]*45, 
-        "Net Return": [f"{v:.2%}" for v in returns[top_pick].tail(45).values]
+        "Date": returns[top_pick].tail(45).index.strftime('%Y-%m-%d'),
+        "Ticker": [top_pick]*45,
+        "Daily Ret": [f"{v:.2%}" for v in returns[top_pick].tail(45).values]
     })
 
-    interface.render_main_output(top_pick, f"{sharpe_val:.2f}", (oos_window > 0).sum() / oos_size, f"{ann_return_val:.2%}", top_horizon, wealth, audit_df)
+    interface.render_main_output(top_pick, "N/A", (oos_window > 0).sum() / oos_size, f"{ann_ret:.2%}", f"{int(best['Horizon'])} Days", wealth, audit_df)

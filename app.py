@@ -13,7 +13,7 @@ import interface
 import time
 
 # ==========================================
-# 1. THE MATH ENGINE (BACK TO STABLE VERSION)
+# 1. THE MATH ENGINE (PPO + MOMENTUM)
 # ==========================================
 class PPONetwork(nn.Module):
     def __init__(self, input_dim, action_dim):
@@ -41,7 +41,6 @@ def train_engine(start_year, etf_list):
     if raw_data is None or raw_data.empty:
         return None
 
-    # Cleaning data
     returns_df = raw_data.ffill().pct_change().dropna()
     vols = returns_df.rolling(window=20).std().dropna()
     returns_df = returns_df.loc[vols.index]
@@ -53,13 +52,17 @@ def train_engine(start_year, etf_list):
     
     full_df = pd.concat([returns_df, vols, macro, m_raw.reindex(returns_df.index).ffill()], axis=1).dropna()
     
-    # --- STABLE SPLIT LOGIC ---
-    oos_size = 126
-    if len(full_df) - oos_size < 100: # Safety buffer
-        oos_size = 60
-        
+    # --- UPDATED: 4-MONTH OOS (84 TRADING DAYS) ---
+    oos_size = 84
+    
     train_df = full_df.iloc[:-oos_size]
     train_returns = returns_df.iloc[:-oos_size]
+    
+    # --- UPDATED: 600 EPOCHS FOR 2021+ ---
+    if start_year >= 2021:
+        n_epochs = 600
+    else:
+        n_epochs = 150
     
     scaler = StandardScaler()
     scaled_train = scaler.fit_transform(train_df)
@@ -67,8 +70,7 @@ def train_engine(start_year, etf_list):
     agent = PPONetwork(scaled_train.shape[1], len(etf_list))
     optimizer = optim.Adam(agent.parameters(), lr=5e-4)
     
-    # Reverting to fixed 150 epochs for high-conviction momentum
-    for _ in range(150):
+    for _ in range(n_epochs):
         idx = np.random.randint(0, len(scaled_train)-1, 64)
         loss = nn.MSELoss()(agent(torch.FloatTensor(scaled_train[idx])), torch.FloatTensor(train_returns.values[idx]))
         optimizer.zero_grad(); loss.backward(); optimizer.step()
@@ -109,7 +111,7 @@ if engine:
         best = pd.DataFrame(decision_matrix).sort_values("NetVal", ascending=False).iloc[0]
         top_pick, top_horizon = best["Ticker"], f"{int(best['Horizon'])} Day" if best['Horizon'] == 1 else f"{int(best['Horizon'])} Days"
 
-    # --- 6-MONTH OOS PERFORMANCE & SHARPE (SOFR) ---
+    # --- PERFORMANCE (4-MONTH WINDOW) ---
     oos_window = returns[top_pick].tail(oos_size)
     wealth = (1 + oos_window).cumprod()
     ann_return_val = (wealth.iloc[-1] ** (252 / oos_size)) - 1
@@ -123,10 +125,11 @@ if engine:
     excess_returns = oos_window - rf_daily
     sharpe_val = (excess_returns.mean() / excess_returns.std()) * np.sqrt(252) if excess_returns.std() != 0 else 0.0
     
+    # --- UPDATED: 45 DAY LOG ---
     audit_df = pd.DataFrame({
-        "Date": returns[top_pick].tail(15).index.strftime('%Y-%m-%d'), 
-        "Ticker": [top_pick]*15, 
-        "Net Return": [f"{v:.2%}" for v in returns[top_pick].tail(15).values]
+        "Date": returns[top_pick].tail(45).index.strftime('%Y-%m-%d'), 
+        "Ticker": [top_pick]*45, 
+        "Net Return": [f"{v:.2%}" for v in returns[top_pick].tail(45).values]
     })
 
     interface.render_main_output(top_pick, f"{sharpe_val:.2f}", (oos_window > 0).sum() / oos_size, f"{ann_return_val:.2%}", top_horizon, wealth, audit_df)

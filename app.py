@@ -156,25 +156,28 @@ def train_lstm(X_train, y_train, seq_len=30, epochs=40, batch_size=64):
 # Simple greedy backtest (long only, pick best predicted ETF)
 # ────────────────────────────────────────────────
 
-def run_backtest(df_oos, hold_days, tc_bps, retrain_every=5, seq_len=30):
-    features = [c for c in df_oos.columns if c not in ETFS]
-    returns = []
+def run_backtest(df_oos_eng, df_raw, hold_days, tc_bps, retrain_every=5, seq_len=30):
+    features = [c for c in df_oos_eng.columns if c not in ETFS]
+    net_returns = []
+    positions = []
+    dates = df_oos_eng.index
 
-    current_train_end = df_oos.index[0] - pd.Timedelta(days=1)
+    current_train_end = df_oos_eng.index[0] - pd.Timedelta(days=1)
     equity = 1.0
     equity_curve = []
-    positions = []
+    predicted_signs = []  # for audit
 
-    for i in range(0, len(df_oos) - hold_days, hold_days):
-        window_end = df_oos.index[i]
+    for i in range(0, len(df_oos_eng) - hold_days, hold_days):
+        window_end = df_oos_eng.index[i]
 
         # Retrain periodically
-        if (i == 0) or ((window_end - current_train_end).days >= retrain_every * hold_days):
-            train_slice = df_full[df_full.index < window_end]
-            if len(train_slice) < 200:
+        if (i == 0) or ((window_end - current_train_end).days >= retrain_every):
+            train_raw = df_raw[df_raw.index < window_end]
+            train_eng = engineer_features(train_raw)
+            if len(train_eng) < 200:
                 continue
-            X_train = train_slice[features].values
-            y_train = train_slice[ETFS].pct_change(hold_days).iloc[seq_len:].values  # align
+            X_train = train_eng[features].values
+            y_train = train_eng[ETFS].pct_change(hold_days).dropna().values
             if len(y_train) < 10:
                 continue
             model, scX, scy = train_lstm(X_train, y_train, seq_len=seq_len)
@@ -182,108 +185,97 @@ def run_backtest(df_oos, hold_days, tc_bps, retrain_every=5, seq_len=30):
 
         # Get latest sequence for prediction
         start_idx = max(0, i - seq_len)
-        seq = df_oos[features].iloc[start_idx:i].values
-        if len(seq) < seq_len:
+        seq = df_oos_eng[features].iloc[start_idx:i + 1].values  # +1 to include current
+        if len(seq) < seq_len + 1:
             continue
         seq_scaled = scX.transform(seq)
-        seq_t = torch.tensor(seq_scaled[None], dtype=torch.float32)  # [1, seq, feat]
-
+        pred_t = torch.tensor(seq_scaled[None, :-1, :], dtype=torch.float32)  # exclude last for prediction
         model.eval()
         with torch.no_grad():
-            pred_scaled = model(seq_t).numpy()[0]
+            pred_scaled = model(pred_t).numpy()[0]
         pred_returns = scy.inverse_transform([pred_scaled])[0]
 
-        # Choose ETF with highest predicted return (if positive)
+        # Trading logic
         best_idx = np.argmax(pred_returns)
         best_etf = ETFS[best_idx]
         expected_ret = pred_returns[best_idx]
 
-        # Realized return over hold period
-        if i + hold_days >= len(df_oos):
+        # Realized
+        if i + hold_days >= len(df_oos_eng):
             break
-        start_price = df_oos[best_etf].iloc[i]
-        end_price   = df_oos[best_etf].iloc[i + hold_days]
+        start_price = df_oos_eng[best_etf].iloc[i]
+        end_price = df_oos_eng[best_etf].iloc[i + hold_days]
         gross_ret = (end_price / start_price) - 1 if start_price > 0 else 0
 
-        # Transaction cost (applied on entry – simplistic)
-        tc = tc_bps / 10000.0
-        net_ret = gross_ret - tc if expected_ret > 0 else 0  # only trade if predicted positive
+        tc = tc_bps / 10000.0 if expected_ret > 0 else 0
+        net_ret = gross_ret - tc if expected_ret > 0 else 0
 
         equity *= (1 + net_ret)
         equity_curve.append(equity)
-        returns.append(net_ret)
+        net_returns.append(net_ret)
         positions.append(best_etf if net_ret != 0 else "Cash")
 
-    if not equity_curve:
-        return 0.0, [], []
+        # For audit: predicted sign vs actual
+        actual_ret = gross_ret
+        predicted_sign = 'positive' if expected_ret > 0 else 'negative'
+        actual_sign = 'positive' if actual_ret > 0 else 'negative'
+        predicted_signs.append((dates[i], best_etf, predicted_sign, actual_sign))
 
-    days_in_period = (df_oos.index[-1] - df_oos.index[0]).days
-    ann_ret = (equity ** (365 / days_in_period)) - 1 if equity > 0 and days_in_period > 0 else -1.0
-    return ann_ret, equity_curve, positions
+    if not equity_curve:
+        return 0.0, [], [], [], []
+
+    ann_ret = (equity ** (252 / (len(df_oos_eng) / hold_days))) - 1
+
+    # Monthly returns
+    net_rets_df = pd.Series(net_returns, index=dates[:len(net_returns)])
+    monthly_returns = net_rets_df.resample('M').sum()
+
+    # Last 15 days audit
+    last_15_start = today - timedelta(days=15)
+    last_15 = [p for p in predicted_signs if p[0] >= last_15_start]
+
+    return ann_ret, equity_curve, monthly_returns, last_15, positions
 
 # ────────────────────────────────────────────────
 # Streamlit App
 # ────────────────────────────────────────────────
 
-st.title("ETF Macro Momentum Engine")
-st.caption("Long-only – return maximization using macro proxies & LSTM forecasts")
+st.title("Fixed Income ETF Forecasting Engine")
 
-# ── Controls ─────────────────────────────────────
-
-col1, col2, col3 = st.columns(3)
-
-with col1:
-    tc_bps = st.slider("Transaction costs (bps per trade)", 0, 100, 10, step=5)
-
-with col2:
-    hold_period = st.radio("Holding period (days)", [1, 3, 5], index=2, horizontal=True)
-
-with col3:
-    retrain_freq = st.radio("Retrain model every (periods)", [3, 5, 10], index=1, horizontal=True)
-
-# ── Data ─────────────────────────────────────────
+tc_bps = st.slider("Transaction Costs (bps)", 0, 100, 10)
 
 today = datetime(2026, 2, 11)
 start_hist = "2010-01-01"
 oos_start  = "2021-01-01"
 
-with st.spinner("Loading market & macro proxy data from Polygon..."):
-    global df_full
-    df_full = fetch_data(start_hist, today.strftime("%Y-%m-%d"))
-    df_eng  = engineer_features(df_full)
+with st.spinner("Loading data..."):
+    df_raw = fetch_data(start_hist, today.strftime("%Y-%m-%d"))
+    df_eng = engineer_features(df_raw)
 
-df_train = df_eng[df_eng.index < oos_start]
-df_oos   = df_eng[df_eng.index >= oos_start]
+df_train_eng = df_eng[df_eng.index < oos_start]
+df_oos_eng = df_eng[df_eng.index >= oos_start]
 
-st.caption(f"Training data until {oos_start}  •  OOS period: ~{len(df_oos)} days")
+if st.button("Run Backtest"):
+    hold_periods = [1, 3, 5]
+    results = {}
+    for h in hold_periods:
+        ann_ret, equity_curve, monthly_returns, last_15, _ = run_backtest(df_oos_eng, df_raw, h, tc_bps)
+        net_ann_ret = ann_ret - (tc_bps / 10000 * (252 / h))  # approximate annual TC impact
+        results[h] = (net_ann_ret, equity_curve, monthly_returns, last_15)
 
-# ── Run backtest ─────────────────────────────────
+    best_h = max(results, key=lambda k: results[k][0])
+    best_ann, best_equity, best_monthly, best_last15 = results[best_h]
 
-if st.button("Run Backtest", type="primary"):
-    with st.spinner(f"Backtesting – {hold_period}d hold, retrain every {retrain_freq} periods, {tc_bps} bps costs..."):
-        ann_ret, equity_curve, positions = run_backtest(
-            df_oos, hold_days=hold_period, tc_bps=tc_bps,
-            retrain_every=retrain_freq, seq_len=30
-        )
+    st.write(f"Best hold period: {best_h} days with annualized return net of costs: {best_ann*100:.2f}%")
 
-    st.subheader(f"Annualized Return (net): **{ann_ret*100:.2f}%**")
+    # Graph
+    eq_series = pd.Series(best_equity, index=df_oos_eng.index[:len(best_equity)])
+    fig = go.Figure(go.Scatter(x=eq_series.index, y=eq_series, mode='lines'))
+    st.plotly_chart(fig)
 
-    if equity_curve:
-        eq_series = pd.Series(equity_curve, index=df_oos.index[:len(equity_curve)])
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(
-            x=eq_series.index,
-            y=eq_series,
-            mode='lines',
-            name='Equity Curve',
-            line=dict(color='royalblue')
-        ))
-        fig.update_layout(
-            title=f"Equity Curve – {hold_period}d hold / {tc_bps} bps",
-            yaxis_title="Cumulative Wealth (1 = start)",
-            xaxis_title="Date",
-            template="plotly_dark"
-        )
-        st.plotly_chart(fig, use_container_width=True)
+    # Monthly returns
+    st.table(best_monthly.rename("Monthly Returns"))
 
-    st.success("Backtest finished.")
+    # Last 15 day audit
+    audit_df = pd.DataFrame(best_last15, columns=['Date', 'ETF', 'Predicted Sign', 'Actual Sign'])
+    st.table(audit_df)

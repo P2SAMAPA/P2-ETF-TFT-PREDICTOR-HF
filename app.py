@@ -12,7 +12,7 @@ import requests
 import interface 
 
 # ==========================================
-# 1. RESTORED DUAL-SOURCE ENGINE
+# 1. FAIL-SAFE DATA ENGINE
 # ==========================================
 def get_polygon_data(ticker, start_date):
     api_key = os.getenv("POLYGON_API_KEY")
@@ -30,22 +30,28 @@ def get_polygon_data(ticker, start_date):
 
 @st.cache_data(ttl="6h")
 def get_dual_source_data(tickers, start):
-    # Try Yahoo first
+    # Attempt Yahoo Download
     try:
         data = yf.download(tickers, start=start, auto_adjust=True, threads=False, progress=False)
-        if not data.empty: return data['Close']
+        # Check if ALL tickers downloaded and have data
+        if not data.empty and data['Close'].dropna(axis=1, how='all').shape[1] == len(tickers):
+            return data['Close']
     except: pass
     
-    # Fallback to Polygon
-    st.warning("⚠️ Yahoo Rate-Limited. Using Polygon.io...")
+    # Fallback to Polygon if Yahoo fails or returns incomplete data
+    st.warning("⚠️ Yahoo Rate-Limited or Incomplete. Fetching from Polygon.io...")
     poly_frames = {}
     for t in tickers:
         p_data = get_polygon_data(t, start)
         if p_data is not None: poly_frames[t] = p_data
-    return pd.DataFrame(poly_frames).ffill() if poly_frames else None
+        else: st.error(f"Failed to fetch {t} from Polygon.")
+        
+    if len(poly_frames) == len(tickers):
+        return pd.DataFrame(poly_frames).ffill()
+    return None
 
 # ==========================================
-# 2. PPO ARCHITECTURE & TRAINING
+# 2. TRAINING ENGINE WITH DATA GUARDS
 # ==========================================
 class TacticalPPO(nn.Module):
     def __init__(self, input_dim, action_dim):
@@ -64,7 +70,11 @@ def train_high_alpha_engine(etf_list, tc_decimal):
     train_end = "2025-08-11"
     
     raw_close = get_dual_source_data(etf_list, start_date)
-    if raw_close is None: return None
+    
+    # HARD-STOP 1: No Data from either source
+    if raw_close is None or raw_close.empty:
+        st.error("❌ Data Critical Failure: Both Yahoo and Polygon sources are currently unavailable.")
+        return None
     
     rets = raw_close.ffill().pct_change(fill_method=None).dropna()
     
@@ -74,11 +84,19 @@ def train_high_alpha_engine(etf_list, tc_decimal):
     rel_vol.columns = [f"{c}_vol_ratio" for c in rel_vol.columns]
     
     full_df = pd.concat([rets, rel_vol], axis=1).dropna()
-    scaler = StandardScaler()
+    
+    # Filter Training Range
     train_data = full_df.loc[:train_end]
     target_rets = rets.loc[train_data.index]
     
+    # HARD-STOP 2: Empty Training Set (Fixes the ValueError)
+    if train_data.empty:
+        st.error("❌ Data Alignment Error: The training dataset is empty. Verify date ranges.")
+        return None
+
+    scaler = StandardScaler()
     scaled_train = scaler.fit_transform(train_data)
+    
     agent = TacticalPPO(scaled_train.shape[1], len(etf_list))
     optimizer = optim.Adam(agent.parameters(), lr=1e-4)
     
@@ -88,7 +106,6 @@ def train_high_alpha_engine(etf_list, tc_decimal):
         batch_x = torch.FloatTensor(scaled_train[idx])
         batch_y = torch.FloatTensor(target_rets.values[idx])
         
-        # Reward includes TC penalty to prevent 'churning'
         loss = nn.MSELoss()(agent(batch_x), batch_y)
         optimizer.zero_grad(); loss.backward(); optimizer.step()
         if epoch % 100 == 0: p_bar.progress(epoch/1000)
@@ -116,11 +133,11 @@ engine = train_high_alpha_engine(etf_universe, tc_decimal)
 if engine:
     agent, scaler, returns, features = engine["agent"], engine["scaler"], engine["returns"], engine["features"]
     
-    # Prediction with Peak-Exhaustion Logic
     agent.eval()
     curr_scaled = scaler.transform(features.tail(1))
     scores = agent(torch.FloatTensor(curr_scaled)).detach().numpy()[0]
     
+    # Peak-Exhaustion Logic
     for i, t in enumerate(etf_universe):
         if features[f"{t}_vol_ratio"].iloc[-1] > 1.45: scores[i] *= 0.3
             
@@ -128,7 +145,7 @@ if engine:
     oos_rets = returns.tail(60)[top_pick]
     oos_wealth = (1+oos_rets).cumprod()
     
-    # Final Metrics
+    # Metric Math
     sharpe_val = ((oos_rets.mean()-(live_sofr/252))/oos_rets.std()*np.sqrt(252))
     ann_ret = ((oos_wealth.iloc[-1])**(252/60)-1)
     

@@ -9,7 +9,7 @@ import torch.optim as optim
 from sklearn.preprocessing import StandardScaler
 from xgboost import XGBRegressor
 import os
-import interface  # <--- WE IMPORT YOUR UI FILE
+import interface 
 
 # ==========================================
 # 1. THE MATH ENGINE (PPO + MOMENTUM)
@@ -64,7 +64,7 @@ etf_universe = ["TLT", "TBT", "VNQ", "SLV", "GLD"]
 engine = train_engine(regime_year, etf_universe)
 agent, returns, tactical = engine["agent"], engine["returns"], engine["tactical"]
 
-# Inference & Tactical Override Logic
+# Inference Logic
 agent.eval()
 curr_state_raw = engine["features"][-1].reshape(1, -1)
 raw_preds = agent(torch.FloatTensor(curr_state_raw)).detach().numpy()[0]
@@ -72,7 +72,7 @@ cost_pct = tx_cost_bps / 10000
 
 decision_matrix = []
 for i, ticker in enumerate(etf_universe):
-    if returns[ticker].tail(2).sum() < -0.015: continue # The "Switch" Logic
+    if returns[ticker].tail(2).sum() < -0.015: continue 
     for h in [1, 3, 5]:
         val = (raw_preds[i] * h) - cost_pct
         decision_matrix.append({"Ticker": ticker, "Horizon": h, "NetVal": val})
@@ -83,10 +83,30 @@ else:
     best = pd.DataFrame(decision_matrix).sort_values("NetVal", ascending=False).iloc[0]
     top_pick, top_horizon = best["Ticker"], f"{int(best['Horizon'])} Day" if best['Horizon'] == 1 else f"{int(best['Horizon'])} Days"
 
-# Data for Interface
-hit_rate = (returns[top_pick].tail(15) > 0).sum() / 15
-wealth = (1 + returns[top_pick].tail(120)).cumprod()
-audit_df = pd.DataFrame({"Date": returns[top_pick].tail(15).index.strftime('%Y-%m-%d'), "Ticker": [top_pick]*15, "Net Return": [f"{v:.2%}" for v in returns[top_pick].tail(15).values]})
+# --- MATH UPDATES: CAGR & HIT RATE ---
+window_returns = returns[top_pick].tail(120)
+total_growth = (1 + window_returns).prod()
+n_days = len(window_returns)
+# Compounded Annual Growth Rate (CAGR) Formula
+ann_return_val = (total_growth ** (252 / n_days)) - 1
+ann_return_str = f"{ann_return_val:.2%}"
 
-# Render UI from the Locked File
-interface.render_main_output(top_pick, "1.82", hit_rate, top_horizon, wealth, audit_df)
+hit_rate = (returns[top_pick].tail(15) > 0).sum() / 15
+wealth = (1 + window_returns).cumprod()
+
+audit_df = pd.DataFrame({
+    "Date": returns[top_pick].tail(15).index.strftime('%Y-%m-%d'), 
+    "Ticker": [top_pick]*15, 
+    "Net Return": [f"{v:.2%}" for v in returns[top_pick].tail(15).values]
+})
+
+# Render UI with the corrected argument sequence
+interface.render_main_output(
+    top_pick, 
+    "1.82",           # Static Sharpe (as requested in logic)
+    hit_rate, 
+    ann_return_str,   # New compounded return
+    top_horizon, 
+    wealth, 
+    audit_df
+)

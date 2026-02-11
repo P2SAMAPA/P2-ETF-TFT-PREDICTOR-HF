@@ -10,6 +10,10 @@ from sklearn.preprocessing import MinMaxScaler
 import plotly.graph_objects as go
 from datetime import datetime, timedelta
 from polygon import RESTClient
+import warnings
+
+# Suppress FutureWarning for Pandas fill methods
+warnings.filterwarnings("ignore", category=FutureWarning, message="Downcasting object dtype arrays")
 
 # ────────────────────────────────────────────────
 # Configuration
@@ -43,11 +47,11 @@ def fetch_data(start_date: str, end_date: str) -> pd.DataFrame:
             df = pd.DataFrame(aggs)
             df['date'] = pd.to_datetime(df['timestamp'], unit='ms').dt.date
             df = df.set_index('date')[['close']].rename(columns={'close': ticker})
-            data[ticker] = df
+            data[ticker] = df.astype(float)  # Ensure float dtype
             st.info(f"Fetched {ticker} successfully ({len(df)} rows)")
         except Exception as e:
             st.warning(f"Failed to fetch {ticker}: {str(e)}. Using empty series.")
-            data[ticker] = pd.Series(name=ticker)  # empty → avoids KeyError later
+            data[ticker] = pd.Series(dtype=float, name=ticker)  # empty with float dtype
 
     if not data:
         st.error("No data fetched at all. Check Polygon API key and connectivity.")
@@ -55,14 +59,14 @@ def fetch_data(start_date: str, end_date: str) -> pd.DataFrame:
 
     combined = pd.concat(data.values(), axis=1).sort_index()
     combined.index = pd.to_datetime(combined.index)
-    return combined
+    return combined.astype(float)  # Force all to float
 
 # ────────────────────────────────────────────────
 # Feature Engineering – using proxies
 # ────────────────────────────────────────────────
 
 def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
+    df = df.copy().astype(float)  # Ensure numeric dtypes early
 
     # Proxy for 10Y-2Y spread: longer-duration ETF minus shorter-duration
     if 'IEF' in df.columns and 'SHY' in df.columns:

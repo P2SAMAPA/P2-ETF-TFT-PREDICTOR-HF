@@ -4,6 +4,6 @@ numpy
 yfinance
 fredapi
 torch
-sklearn
+scikit-learn
 xgboost
 plotly

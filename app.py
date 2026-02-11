@@ -39,6 +39,13 @@ def train_engine(start_year, etf_list):
     
     full_df = pd.concat([returns_df, vols, macro, m_raw.reindex(returns_df.index).ffill()], axis=1).dropna()
     
+    # --- DYNAMIC EPOCH CALCULATION ---
+    # Shorter history = More epochs to ensure convergence
+    current_year = 2026
+    years_of_data = current_year - start_year
+    # Base 150 for 18 years (2008), scales up to ~500 for 5 years (2021)
+    n_epochs = int(np.clip(150 * (18 / max(years_of_data, 1)), 150, 600))
+    
     # --- STRICT OOS SPLIT (6 MONTHS = 126 TRADING DAYS) ---
     oos_size = 126
     train_df = full_df.iloc[:-oos_size]
@@ -49,7 +56,9 @@ def train_engine(start_year, etf_list):
     
     agent = PPONetwork(scaled_train.shape[1], len(etf_list))
     optimizer = optim.Adam(agent.parameters(), lr=5e-4)
-    for _ in range(150):
+    
+    # Progress indicator for the dynamic training
+    for _ in range(n_epochs):
         idx = np.random.randint(0, len(scaled_train)-1, 64)
         loss = nn.MSELoss()(agent(torch.FloatTensor(scaled_train[idx])), torch.FloatTensor(train_returns.values[idx]))
         optimizer.zero_grad(); loss.backward(); optimizer.step()
@@ -69,7 +78,6 @@ etf_universe = ["TLT", "TBT", "VNQ", "SLV", "GLD"]
 engine = train_engine(regime_year, etf_universe)
 agent, returns, full_features = engine["agent"], engine["returns"], engine["full_features"]
 
-# Inference
 agent.eval()
 curr_state_scaled = engine["scaler"].transform(full_features.tail(1))
 raw_preds = agent(torch.FloatTensor(curr_state_scaled)).detach().numpy()[0]
@@ -91,13 +99,9 @@ else:
 # --- 6-MONTH OOS PERFORMANCE & SHARPE (SOFR) ---
 oos_window = returns[top_pick].tail(126)
 wealth = (1 + oos_window).cumprod()
-
-# Annualized Return (Geometric)
-final_wealth_val = wealth.iloc[-1]
-ann_return_val = (final_wealth_val ** (252 / 126)) - 1
+ann_return_val = (wealth.iloc[-1] ** (252 / 126)) - 1
 ann_return_str = f"{ann_return_val:.2%}"
 
-# Dynamic Sharpe Calculation using SOFR
 try:
     sofr_series = engine["fred"].get_series('SOFR', oos_window.index[0]).reindex(oos_window.index).ffill()
     rf_daily = (sofr_series.mean() / 100) / 252 

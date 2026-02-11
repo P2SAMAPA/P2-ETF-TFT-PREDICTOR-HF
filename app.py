@@ -89,7 +89,7 @@ if tickers:
         fig = go.Figure()
         for t in tickers:
             fig.add_trace(go.Scatter(x=data.index, y=data[t], name=t))
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width='stretch')
         
         st.success("Data loaded successfully! LSTM Model ready for training.")
     else:

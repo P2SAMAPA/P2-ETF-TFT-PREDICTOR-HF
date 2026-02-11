@@ -53,10 +53,14 @@ st.markdown("Optimization using LSTM & Economic Indicators (FRED + Polygon)")
 # Sidebar Configuration
 st.sidebar.header("Parameters")
 lookback_days = st.sidebar.slider("Historical Lookback (Days)", 365, 3650, 1825)
+
+# Update this list with your specific ETFs
+fixed_income_etfs = ["VCLT", "TLT", "TBT", "MBB", "VNQ", "HYG", "SLV", "GLD", "PFF"]
+
 tickers = st.sidebar.multiselect(
     "Select ETFs", 
-    ["TLT", "IEF", "SHY", "LQD", "HYG", "BND", "AGG"], 
-    default=["TLT", "LQD", "HYG"]
+    fixed_income_etfs, 
+    default=["VCLT", "TLT", "HYG"] # These will be selected by default
 )
 
 # Placeholder for Data Fetching

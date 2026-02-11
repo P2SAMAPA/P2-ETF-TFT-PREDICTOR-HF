@@ -1,44 +1,56 @@
 import streamlit as st
 import pandas as pd
 
-def render_main_output(prediction, sharpe, hit_ratio, ann_return, horizon, wealth_curve, audit_df, training_info):
-    st.title(f"🚀 Alpha Engine v9: Tactical Overhaul")
+def render_main_output(top_pick, sharpe, win_rate, ann_return, timeframe, wealth_curve, audit_log, train_info):
+    # --- SIDEBAR CONTROLS ---
+    st.sidebar.header("🕹️ Strategy Controls")
     
-    # Methodology & Dates Section
-    with st.expander("ℹ️ Strategy Methodology & Training Details", expanded=False):
-        st.write(f"**Training Period:** {training_info['start']} to {training_info['end']}")
-        st.write(f"**OOS Test Period:** Last 60 Trading Days")
-        st.markdown("""
-        **Core Algorithm: PPO (Proximal Policy Optimization)**
-        * **Clipped Updates:** PPO prevents the model from making radical strategy shifts based on single-day noise.
-        * **Actor-Critic Architecture:** The 'Actor' chooses the ETF, while the 'Critic' evaluates if that choice actually reduced risk.
-        
-        **Advanced Features Added:**
-        * **Rolling Z-Score Scaling:** Normalizes features based on a 60-day moving window to catch local peaks.
-        * **Macro Integration:** Ingests 10Y2Y Treasury spreads and MOVE index to sense credit stress.
-        * **Momentum Buffers:** RSI and MACD signals are used to penalize 'Overbought' holdings.
-        """)
+    # Re-adding the Transaction Cost Slider
+    tc_pct = st.sidebar.slider(
+        "Transaction Cost / Slippage (%)", 
+        min_value=0.0, 
+        max_value=1.0, 
+        value=0.1, 
+        step=0.05,
+        help="Estimate of total cost per trade (Commissions + Bid/Ask Spread)."
+    )
+    
+    st.sidebar.divider()
+    st.sidebar.write(f"**Model:** PPO Deep Neural Net")
+    st.sidebar.write(f"**Training:** {train_info['start']} to {train_info['end']}")
 
-    # Metrics
+    # --- MAIN UI ---
+    st.title("🏔️ Alpha Engine v12.1")
+    
     col1, col2, col3 = st.columns(3)
-    with col1: st.metric("TOP PICK", prediction)
-    with col2: st.metric("ANNUALISED (Last 60D)", ann_return)
-    with col3: st.metric("SHARPE (Last 60D)", sharpe)
-
-    st.markdown("---")
     
-    left_col, right_col = st.columns([1, 1.5])
-    with left_col:
-        st.markdown(f"""
-            <div style="background-color: #0e1117; padding: 40px; border-radius: 10px; border: 2px solid #ff4b4b; text-align: center;">
-                <h1 style="font-size: 80px; color: #ff4b4b; margin: 0;">{prediction}</h1>
-                <p style="font-size: 20px; color: #8892b0;">TACTICAL HORIZON: {horizon}</p>
-            </div>
-            """, unsafe_allow_html=True)
-            
-    with right_col:
-        st.subheader("Last 60 Days Performance (OOS)")
-        st.line_chart(wealth_curve, height=350)
+    # Adjusting Annualized Return for Transaction Costs
+    # (Simplified: assumes 1 trade per week on average for tactical rotation)
+    est_trades_per_year = 52
+    net_ann_return = float(ann_return.strip('%')) / 100 - (tc_pct/100 * est_trades_per_year)
 
-    st.subheader("🔍 Verification Log (Last 45 Days)")
-    st.table(audit_df.style.map(lambda x: f"color: {'#00d4ff' if '-' not in str(x) else '#fb7185'}", subset=['Net Return']))
+    with col1:
+        st.metric("CURRENT ROTATION", top_pick)
+        st.caption("Updated: Live Market Data")
+
+    with col2:
+        st.metric("Sharpe Ratio", sharpe)
+        st.caption("Benchmark: Live SOFR")
+
+    with col3:
+        # Displaying the "Net" return after costs
+        st.metric("Net Ann. Return (Est)", f"{net_ann_return:.2%}", 
+                  delta=f"-{(tc_pct/100 * est_trades_per_year):.1%} cost drag", 
+                  delta_color="inverse")
+
+    st.divider()
+
+    # Performance Graph
+    st.subheader(f"Equity Curve: {top_pick} (Last 60D OOS)")
+    st.line_chart(wealth_curve)
+
+    # Verification Table
+    st.write("#### Historical Verification Log (Last 15 Trading Days)")
+    st.table(audit_log.head(15))
+
+    return tc_pct # Returning this in case app.py needs to use it in its logic

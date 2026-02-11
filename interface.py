@@ -39,7 +39,8 @@ def render_main_output(top_pick, sharpe, hit_rate, ann_return, top_horizon, weal
         fig = go.Figure()
         fig.add_trace(go.Scatter(x=wealth.index, y=wealth, mode='lines', line=dict(color='#00d4ff', width=3)))
         fig.update_layout(height=320, margin=dict(l=0, r=0, t=10, b=0), template="plotly_dark", yaxis_title="Growth of $1")
-        st.plotly_chart(fig, use_container_width=True)
+        # Updated to fix deprecation warning
+        st.plotly_chart(fig, width="stretch")
 
     # Row 3: Audit Table
     st.subheader("🔍 Verification Log (Last 15 Trading Days)")

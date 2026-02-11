@@ -86,7 +86,7 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
             df[f'{col}_ma20'] = df[col].rolling(20).mean()
 
     # Fill gaps (macro data can be sparse) → forward then backward
-    df = df.ffill().bfill().infer_objects(copy=False)  # Avoid FutureWarning by inferring dtypes
+    df = df.ffill().bfill().infer_objects(copy=False)  # Avoid FutureWarning
 
     return df.dropna(how='all')  # keep rows with at least some data
 

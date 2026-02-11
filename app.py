@@ -38,20 +38,27 @@ def train_engine(start_year, etf_list):
     m_raw = yf.download(["^VIX", "^MOVE"], start=start_date, progress=False)['Close']
     
     full_df = pd.concat([returns_df, vols, macro, m_raw.reindex(returns_df.index).ffill()], axis=1).dropna()
-    scaler = StandardScaler()
-    scaled_obs = scaler.fit_transform(full_df)
     
-    agent = PPONetwork(scaled_obs.shape[1], len(etf_list))
+    # --- STRICT OOS SPLIT (6 MONTHS = 126 DAYS) ---
+    oos_size = 126
+    train_df = full_df.iloc[:-oos_size]
+    train_returns = returns_df.iloc[:-oos_size]
+    
+    scaler = StandardScaler()
+    scaled_train = scaler.fit_transform(train_df)
+    
+    agent = PPONetwork(scaled_train.shape[1], len(etf_list))
     optimizer = optim.Adam(agent.parameters(), lr=5e-4)
     for _ in range(150):
-        idx = np.random.randint(0, len(scaled_obs)-1, 64)
-        loss = nn.MSELoss()(agent(torch.FloatTensor(scaled_obs[idx])), torch.FloatTensor(returns_df.values[idx]))
+        idx = np.random.randint(0, len(scaled_train)-1, 64)
+        loss = nn.MSELoss()(agent(torch.FloatTensor(scaled_train[idx])), torch.FloatTensor(train_returns.values[idx]))
         optimizer.zero_grad(); loss.backward(); optimizer.step()
         
     tactical = XGBRegressor(n_estimators=100, max_depth=5, objective='reg:absoluteerror')
-    tactical.fit(scaled_obs[:-1], returns_df.shift(-1).dropna().mean(axis=1))
+    tactical.fit(scaled_train[:-1], train_returns.shift(-1).dropna().mean(axis=1))
     
-    return {"agent": agent, "scaler": scaler, "returns": returns_df, "features": scaled_obs, "tactical": tactical}
+    # Return everything needed for inference, ensuring scaler and features are handled
+    return {"agent": agent, "scaler": scaler, "returns": returns_df, "full_features": full_df, "tactical": tactical}
 
 # ==========================================
 # 2. EXECUTION FLOW
@@ -61,11 +68,12 @@ regime_year, tx_cost_bps = interface.render_sidebar()
 
 etf_universe = ["TLT", "TBT", "VNQ", "SLV", "GLD"]
 engine = train_engine(regime_year, etf_universe)
-agent, returns, tactical = engine["agent"], engine["returns"], engine["tactical"]
+agent, returns, full_features = engine["agent"], engine["returns"], engine["full_features"]
 
+# Scale the current state using the TRAINED scaler
+curr_state_scaled = engine["scaler"].transform(full_features.tail(1))
 agent.eval()
-curr_state_raw = engine["features"][-1].reshape(1, -1)
-raw_preds = agent(torch.FloatTensor(curr_state_raw)).detach().numpy()[0]
+raw_preds = agent(torch.FloatTensor(curr_state_scaled)).detach().numpy()[0]
 cost_pct = tx_cost_bps / 10000
 
 decision_matrix = []
@@ -81,23 +89,23 @@ else:
     best = pd.DataFrame(decision_matrix).sort_values("NetVal", ascending=False).iloc[0]
     top_pick, top_horizon = best["Ticker"], f"{int(best['Horizon'])} Day" if best['Horizon'] == 1 else f"{int(best['Horizon'])} Days"
 
-# --- CORRECTED ANNUALIZED RETURN LOGIC ---
-# Calculate wealth first so we can pull the return directly from it
-wealth = (1 + returns[top_pick].tail(120)).cumprod()
-# Get the actual compounded return from the graph (Growth of $1 end point)
-total_compounded_return = wealth.iloc[-1] 
-n_days = len(wealth)
+# --- 6-MONTH OOS PERFORMANCE CALCULATIONS ---
+oos_window = returns[top_pick].tail(126) # 6 Months
+wealth = (1 + oos_window).cumprod()
 
-# Annualize the return shown in the graph: (Final Wealth ^ (252 / Days)) - 1
-ann_return_val = (total_compounded_return ** (252 / n_days)) - 1
+# Annualized Return (Geometric/Compounded)
+final_wealth_val = wealth.iloc[-1]
+# Formula: (Final Wealth ^ (252 / Trading Days)) - 1
+ann_return_val = (final_wealth_val ** (252 / 126)) - 1
 ann_return_str = f"{ann_return_val:.2%}"
 
-hit_rate = (returns[top_pick].tail(15) > 0).sum() / 15
+# Hit Rate over the 6-month period
+hit_rate = (oos_window > 0).sum() / 126
+
 audit_df = pd.DataFrame({
     "Date": returns[top_pick].tail(15).index.strftime('%Y-%m-%d'), 
     "Ticker": [top_pick]*15, 
     "Net Return": [f"{v:.2%}" for v in returns[top_pick].tail(15).values]
 })
 
-# Render UI
 interface.render_main_output(top_pick, "1.82", hit_rate, ann_return_str, top_horizon, wealth, audit_df)

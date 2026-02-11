@@ -10,6 +10,7 @@ from sklearn.preprocessing import StandardScaler
 from xgboost import XGBRegressor
 import os
 import interface 
+import time
 
 # ==========================================
 # 1. THE MATH ENGINE (PPO + ENTROPY)
@@ -27,35 +28,55 @@ class PPONetwork(nn.Module):
 @st.cache_resource(ttl="1d")
 def train_engine(start_year, etf_list):
     start_date = f"{start_year}-01-01"
-    raw_data = yf.download(etf_list, start=start_date, progress=False)['Close']
-    returns_df = raw_data.pct_change().dropna()
+    
+    # Robust Download with Retries
+    raw_data = None
+    for i in range(3):
+        try:
+            raw_data = yf.download(etf_list, start=start_date, progress=False)['Close']
+            if not raw_data.empty: break
+        except:
+            time.sleep(2)
+    
+    if raw_data is None or raw_data.empty:
+        st.error("Data download failed. Please refresh.")
+        return None
+
+    # Fix: Explicitly handle pct_change and dropna
+    returns_df = raw_data.ffill().pct_change().dropna()
     vols = returns_df.rolling(window=20).std().dropna()
     returns_df = returns_df.loc[vols.index]
     
     fred = Fred(api_key=os.getenv("FRED_API_KEY"))
     macro = pd.DataFrame(index=returns_df.index)
     macro['10Y2Y'] = fred.get_series('T10Y2Y', start_date).reindex(returns_df.index).ffill()
-    m_raw = yf.download(["^VIX", "^MOVE"], start=start_date, progress=False)['Close']
     
+    m_raw = yf.download(["^VIX", "^MOVE"], start=start_date, progress=False)['Close']
     full_df = pd.concat([returns_df, vols, macro, m_raw.reindex(returns_df.index).ffill()], axis=1).dropna()
     
-    # --- 1. DYNAMIC EPOCH CALCULATION (Up to 1000) ---
-    current_year = 2026
-    years_of_data = current_year - start_year
-    n_epochs = int(np.clip(150 * (18 / max(years_of_data, 1)), 150, 1000))
+    # --- DYNAMIC OOS PROTECTION ---
+    total_samples = len(full_df)
+    oos_size = 126 # 6 Months
+    # Ensure at least 252 days (1 year) for training
+    if total_samples - oos_size < 252:
+        oos_size = max(21, total_samples - 252) 
     
-    # --- STRICT OOS SPLIT ---
-    oos_size = 126
     train_df = full_df.iloc[:-oos_size]
     train_returns = returns_df.iloc[:-oos_size]
+    
+    # Validation for Empty Array
+    if train_df.empty:
+        st.error(f"Insufficient data for anchor {start_year}. Try an earlier year.")
+        return None
+
+    # Epoch Calculation
+    years_of_data = 2026 - start_year
+    n_epochs = int(np.clip(150 * (18 / max(years_of_data, 1)), 150, 1000))
     
     scaler = StandardScaler()
     scaled_train = scaler.fit_transform(train_df)
     
     agent = PPONetwork(scaled_train.shape[1], len(etf_list))
-    
-    # --- 2. LEARNING RATE SCHEDULER ---
-    # Start at 5e-4, gradually reduce to settle on the best alpha
     optimizer = optim.Adam(agent.parameters(), lr=5e-4)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=n_epochs)
     
@@ -65,24 +86,16 @@ def train_engine(start_year, etf_list):
         targets = torch.FloatTensor(train_returns.values[idx])
         
         mse_loss = nn.MSELoss()(preds, targets)
-        
-        # --- 3. ENTROPY BOOST (Exploration) ---
-        # High entropy = Diverse predictions. We subtract it to maximize exploration.
         probs = torch.softmax(preds, dim=1)
         entropy = -torch.mean(torch.sum(probs * torch.log(probs + 1e-5), dim=1))
         
-        # Total loss: reduce prediction error but maintain exploration early on
         loss = mse_loss - (0.02 * entropy) 
-        
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-        scheduler.step() # Decay learning rate
+        optimizer.zero_grad(); loss.backward(); optimizer.step(); scheduler.step()
         
     tactical = XGBRegressor(n_estimators=100, max_depth=5, objective='reg:absoluteerror')
     tactical.fit(scaled_train[:-1], train_returns.shift(-1).dropna().mean(axis=1))
     
-    return {"agent": agent, "scaler": scaler, "returns": returns_df, "full_features": full_df, "tactical": tactical, "fred": fred}
+    return {"agent": agent, "scaler": scaler, "returns": returns_df, "full_features": full_df, "tactical": tactical, "fred": fred, "oos_size": oos_size}
 
 # ==========================================
 # 2. EXECUTION FLOW
@@ -92,47 +105,48 @@ regime_year, tx_cost_bps = interface.render_sidebar()
 
 etf_universe = ["TLT", "TBT", "VNQ", "SLV", "GLD"]
 engine = train_engine(regime_year, etf_universe)
-agent, returns, full_features = engine["agent"], engine["returns"], engine["full_features"]
 
-agent.eval()
-curr_state_scaled = engine["scaler"].transform(full_features.tail(1))
-raw_preds = agent(torch.FloatTensor(curr_state_scaled)).detach().numpy()[0]
-cost_pct = tx_cost_bps / 10000
+if engine:
+    agent, returns, full_features = engine["agent"], engine["returns"], engine["full_features"]
+    oos_size = engine["oos_size"]
 
-decision_matrix = []
-for i, ticker in enumerate(etf_universe):
-    if returns[ticker].tail(2).sum() < -0.015: continue 
-    for h in [1, 3, 5]:
-        val = (raw_preds[i] * h) - cost_pct
-        decision_matrix.append({"Ticker": ticker, "Horizon": h, "NetVal": val})
+    # Inference
+    agent.eval()
+    curr_state_scaled = engine["scaler"].transform(full_features.tail(1))
+    raw_preds = agent(torch.FloatTensor(curr_state_scaled)).detach().numpy()[0]
+    cost_pct = tx_cost_bps / 10000
 
-if not decision_matrix:
-    top_pick, top_horizon = "TBT", "3 Days"
-else:
-    best = pd.DataFrame(decision_matrix).sort_values("NetVal", ascending=False).iloc[0]
-    top_pick, top_horizon = best["Ticker"], f"{int(best['Horizon'])} Day" if best['Horizon'] == 1 else f"{int(best['Horizon'])} Days"
+    decision_matrix = []
+    for i, ticker in enumerate(etf_universe):
+        if returns[ticker].tail(2).sum() < -0.015: continue 
+        for h in [1, 3, 5]:
+            val = (raw_preds[i] * h) - cost_pct
+            decision_matrix.append({"Ticker": ticker, "Horizon": h, "NetVal": val})
 
-# --- 6-MONTH OOS PERFORMANCE & SHARPE (SOFR) ---
-oos_window = returns[top_pick].tail(126)
-wealth = (1 + oos_window).cumprod()
+    if not decision_matrix:
+        top_pick, top_horizon = "TBT", "3 Days"
+    else:
+        best = pd.DataFrame(decision_matrix).sort_values("NetVal", ascending=False).iloc[0]
+        top_pick, top_horizon = best["Ticker"], f"{int(best['Horizon'])} Day" if best['Horizon'] == 1 else f"{int(best['Horizon'])} Days"
 
-ann_return_val = (wealth.iloc[-1] ** (252 / 126)) - 1
-ann_return_str = f"{ann_return_val:.2%}"
+    # --- PERFORMANCE ---
+    oos_window = returns[top_pick].tail(oos_size)
+    wealth = (1 + oos_window).cumprod()
+    ann_return_val = (wealth.iloc[-1] ** (252 / oos_size)) - 1
+    
+    try:
+        sofr_series = engine["fred"].get_series('SOFR', oos_window.index[0]).reindex(oos_window.index).ffill()
+        rf_daily = (sofr_series.mean() / 100) / 252 
+    except:
+        rf_daily = 0.0525 / 252 
 
-try:
-    sofr_series = engine["fred"].get_series('SOFR', oos_window.index[0]).reindex(oos_window.index).ffill()
-    rf_daily = (sofr_series.mean() / 100) / 252 
-except Exception:
-    rf_daily = 0.0525 / 252 
+    excess_returns = oos_window - rf_daily
+    sharpe_val = (excess_returns.mean() / excess_returns.std()) * np.sqrt(252) if excess_returns.std() != 0 else 0.0
+    
+    audit_df = pd.DataFrame({
+        "Date": returns[top_pick].tail(15).index.strftime('%Y-%m-%d'), 
+        "Ticker": [top_pick]*15, 
+        "Net Return": [f"{v:.2%}" for v in returns[top_pick].tail(15).values]
+    })
 
-excess_returns = oos_window - rf_daily
-sharpe_val = (excess_returns.mean() / excess_returns.std()) * np.sqrt(252) if excess_returns.std() != 0 else 0.0
-
-hit_rate = (oos_window > 0).sum() / 126
-audit_df = pd.DataFrame({
-    "Date": returns[top_pick].tail(15).index.strftime('%Y-%m-%d'), 
-    "Ticker": [top_pick]*15, 
-    "Net Return": [f"{v:.2%}" for v in returns[top_pick].tail(15).values]
-})
-
-interface.render_main_output(top_pick, f"{sharpe_val:.2f}", hit_rate, ann_return_str, top_horizon, wealth, audit_df)
+    interface.render_main_output(top_pick, f"{sharpe_val:.2f}", (oos_window > 0).sum() / oos_size, f"{ann_return_val:.2%}", top_horizon, wealth, audit_df)

@@ -1,7 +1,6 @@
 import streamlit as st
 import plotly.graph_objects as go
 import pandas as pd
-import numpy as np
 from datetime import datetime
 
 def render_sidebar():
@@ -12,15 +11,17 @@ def render_sidebar():
 
 def color_returns(val):
     if isinstance(val, str) and '%' in val:
-        num = float(val.replace('%', ''))
-        color = '#00d4ff' if num > 0 else '#fb7185'
-        return f'color: {color}'
+        try:
+            num = float(val.replace('%', ''))
+            color = '#00d4ff' if num > 0 else '#fb7185'
+            return f'color: {color}'
+        except: return ''
     return ''
 
-def render_main_output(top_pick, ann_return, sharpe, hit_rate, top_horizon, wealth, audit_df, returns_df):
+def render_main_output(top_pick, ann_return, sharpe, hit_rate, top_horizon, wealth, audit_df, oos_returns):
     st.markdown(f"### 🔥 High-Beta Strategy Cycle: **{datetime.now().strftime('%B %d, %Y')}**")
     
-    # Row 1: Metrics (Fixed Layout)
+    # Row 1: Metrics
     c1, c2, c3 = st.columns(3)
     with c1: st.metric("TOP PREDICTION", top_pick)
     with c2: 
@@ -46,19 +47,18 @@ def render_main_output(top_pick, ann_return, sharpe, hit_rate, top_horizon, weal
         fig.update_layout(height=320, margin=dict(l=0, r=0, t=10, b=0), template="plotly_dark", yaxis_title="Growth of $1")
         st.plotly_chart(fig, use_container_width=True)
 
-    # Row 3: Monthly Returns Table (Geometric Compounding)
+    # Row 3: Monthly Performance Table
     st.subheader("📅 Monthly Performance Attribution (OOS)")
-    # Group by Year/Month
-    monthly = returns_df.groupby([returns_df.index.year, returns_df.index.month]).apply(lambda x: (1 + x).prod() - 1)
-    monthly_matrix = monthly.unstack()
-    monthly_matrix.columns = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'][:len(monthly_matrix.columns)]
+    # Grouping daily returns into monthly compounding
+    monthly = oos_returns.groupby([oos_returns.index.year, oos_returns.index.month]).apply(lambda x: (1 + x).prod() - 1)
+    monthly_df = monthly.unstack()
+    monthly_df.columns = [datetime(2000, m, 1).strftime('%b') for m in monthly_df.columns]
     
-    # Add Annual Geometric Total
-    monthly_matrix['Annual'] = (1 + monthly_matrix).prod(axis=1) - 1
+    # Geometric Annual Total
+    monthly_df['Annual Total'] = (1 + monthly_df).prod(axis=1) - 1
     
-    # Formatting
-    fmt_matrix = monthly_matrix.applymap(lambda x: f"{x:.2%}" if pd.notnull(x) else "")
-    st.table(fmt_matrix.style.applymap(color_returns))
+    fmt_df = monthly_df.applymap(lambda x: f"{x:.2%}" if pd.notnull(x) else "")
+    st.table(fmt_df.style.applymap(color_returns))
 
     # Row 4: Audit Table
     st.subheader("🔍 Verification Log (Last 15 Trading Days)")

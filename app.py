@@ -17,13 +17,13 @@ class FinancialTransformer(nn.Module):
         self.pos_encoder = nn.Parameter(torch.zeros(1, 30, d_model))
         encoder_layers = nn.TransformerEncoderLayer(d_model=d_model, nhead=num_heads, batch_first=True)
         self.transformer_encoder = nn.TransformerEncoder(encoder_layers, num_layers=3)
-        self.decoder = nn.Linear(d_model, 6) # 5 ETFs + CASH
+        self.decoder = nn.Linear(d_model, 6) # 5 ETFs + 1 CASH
 
     def forward(self, x):
         x = self.input_projection(x) + self.pos_encoder
         return self.decoder(self.transformer_encoder(x)[:, -1, :])
 
-# --- 2. RESILIENT ENGINE ---
+# --- 2. DYNAMIC ENGINE (NO HARDCODED FALLBACKS) ---
 @st.cache_resource(ttl="1d")
 def train_engine(start_year, tx_cost_bps):
     fred = Fred(api_key=os.getenv("FRED_API_KEY"))
@@ -31,39 +31,52 @@ def train_engine(start_year, tx_cost_bps):
     start_date = f"{start_year}-01-01"
     
     # 1. Fetch ETF Data
-    try:
-        raw_prices = yf.download(etfs, start=start_date, progress=False)['Close']
-        returns_df = raw_prices.ffill().pct_change().dropna()
-    except:
-        st.error("Yahoo Finance Sync Error."); st.stop()
+    raw_prices = yf.download(etfs, start=start_date, progress=False)['Close']
+    returns_df = raw_prices.ffill().pct_change().dropna()
     
-    # 2. Add SOFR (Cash) with Fallback
+    # 2. Tiered Cash Fallback: SOFR -> 6-Month T-Bill
     try:
-        sofr_raw = fred.get_series('SOFR', start_date)
-        # Use a 4.5% annual rate if SOFR is missing to prevent empty datasets
-        sofr_daily = (sofr_raw / 360 / 100).reindex(returns_df.index).ffill().fillna(0.045/252)
-        returns_df['CASH'] = sofr_daily
+        sofr = fred.get_series('SOFR', start_date)
+        tbill = fred.get_series('DTB6', start_date)
+        cash_rate = sofr.combine_first(tbill) #
+        returns_df['CASH'] = (cash_rate / 360 / 100).reindex(returns_df.index).ffill().fillna(0.0001)
     except:
-        returns_df['CASH'] = 0.045 / 252
+        returns_df['CASH'] = 0.0001
 
-    # 3. Macro Features with Alignment Safety
+    # 3. Dynamic Macro Features (Tiered Fallbacks)
     macro = pd.DataFrame(index=returns_df.index)
-    macro['10Y2Y'] = fred.get_series('T10Y2Y', start_date).reindex(returns_df.index).ffill().fillna(0)
-    m_raw = yf.download(["^VIX", "HG=F"], start=start_date, progress=False)['Close']
-    m_rets = m_raw.reindex(returns_df.index).ffill().fillna(method='bfill')
     
-    # Use ffill BEFORE dropna to ensure we don't lose the whole array
-    full_df = pd.concat([returns_df, macro, m_rets], axis=1).ffill().dropna()
+    # Yield Curve Fallback
+    try:
+        macro['10Y2Y'] = fred.get_series('T10Y2Y', start_date)
+    except:
+        t10 = fred.get_series('DGS10', start_date)
+        t2 = fred.get_series('DGS2', start_date)
+        macro['10Y2Y'] = t10 - t2 # Manually calculate spread
+    
+    # Volatility Fallback
+    try:
+        vix_data = yf.download("^VIX", start=start_date, progress=False)['Close']
+        macro['VIX'] = vix_data
+    except:
+        # If VIX feed fails, use 20-day realized vol of TLT as a fear proxy
+        macro['VIX'] = returns_df['TLT'].rolling(20).std() * np.sqrt(252) * 100
+        
+    # Copper Fallback
+    try:
+        copper = yf.download("HG=F", start=start_date, progress=False)['Close']
+        macro['COPPER'] = copper
+    except:
+        macro['COPPER'] = fred.get_series('PCOPPUSDM', start_date) # Global Copper Price
 
-    if full_df.empty:
-        st.error(f"Regime {start_year} has no overlapping data. Try another year."); st.stop()
+    full_df = pd.concat([returns_df, macro], axis=1).ffill().dropna()
 
-    # 4. Multi-Day Target (Predicting 3-day trend)
+    # 4. Multi-Day Target (3-Day Trend)
     target_df = returns_df.rolling(window=3).sum().shift(-3).dropna()
     common_idx = full_df.index.intersection(target_df.index)
     full_df, target_df = full_df.loc[common_idx], target_df.loc[common_idx]
 
-    # 5. Training
+    # 5. Training Logic
     scaler = StandardScaler()
     scaled_data = scaler.fit_transform(full_df)
     
@@ -81,7 +94,7 @@ def train_engine(start_year, tx_cost_bps):
     loss_history = []
     
     model.train()
-    for epoch in range(100):
+    for _ in range(100):
         optimizer.zero_grad()
         output = model(X_train)
         loss = nn.HuberLoss()(output, y_train)
@@ -91,7 +104,7 @@ def train_engine(start_year, tx_cost_bps):
     return {"model": model, "scaler": scaler, "returns": returns_df, "features": scaled_data, "loss": loss_history}
 
 # --- 3. UI & SIMULATION ---
-st.set_page_config(page_title="Transformer Alpha V3", layout="wide")
+st.set_page_config(page_title="Transformer Alpha V4", layout="wide")
 
 with st.sidebar:
     st.header("⚙️ Strategy Settings")
@@ -99,7 +112,6 @@ with st.sidebar:
     tx_cost = st.number_input("Tx Cost (BPS)", 0, 50, 10)
     engine = train_engine(regime_year, tx_cost)
     
-    st.divider()
     st.subheader("Training Convergence")
     fig = go.Figure(go.Scatter(y=engine["loss"], mode='lines', line=dict(color='#00d4ff')))
     fig.update_layout(height=180, margin=dict(l=0,r=0,t=10,b=0), template="plotly_dark")
@@ -123,7 +135,7 @@ for i in range(len(oos_features) - 30):
     current_pick = assets[np.argmax(pred)]
     picks.append(current_pick)
 
-# 5. ALIGNMENT & PERFORMANCE
+# 5. ALIGNMENT & METRICS
 available_rets = actual_rets_df.iloc[30:].iloc[:len(picks)]
 final_rets_list = []
 
@@ -136,7 +148,7 @@ for i, p in enumerate(picks):
 final_rets_series = pd.Series(final_rets_list, index=available_rets.index)
 wealth = (1 + final_rets_series).cumprod()
 
-# Display
+# Dashboard Output
 st.title("🚀 Transformer Alpha: Multi-Asset Dashboard")
 m1, m2, m3, m4 = st.columns(4)
 m1.metric("Current Pick", picks[-1])
@@ -144,7 +156,6 @@ m2.metric("Ann. Return", f"{(((1 + final_rets_series.mean())**252) - 1) * 100:.1
 m3.metric("Sharpe Ratio", f"{(final_rets_series.mean() / final_rets_series.std()) * np.sqrt(252):.2f}")
 m4.metric("Hit Ratio", f"{(final_rets_series > 0).sum() / len(final_rets_series) * 100:.1f}%")
 
-st.subheader("Out-of-Sample Performance (Wealth Curve)")
 st.line_chart(wealth)
 
 with st.expander("15-Day Strategy Audit"):

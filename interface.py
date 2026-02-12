@@ -4,8 +4,8 @@ import pandas as pd
 def render_comparison_dashboard(transformer_results, regime_results, sofr_rate):
     st.title("🏔️ Alpha Engine ver1.0")
     
-    # Header with US Markets Context
-    st.markdown(f"### 📅 US Markets Open: Thursday, 12th February 2026")
+    # Thursday, 12th February 2026 Context
+    st.markdown("### 📅 US Markets: Thursday, 12th February 2026")
     st.info(f"Current Risk-Free Rate (SOFR): **{sofr_rate:.2%}**")
 
     col1, col2 = st.columns(2)
@@ -37,15 +37,17 @@ def render_comparison_dashboard(transformer_results, regime_results, sofr_rate):
 
 def render_tactical_logs(transformer_df, regime_df):
     st.divider()
-    st.subheader("📝 Prediction Logs (Last 15 Trading Days)")
+    st.subheader("📝 Reality Check: Prediction vs. Actual Market (Last 15 Days)")
     
-    def color_pnl(val):
-        color = '#2ecc71' if val > 0 else '#e74c3c'
-        return f'color: {color}; font-weight: bold'
+    def highlight_hits(row):
+        # Color based on whether prediction and actual move had the same sign
+        is_hit = (row['Predicted Return'] > 0) == (row['Actual Return'] > 0)
+        color = '#2ecc71' if is_hit else '#e74c3c'
+        return [f'color: {color}; font-weight: bold'] * len(row)
 
-    tab1, tab2 = st.tabs(["Transformer Details", "Regime Switcher Details"])
+    tab1, tab2 = st.tabs(["Transformer Accuracy", "Regime Switcher Accuracy"])
     
     with tab1:
-        st.dataframe(transformer_df.style.applymap(color_pnl, subset=['Prediction']), width='stretch')
+        st.dataframe(transformer_df.style.apply(highlight_hits, axis=1), width='stretch')
     with tab2:
-        st.dataframe(regime_df.style.applymap(color_pnl, subset=['Prediction']), width='stretch')
+        st.dataframe(regime_df.style.apply(highlight_hits, axis=1), width='stretch')

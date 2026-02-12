@@ -103,9 +103,12 @@ for i in range(len(oos_features)-30):
     current_pick = assets[np.argmax(pred)]
     picks.append(current_pick)
 
-final_series = pd.Series([actual_rets[p].iloc[i+30] for i, p in enumerate(picks)], index=actual_rets.index[30:])
-st.title("🚀 Transformer Alpha V7: Absolute Growth")
-st.line_chart((1 + final_series).cumprod())
+# Match the index length to the picks length exactly
+final_series = pd.Series(
+    [actual_rets[p].iloc[i+30] for i, p in enumerate(picks)], 
+    index=actual_rets.index[30 : 30 + len(picks)]
+)
+wealth = (1 + final_series).cumprod()
 
 # --- 4. COLOR-CODED AUDIT ---
 st.subheader("15-Day Strategy Audit")

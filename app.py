@@ -41,7 +41,7 @@ def train_engine(start_year, tx_cost_bps):
     except:
         returns_df['CASH'] = 0.0001
 
-    # Macro Input
+    # Macro Input with Fallbacks
     macro = pd.DataFrame(index=returns_df.index)
     macro['10Y2Y'] = fred.get_series('T10Y2Y', start_date).reindex(returns_df.index).ffill().fillna(0)
     vix = yf.download("^VIX", start=start_date, progress=False)['Close']
@@ -78,7 +78,7 @@ def train_engine(start_year, tx_cost_bps):
         
     return {"model": model, "scaler": scaler, "returns": returns_df, "features": scaled_data, "loss": loss_history}
 
-# --- 3. UI LAYOUT ---
+# --- 3. UI LAYOUT (RESTORED) ---
 st.set_page_config(page_title="Transformer Alpha V7: Max Return", layout="wide")
 
 with st.sidebar:
@@ -115,7 +115,7 @@ final_series = pd.Series(
 )
 wealth = (1 + final_series).cumprod()
 
-# --- 5. DASHBOARD RENDER ---
+# --- 5. DASHBOARD RENDER (RESTORED) ---
 st.title("🚀 Transformer Alpha: Multi-Asset Dashboard")
 
 m1, m2, m3, m4 = st.columns(4)

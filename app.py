@@ -9,13 +9,16 @@ from sklearn.preprocessing import StandardScaler
 import plotly.graph_objects as go
 import os
 
-# --- 1. MODEL ARCHITECTURE ---
+# --- 1. ROBUST MODEL ARCHITECTURE ---
 class FinancialTransformer(nn.Module):
     def __init__(self, input_dim, d_model=64, num_heads=8):
         super(FinancialTransformer, self).__init__()
         self.input_projection = nn.Linear(input_dim, d_model)
         self.pos_encoder = nn.Parameter(torch.zeros(1, 30, d_model))
-        encoder_layers = nn.TransformerEncoderLayer(d_model=d_model, nhead=num_heads, batch_first=True)
+        # Added Dropout to prevent overfitting
+        encoder_layers = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=num_heads, dropout=0.2, batch_first=True
+        )
         self.transformer_encoder = nn.TransformerEncoder(encoder_layers, num_layers=3)
         self.decoder = nn.Linear(d_model, 6) 
 
@@ -23,17 +26,18 @@ class FinancialTransformer(nn.Module):
         x = self.input_projection(x) + self.pos_encoder
         return self.decoder(self.transformer_encoder(x)[:, -1, :])
 
-# --- 2. DYNAMIC ENGINE ---
+# --- 2. THE ENGINE ---
 @st.cache_resource(ttl="1d")
 def train_engine(start_year, tx_cost_bps):
     fred = Fred(api_key=os.getenv("FRED_API_KEY"))
     etfs = ["TLT", "TBT", "VNQ", "SLV", "GLD"]
     start_date = f"{start_year}-01-01"
     
+    # Data Fetching
     raw_prices = yf.download(etfs, start=start_date, progress=False)['Close']
     returns_df = raw_prices.ffill().pct_change().dropna()
     
-    # Dynamic Cash Fallback
+    # Tiered Cash Fallback (SOFR -> T-Bill)
     try:
         sofr = fred.get_series('SOFR', start_date)
         tbill = fred.get_series('DTB6', start_date)
@@ -41,18 +45,16 @@ def train_engine(start_year, tx_cost_bps):
     except:
         returns_df['CASH'] = 0.0001
 
-    # Dynamic Macro
+    # Dynamic Macro Features
     macro = pd.DataFrame(index=returns_df.index)
-    try:
-        macro['10Y2Y'] = fred.get_series('T10Y2Y', start_date).reindex(returns_df.index).ffill().fillna(0)
-    except:
-        macro['10Y2Y'] = 0
-        
+    macro['10Y2Y'] = fred.get_series('T10Y2Y', start_date).reindex(returns_df.index).ffill().fillna(0)
     m_raw = yf.download(["^VIX", "HG=F"], start=start_date, progress=False)['Close']
     macro = pd.concat([macro, m_raw.reindex(returns_df.index).ffill()], axis=1).fillna(method='bfill')
     
     full_df = pd.concat([returns_df, macro], axis=1).ffill().dropna()
-    target_df = returns_df.rolling(window=3).sum().shift(-3).dropna()
+    
+    # Target: 3-Day Risk-Adjusted Return (Smoother for OOS)
+    target_df = (returns_df.rolling(3).mean() / returns_df.rolling(3).std()).shift(-3).dropna()
     
     common_idx = full_df.index.intersection(target_df.index)
     full_df, target_df = full_df.loc[common_idx], target_df.loc[common_idx]
@@ -70,26 +72,25 @@ def train_engine(start_year, tx_cost_bps):
     X_train, y_train = create_seq(scaled_data[:split_idx], target_df.values[:split_idx])
     
     model = FinancialTransformer(input_dim=full_df.shape[1])
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.0008)
-    loss_history = []
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.0005) # Slower LR for stability
     
     model.train()
-    for _ in range(100):
+    for _ in range(120): # Slightly more epochs for dropout to settle
         optimizer.zero_grad()
         loss = nn.HuberLoss()(model(X_train), y_train)
         loss.backward(); optimizer.step()
-        loss_history.append(loss.item())
         
-    return {"model": model, "scaler": scaler, "returns": returns_df, "features": scaled_data, "loss": loss_history}
+    return {"model": model, "scaler": scaler, "returns": returns_df, "features": scaled_data}
 
 # --- 3. UI ---
-st.set_page_config(page_title="Transformer Alpha V5", layout="wide")
+st.set_page_config(page_title="Transformer Alpha V6", layout="wide")
 with st.sidebar:
+    st.header("Strategy Settings")
     regime_year = st.slider("Data Anchor", 2008, 2023, 2015)
     tx_cost = st.number_input("Tx Cost (BPS)", 0, 50, 10)
     engine = train_engine(regime_year, tx_cost)
 
-# 4. INFERENCE
+# 4. WALK-FORWARD INFERENCE
 engine["model"].eval()
 assets = ["TLT", "TBT", "VNQ", "SLV", "GLD", "CASH"]
 oos_idx = int(len(engine["returns"]) * 0.8)
@@ -98,8 +99,10 @@ actual_rets_df = engine["returns"].iloc[oos_idx:]
 
 picks, current_pick, cost_decimal = [], None, tx_cost / 10000
 for i in range(len(oos_features) - 30):
-    pred = engine["model"](torch.FloatTensor(oos_features[i:i+30]).unsqueeze(0)).detach().numpy()[0]
-    if current_pick: pred[assets.index(current_pick)] += (cost_decimal * 2.0)
+    with torch.no_grad():
+        pred = engine["model"](torch.FloatTensor(oos_features[i:i+30]).unsqueeze(0)).numpy()[0]
+    
+    if current_pick: pred[assets.index(current_pick)] += (cost_decimal * 2.5) # Increased Loyalty
     current_pick = assets[np.argmax(pred)]
     picks.append(current_pick)
 
@@ -111,21 +114,25 @@ for i, p in enumerate(picks):
     final_rets.append(day_ret)
 
 final_series = pd.Series(final_rets, index=available_rets.index)
-st.title("🚀 Transformer Alpha V5")
+st.title("🚀 Transformer Alpha V6: OOS Focus")
 st.line_chart((1 + final_series).cumprod())
 
 # --- 5. COLOR-CODED AUDIT TRAIL ---
 st.subheader("15-Day Strategy Audit")
 
-def color_returns(val):
-    color = 'red' if '-' in val else 'green'
-    return f'color: {color}; font-weight: bold;'
+# Styling function for Green/Red
+def highlight_returns(val):
+    try:
+        num = float(val.strip('%').replace('+', ''))
+        color = 'green' if num > 0 else 'red'
+        return f'color: {color}; font-weight: bold;'
+    except:
+        return ''
 
-audit_data = pd.DataFrame({
+audit_df = pd.DataFrame({
     "Date": final_series.tail(15).index.strftime('%Y-%m-%d'),
     "Ticker": picks[-15:],
     "Net Return": [f"{v:+.2%}" for v in final_series.tail(15).values]
 })
 
-# Applying the style
-st.table(audit_data.style.applymap(color_returns, subset=['Net Return']))
+st.table(audit_df.style.applymap(highlight_returns, subset=['Net Return']))

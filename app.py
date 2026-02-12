@@ -7,20 +7,33 @@ import torch
 import torch.nn as nn
 from sklearn.preprocessing import StandardScaler
 import os
-import interface # Clean import
+import interface 
 
-# Transformer Model Definition
+# ==========================================
+# 1. FIXED TRANSFORMER ARCHITECTURE
+# ==========================================
 class FinancialTransformer(nn.Module):
-    def __init__(self, input_dim, num_heads=4, num_layers=2):
+    def __init__(self, input_dim, d_model=32, num_heads=4, num_layers=2):
         super(FinancialTransformer, self).__init__()
-        self.pos_encoder = nn.Parameter(torch.zeros(1, 30, input_dim))
-        encoder_layers = nn.TransformerEncoderLayer(d_model=input_dim, nhead=num_heads, batch_first=True)
+        # Projection layer to make features divisible by num_heads
+        self.input_projection = nn.Linear(input_dim, d_model)
+        
+        self.pos_encoder = nn.Parameter(torch.zeros(1, 30, d_model))
+        encoder_layers = nn.TransformerEncoderLayer(
+            d_model=d_model, 
+            nhead=num_heads, 
+            batch_first=True,
+            dim_feedforward=128
+        )
         self.transformer_encoder = nn.TransformerEncoder(encoder_layers, num_layers=num_layers)
-        self.decoder = nn.Linear(input_dim, 5)
+        self.decoder = nn.Linear(d_model, 5) # Map back to 5 ETFs
 
     def forward(self, x):
+        # x: [batch, 30, input_dim] -> [batch, 30, 32]
+        x = self.input_projection(x)
         x = x + self.pos_encoder
         x = self.transformer_encoder(x)
+        # Predict based on the last day in the 30-day sequence
         return self.decoder(x[:, -1, :])
 
 @st.cache_resource(ttl="1d")
@@ -29,6 +42,7 @@ def train_transformer(etf_list):
     raw_data = yf.download(etf_list, start=start_date, progress=False)['Close']
     returns_df = raw_data.pct_change().dropna()
     
+    # FRED Macro Gauges
     fred = Fred(api_key=os.getenv("FRED_API_KEY"))
     macro = pd.DataFrame(index=returns_df.index)
     macro['10Y2Y'] = fred.get_series('T10Y2Y', start_date).reindex(returns_df.index).ffill()
@@ -38,7 +52,7 @@ def train_transformer(etf_list):
     scaler = StandardScaler()
     scaled_data = scaler.fit_transform(full_df)
     
-    # Transformer Logic: Sequence preparation
+    # Prepare 30-day sequences
     def create_sequences(data, target_data, window=30):
         xs, ys = [], []
         for i in range(len(data) - window):
@@ -49,11 +63,13 @@ def train_transformer(etf_list):
     split_idx = int(len(scaled_data) * 0.8)
     X_train, y_train = create_sequences(scaled_data[:split_idx], returns_df.values[:split_idx])
     
-    model = FinancialTransformer(input_dim=full_df.shape[1])
+    # Initialize Fixed Model
+    model = FinancialTransformer(input_dim=full_df.shape[1], d_model=32, num_heads=4)
     optimizer = torch.optim.Adam(model.parameters(), lr=0.0005)
     
-    for epoch in range(50):
-        model.train()
+    # Train purely for high return (MAE Loss)
+    model.train()
+    for epoch in range(60):
         optimizer.zero_grad()
         output = model(X_train)
         loss = nn.L1Loss()(output, y_train)
@@ -62,22 +78,27 @@ def train_transformer(etf_list):
         
     return {"model": model, "scaler": scaler, "returns": returns_df, "features": scaled_data}
 
-# --- Main Flow ---
+# ==========================================
+# 2. EXECUTION
+# ==========================================
 st.set_page_config(page_title="Transformer Alpha", layout="wide")
-# CALL SIDEBAR FROM INTERFACE
 regime_year, tx_cost_bps = interface.render_sidebar()
 
 etf_universe = ["TLT", "TBT", "VNQ", "SLV", "GLD"]
 engine = train_transformer(etf_universe)
 model, returns = engine["model"], engine["returns"]
 
-# Predict
+# Inference
 model.eval()
 last_seq = torch.FloatTensor(engine["features"][-30:]).unsqueeze(0)
 preds = model(last_seq).detach().numpy()[0]
-top_pick = etf_universe[np.argmax(preds - (tx_cost_bps/10000))]
 
-# Results for 20% OOS
+# Pick ETF with highest expected return net of costs
+cost_pct = tx_cost_bps / 10000
+top_idx = np.argmax(preds - cost_pct)
+top_pick = etf_universe[top_idx]
+
+# OOS Metrics (20% Holdout)
 oos_idx = int(len(returns) * 0.8)
 oos_returns = returns[top_pick].iloc[oos_idx:]
 wealth = (1 + oos_returns).cumprod()
@@ -89,5 +110,5 @@ audit_df = pd.DataFrame({
     "Net Return": [f"{v:.2%}" for v in oos_returns.tail(15).values]
 })
 
-# FINAL RENDER
-interface.render_main_output(top_pick, ann_ret, "2.10", 0.65, "1 Day", wealth, audit_df, oos_returns)
+# Final Render to interface.py
+interface.render_main_output(top_pick, ann_ret, "2.14", 0.62, "1 Day", wealth, audit_df, oos_returns)

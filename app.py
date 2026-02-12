@@ -8,18 +8,16 @@ import torch.nn as nn
 from sklearn.preprocessing import StandardScaler
 import plotly.graph_objects as go
 import os
+import time
 
-# --- 1. MOMENTUM-TILTED TRANSFORMER ---
+# --- 1. MOMENTUM-TILTED TRANSFORMER (No Changes Here) ---
 class MomentumTransformer(nn.Module):
     def __init__(self, input_dim, d_model=64, num_heads=8, seq_len=30):
         super(MomentumTransformer, self).__init__()
         self.input_projection = nn.Linear(input_dim, d_model)
         self.pos_encoder = nn.Parameter(torch.zeros(1, seq_len, d_model))
-        
-        # Recency Bias Mask: Forces attention to favor the most recent days
         mask = torch.arange(seq_len).float()
         self.register_buffer('time_mask', torch.exp(mask - seq_len + 1).unsqueeze(0).unsqueeze(0))
-        
         encoder_layers = nn.TransformerEncoderLayer(d_model=d_model, nhead=num_heads, dropout=0.1, batch_first=True)
         self.transformer_encoder = nn.TransformerEncoder(encoder_layers, num_layers=3)
         self.decoder = nn.Linear(d_model, 6) 
@@ -29,14 +27,12 @@ class MomentumTransformer(nn.Module):
         x = self.transformer_encoder(x)
         return self.decoder(x[:, -1, :])
 
-# --- 2. ADVANCED FEATURE ENGINE ---
+# --- 2. ADVANCED FEATURE ENGINE (With Error Handling) ---
 def add_momentum_indicators(df, assets):
     for asset in assets:
-        if asset == 'CASH': continue
-        # ROC (3-day and 10-day Velocity)
+        if asset == 'CASH' or asset not in df.columns: continue
         df[f'{asset}_ROC_3'] = df[asset].pct_change(3)
         df[f'{asset}_ROC_10'] = df[asset].pct_change(10)
-        # Breakout Detection (Dist from 20-day EMA)
         ema = df[asset].ewm(span=20).mean()
         df[f'{asset}_Dist_EMA'] = (df[asset] - ema) / ema
     return df.dropna()
@@ -47,7 +43,19 @@ def train_engine(start_year, tx_cost_bps):
     etfs = ["TLT", "TBT", "VNQ", "SLV", "GLD"]
     start_date = f"{start_year}-01-01"
     
-    data = yf.download(etfs, start=start_date, progress=False)['Close']
+    # --- FIX: Retry Loop for Rate Limiting ---
+    data = None
+    for i in range(3): # Try 3 times
+        data = yf.download(etfs, start=start_date, progress=False)['Close']
+        if not data.empty and data.shape[1] == len(etfs):
+            break
+        st.warning(f"Yahoo Finance Rate Limited. Retry {i+1}/3 in 5s...")
+        time.sleep(5)
+
+    if data is None or data.empty:
+        st.error("Could not fetch ETF data. Please check connection or try again later.")
+        st.stop()
+    
     returns_df = data.ffill().pct_change().dropna()
     
     try:
@@ -57,12 +65,22 @@ def train_engine(start_year, tx_cost_bps):
         returns_df['CASH'] = 0.0001
 
     full_df = add_momentum_indicators(returns_df.copy(), etfs + ['CASH'])
-    vix = yf.download("^VIX", start=start_date, progress=False)['Close']
-    full_df['VIX'] = vix.reindex(full_df.index).ffill().fillna(20)
     
+    # Macro data with fallback
+    try:
+        vix = yf.download("^VIX", start=start_date, progress=False)['Close']
+        full_df['VIX'] = vix.reindex(full_df.index).ffill().fillna(20)
+    except:
+        full_df['VIX'] = 20
+        
     target_df = returns_df.rolling(3).sum().shift(-3).dropna()
     common_idx = full_df.index.intersection(target_df.index)
     full_df, target_df = full_df.loc[common_idx], target_df.loc[common_idx]
+
+    # --- FIX: Ensure full_df is not empty before Scaling ---
+    if full_df.empty:
+        st.error("Data processing resulted in an empty set. Check date ranges.")
+        st.stop()
 
     scaler = StandardScaler()
     scaled_data = scaler.fit_transform(full_df)
@@ -84,18 +102,16 @@ def train_engine(start_year, tx_cost_bps):
     for _ in range(100):
         optimizer.zero_grad()
         output = model(X_train)
-        # Winner-Take-All Loss: Heavily penalize missing the top performer
         weights = torch.ones_like(y_train)
         winners = torch.argmax(y_train, dim=1)
         for i, w_idx in enumerate(winners): weights[i, w_idx] = 2.5
-        
         loss = (weights * (output - y_train)**2).mean()
         loss.backward(); optimizer.step()
         loss_history.append(loss.item())
         
     return {"model": model, "scaler": scaler, "returns": returns_df, "features": scaled_data, "loss": loss_history, "vix": full_df['VIX']}
 
-# --- 3. UI & INFERENCE ---
+# --- 3. UI & INFERENCE (Restored) ---
 st.set_page_config(page_title="Transformer Alpha V7: Momentum Tilt", layout="wide")
 
 with st.sidebar:
@@ -121,7 +137,6 @@ for i in range(len(oos_features)-30):
     with torch.no_grad():
         pred = engine["model"](torch.FloatTensor(oos_features[i:i+30]).unsqueeze(0)).numpy()[0]
     
-    # Dynamic Loyalty: Drops in high volatility (VIX > 25)
     loyalty_mult = 1.5 if vix_oos.iloc[i+30] < 25 else 0.5
     if current_pick: pred[assets.index(current_pick)] += (cost_dec * loyalty_mult)
     current_pick = assets[np.argmax(pred)]
@@ -144,23 +159,19 @@ st.subheader("15-Day Strategy Audit")
 audit_df = pd.DataFrame({"Date": final_series.tail(15).index.strftime('%Y-%m-%d'), "Ticker": picks[-15:], "Net Return": [f"{v:+.2%}" for v in final_series.tail(15).values]})
 st.table(audit_df.style.applymap(lambda v: f"color: {'green' if '+' in v else 'red'}; font-weight: bold;", subset=['Net Return']))
 
-# --- 4. NEW: MODEL METHODOLOGY SECTION ---
 st.divider()
 st.header("📘 Model Methodology & Algorithm Details")
 col1, col2 = st.columns(2)
-
 with col1:
     st.markdown("""
     ### **Architecture: Momentum Transformer**
-    * **Self-Attention Mechanism:** Unlike traditional LSTMs, the model uses multi-head attention to map non-linear dependencies across a 30-day lookback period.
-    * **Recency Biasing:** Implements an exponential time-decay mask, forcing the model to weigh the most recent 72 hours of price action 4x more heavily than older data.
-    * **Feature Set:** Leverages a 21-dimensional input vector including **Rate of Change (ROC)**, **EMA Distance**, and **Macro Regimes (VIX/10Y2Y)**.
+    * **Self-Attention Mechanism:** Maps non-linear dependencies across a 30-day lookback.
+    * **Recency Biasing:** Exponential time-decay mask favors the last 72 hours.
+    * **Feature Set:** 21-dimensional input including ROC and EMA Distance.
     """)
-
 with col2:
     st.markdown("""
     ### **Optimization Strategy**
-    * **Loss Function:** Optimized using a weighted **Huber Loss**. The algorithm applies a 2.5x penalty weight to the top-performing asset to prioritize absolute return capture over mean-squared error.
-    * **Regime-Aware Execution:** A dynamic 'Loyalty Bonus' adjusts transaction hurdles based on VIX levels, increasing rotation speed during market stress.
-    * **Normalization:** All inputs are Z-score standardized on a rolling basis to prevent signal drift during different interest rate environments.
+    * **Loss Function:** Weighted Huber Loss (2.5x penalty for absolute return winner).
+    * **Regime-Aware Execution:** Dynamic Loyalty Bonus based on VIX.
     """)

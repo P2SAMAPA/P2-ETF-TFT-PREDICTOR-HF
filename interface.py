@@ -1,112 +1,62 @@
 import streamlit as st
+import plotly.graph_objects as go
 import pandas as pd
-import numpy as np
-import yfinance as yf
-from fredapi import Fred
-import torch
-import torch.nn as nn
-from sklearn.preprocessing import StandardScaler
-import os
-import interface 
+from datetime import datetime
 
-# ==========================================
-# 1. ACTUAL TRANSFORMER ARCHITECTURE
-# ==========================================
-class FinancialTransformer(nn.Module):
-    def __init__(self, input_dim, num_heads=4, num_layers=2):
-        super(FinancialTransformer, self).__init__()
-        self.pos_encoder = nn.Parameter(torch.zeros(1, 30, input_dim)) # 30-day window
-        encoder_layers = nn.TransformerEncoderLayer(d_model=input_dim, nhead=num_heads, batch_first=True)
-        self.transformer_encoder = nn.TransformerEncoder(encoder_layers, num_layers=num_layers)
-        self.decoder = nn.Linear(input_dim, 5) # 5 ETFs output
+def render_sidebar():
+    st.sidebar.header("Model Configuration")
+    regime_year = st.sidebar.select_slider("Data Anchor", options=[2008, 2015, 2019, 2021], value=2015)
+    tx_cost_bps = st.sidebar.slider("Transaction Cost (bps)", 0, 100, 15)
+    return regime_year, tx_cost_bps
 
-    def forward(self, x):
-        # x shape: [batch, seq_len, features]
-        x = x + self.pos_encoder
-        x = self.transformer_encoder(x)
-        # We take the last time step for prediction
-        x = self.decoder(x[:, -1, :])
-        return x
+def color_returns(val):
+    if isinstance(val, str) and '%' in val:
+        try:
+            num = float(val.replace('%', ''))
+            color = '#00d4ff' if num > 0 else '#fb7185'
+            return f'color: {color}'
+        except: return ''
+    return ''
 
-@st.cache_resource(ttl="1d")
-def train_transformer_engine(etf_list):
-    # Data Setup 2008 - Present
-    start_date = "2008-01-01"
-    raw_data = yf.download(etf_list, start=start_date, progress=False)['Close']
-    returns_df = raw_data.pct_change().dropna()
+def render_main_output(top_pick, ann_return, sharpe, hit_rate, top_horizon, wealth, audit_df, oos_returns):
+    st.markdown(f"### 🤖 Transformer Strategy Cycle: **{datetime.now().strftime('%B %d, %Y')}**")
     
-    # Macro Gauges
-    fred = Fred(api_key=os.getenv("FRED_API_KEY"))
-    macro = pd.DataFrame(index=returns_df.index)
-    macro['10Y2Y'] = fred.get_series('T10Y2Y', start_date).reindex(returns_df.index).ffill()
-    m_raw = yf.download(["^VIX", "^MOVE", "HG=F"], start=start_date, progress=False)['Close']
+    # Row 1: Metrics
+    c1, c2, c3 = st.columns(3)
+    with c1: st.metric("TOP PREDICTION", top_pick)
+    with c2: 
+        st.metric("ANNUALIZED RETURN (OOS)", f"{ann_return}%")
+        st.caption(f"↑ {sharpe} Sharpe Ratio")
+    with c3: st.metric("15-DAY HIT RATIO", f"{hit_rate:.0%}")
+    st.divider()
+
+    # Row 2: Signal Box and Chart
+    col1, col2 = st.columns(2)
+    with col1:
+        st.markdown(f"""
+        <div style="padding:40px; border-radius:10px; border:2px solid #00d4ff; background-color:#0e1117; text-align:center;">
+            <h1 style="color:#00d4ff; margin:0; font-size:100px;">{top_pick}</h1>
+            <p style="font-size:24px; color:#8892b0; letter-spacing: 2px;">MODEL: TRANSFORMER (1D)</p>
+        </div>
+        """, unsafe_allow_html=True)
     
-    full_df = pd.concat([returns_df, macro, m_raw.reindex(returns_df.index).ffill()], axis=1).dropna()
-    scaler = StandardScaler()
-    scaled_data = scaler.fit_transform(full_df)
+    with col2:
+        st.subheader("OOS Cumulative Return")
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=wealth.index, y=wealth, mode='lines', line=dict(color='#00d4ff', width=3)))
+        fig.update_layout(height=320, margin=dict(l=0, r=0, t=10, b=0), template="plotly_dark")
+        st.plotly_chart(fig, use_container_width=True)
+
+    # Row 3: Monthly Performance
+    st.subheader("📅 Monthly Performance Attribution (OOS)")
+    monthly = oos_returns.groupby([oos_returns.index.year, oos_returns.index.month]).apply(lambda x: (1 + x).prod() - 1)
+    monthly_df = monthly.unstack()
+    monthly_df.columns = [datetime(2000, m, 1).strftime('%b') for m in monthly_df.columns]
+    monthly_df['Annual Total'] = (1 + monthly_df).prod(axis=1) - 1
     
-    # 80/20 Split
-    split_idx = int(len(scaled_data) * 0.8)
-    train_data = scaled_data[:split_idx]
-    
-    # Prepare sequences (30-day lookback)
-    def create_sequences(data, target_data, window=30):
-        xs, ys = [], []
-        for i in range(len(data) - window):
-            xs.append(data[i:i+window])
-            ys.append(target_data[i+window])
-        return torch.FloatTensor(np.array(xs)), torch.FloatTensor(np.array(ys))
+    fmt_df = monthly_df.map(lambda x: f"{x:.2%}" if pd.notnull(x) else "")
+    st.table(fmt_df.style.map(color_returns))
 
-    X_train, y_train = create_sequences(train_data, returns_df.values[:split_idx])
-    
-    model = FinancialTransformer(input_dim=full_df.shape[1])
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.0001)
-    criterion = nn.L1Loss() # MAE to prioritize directional magnitude over variance
-
-    # Training
-    model.train()
-    for epoch in range(50):
-        optimizer.zero_grad()
-        output = model(X_train)
-        loss = criterion(output, y_train)
-        loss.backward()
-        optimizer.step()
-        
-    return {"model": model, "scaler": scaler, "returns": returns_df, "full_features": scaled_data}
-
-# ==========================================
-# 2. EXECUTION FLOW
-# ==========================================
-st.set_page_config(page_title="Transformer Alpha", layout="wide")
-regime_year, tx_cost_bps = interface.render_sidebar()
-
-etf_universe = ["TLT", "TBT", "VNQ", "SLV", "GLD"]
-engine = train_transformer_engine(etf_universe)
-model, returns = engine["model"], engine["returns"]
-
-# Inference: Take the last 30 days of data to predict tomorrow
-model.eval()
-last_30_days = torch.FloatTensor(engine["full_features"][-30:]).unsqueeze(0)
-predictions = model(last_30_days).detach().numpy()[0]
-
-# Selection: Highest predicted return net of costs
-cost_pct = tx_cost_bps / 10000
-net_preds = predictions - cost_pct
-top_idx = np.argmax(net_preds)
-top_pick = etf_universe[top_idx]
-
-# Calculation for OOS (The last 20% of data)
-oos_start = int(len(returns) * 0.8)
-oos_returns = returns[top_pick].iloc[oos_start:]
-ann_return = round(((1 + oos_returns.mean())**252 - 1) * 100, 1)
-hit_rate = (oos_returns.tail(15) > 0).sum() / 15
-wealth = (1 + oos_returns).cumprod()
-
-audit_df = pd.DataFrame({
-    "Date": oos_returns.tail(15).index.strftime('%Y-%m-%d'), 
-    "Ticker": [top_pick]*15, 
-    "Net Return": [f"{v:.2%}" for v in oos_returns.tail(15).values]
-})
-
-# Render via fixed interface
-interface.render_main_output(top_pick, ann_return, "2.10", hit_rate, "1 Day", wealth, audit_df, oos_returns)
+    # Row 4: Audit
+    st.subheader("🔍 Verification Log (Last 15 Trading Days)")
+    st.table(audit_df.style.map(color_returns))

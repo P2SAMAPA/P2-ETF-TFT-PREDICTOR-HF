@@ -30,35 +30,57 @@ class FinancialTransformer(nn.Module):
 def train_transformer(etf_list):
     start_date = "2008-01-01"
     
-    # 1. Resilient Download Logic
-    raw_data = None
+    # 1. Resilient Download with Retry Logic
+    raw_data = pd.DataFrame()
     for attempt in range(3):
         try:
-            raw_data = yf.download(etf_list, start=start_date, progress=False)['Close']
-            if not raw_data.empty and raw_data.shape[1] == len(etf_list):
+            # Attempting to fetch Close prices
+            data = yf.download(etf_list, start=start_date, progress=False)
+            if 'Close' in data:
+                raw_data = data['Close']
+            else:
+                raw_data = data # Older yfinance versions
+            
+            # Check if all tickers are present and contain data
+            if not raw_data.empty and all(t in raw_data.columns for t in etf_list):
                 break
-        except Exception as e:
+        except Exception:
             time.sleep(2)
     
-    if raw_data is None or raw_data.empty:
-        st.error("Yahoo Finance Rate Limit hit. Please wait 5 minutes and refresh.")
-        st.stop()
+    # Validation Gate: Prevents the "ValueError" in StandardScaler
+    if raw_data.empty or len(raw_data) < 100:
+        st.error("⚠️ Data Sync Failed (Yahoo Finance Rate Limit). Using fallback logic...")
+        # Check if we have a local cache to recover from
+        if os.path.exists("price_cache.csv"):
+            raw_data = pd.read_csv("price_cache.csv", index_col=0, parse_dates=True)
+        else:
+            st.warning("No local cache found. Please wait 1 minute and refresh the page.")
+            st.stop()
+    else:
+        # Save a fresh cache for future rate-limit protection
+        raw_data.to_csv("price_cache.csv")
 
-    # 2. Fix pandas warnings and calculate returns
+    # 2. Pre-processing (Handling NAs before Percent Change)
     returns_df = raw_data.ffill().pct_change().dropna()
     
-    # 3. Macro Integration
+    # 3. Macro Integration with Safety Checks
     try:
         fred = Fred(api_key=os.getenv("FRED_API_KEY"))
         macro = pd.DataFrame(index=returns_df.index)
+        # Yield Curve 10Y2Y
         macro['10Y2Y'] = fred.get_series('T10Y2Y', start_date).reindex(returns_df.index).ffill()
+        # Market Sentiment
         m_raw = yf.download(["^VIX", "^MOVE", "HG=F"], start=start_date, progress=False)['Close']
         full_df = pd.concat([returns_df, macro, m_raw.reindex(returns_df.index).ffill()], axis=1).dropna()
     except Exception as e:
-        st.error(f"External API Error: {e}")
+        st.error(f"Macro Data Error: {e}")
         st.stop()
 
-    # 4. Scaling and Training
+    # 4. Final Validation before Scaler
+    if full_df.empty:
+        st.error("Calculation Error: Data alignment produced zero samples.")
+        st.stop()
+
     scaler = StandardScaler()
     scaled_data = scaler.fit_transform(full_df)
     
@@ -76,7 +98,7 @@ def train_transformer(etf_list):
     optimizer = torch.optim.Adam(model.parameters(), lr=0.0005)
     
     model.train()
-    for _ in range(60): # Epochs
+    for _ in range(60): # Training Epochs
         optimizer.zero_grad()
         output = model(X_train)
         loss = nn.L1Loss()(output, y_train)
@@ -85,7 +107,7 @@ def train_transformer(etf_list):
         
     return {"model": model, "scaler": scaler, "returns": returns_df, "features": scaled_data}
 
-# --- Main Flow ---
+# --- Standard App Flow ---
 st.set_page_config(page_title="Transformer Alpha", layout="wide")
 regime_year, tx_cost_bps = interface.render_sidebar()
 
@@ -93,13 +115,11 @@ etf_universe = ["TLT", "TBT", "VNQ", "SLV", "GLD"]
 engine = train_transformer(etf_universe)
 model, returns = engine["model"], engine["returns"]
 
-# Predict next day
 model.eval()
 last_seq = torch.FloatTensor(engine["features"][-30:]).unsqueeze(0)
 preds = model(last_seq).detach().numpy()[0]
 top_pick = etf_universe[np.argmax(preds - (tx_cost_bps/10000))]
 
-# Calculate OOS
 oos_idx = int(len(returns) * 0.8)
 oos_returns = returns[top_pick].iloc[oos_idx:]
 wealth = (1 + oos_returns).cumprod()

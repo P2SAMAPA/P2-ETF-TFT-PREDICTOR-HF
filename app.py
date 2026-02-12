@@ -31,37 +31,46 @@ def train_engine(start_year, tx_cost_bps):
     start_date = f"{start_year}-01-01"
     
     # 1. Fetch ETF Data
-    raw_prices = yf.download(etfs, start=start_date, progress=False)['Close']
-    returns_df = raw_prices.ffill().pct_change().dropna()
+    try:
+        raw_prices = yf.download(etfs, start=start_date, progress=False)['Close']
+        returns_df = raw_prices.ffill().pct_change().dropna()
+    except:
+        st.error("Yahoo Finance Sync Error."); st.stop()
     
-    # 2. Add SOFR (Cash) with Safety Defaults
+    # 2. Add SOFR (Cash) with Fallback
     try:
         sofr_raw = fred.get_series('SOFR', start_date)
+        # Use a 4.5% annual rate if SOFR is missing to prevent empty datasets
         sofr_daily = (sofr_raw / 360 / 100).reindex(returns_df.index).ffill().fillna(0.045/252)
         returns_df['CASH'] = sofr_daily
     except:
         returns_df['CASH'] = 0.045 / 252
 
-    # 3. Macro Features
+    # 3. Macro Features with Alignment Safety
     macro = pd.DataFrame(index=returns_df.index)
     macro['10Y2Y'] = fred.get_series('T10Y2Y', start_date).reindex(returns_df.index).ffill().fillna(0)
     m_raw = yf.download(["^VIX", "HG=F"], start=start_date, progress=False)['Close']
     m_rets = m_raw.reindex(returns_df.index).ffill().fillna(method='bfill')
+    
+    # Use ffill BEFORE dropna to ensure we don't lose the whole array
     full_df = pd.concat([returns_df, macro, m_rets], axis=1).ffill().dropna()
 
-    # 4. Multi-Day Target (Shift by 3 for trend following)
+    if full_df.empty:
+        st.error(f"Regime {start_year} has no overlapping data. Try another year."); st.stop()
+
+    # 4. Multi-Day Target (Predicting 3-day trend)
     target_df = returns_df.rolling(window=3).sum().shift(-3).dropna()
     common_idx = full_df.index.intersection(target_df.index)
     full_df, target_df = full_df.loc[common_idx], target_df.loc[common_idx]
 
+    # 5. Training
     scaler = StandardScaler()
     scaled_data = scaler.fit_transform(full_df)
     
     def create_sequences(data, target_data, window=30):
         xs, ys = [], []
         for i in range(len(data) - window):
-            xs.append(data[i:i+window])
-            ys.append(target_data[i+window])
+            xs.append(data[i:i+window]); ys.append(target_data[i+window])
         return torch.FloatTensor(np.array(xs)), torch.FloatTensor(np.array(ys))
 
     split_idx = int(len(scaled_data) * 0.8)
@@ -69,8 +78,8 @@ def train_engine(start_year, tx_cost_bps):
     
     model = FinancialTransformer(input_dim=full_df.shape[1])
     optimizer = torch.optim.Adam(model.parameters(), lr=0.0008)
-    
     loss_history = []
+    
     model.train()
     for epoch in range(100):
         optimizer.zero_grad()
@@ -81,7 +90,7 @@ def train_engine(start_year, tx_cost_bps):
         
     return {"model": model, "scaler": scaler, "returns": returns_df, "features": scaled_data, "loss": loss_history}
 
-# --- 3. UI ---
+# --- 3. UI & SIMULATION ---
 st.set_page_config(page_title="Transformer Alpha V3", layout="wide")
 
 with st.sidebar:
@@ -92,7 +101,7 @@ with st.sidebar:
     
     st.divider()
     st.subheader("Training Convergence")
-    fig = go.Figure(go.Scatter(y=engine["loss"], mode='lines', line=dict(color='#00d4ff', width=2)))
+    fig = go.Figure(go.Scatter(y=engine["loss"], mode='lines', line=dict(color='#00d4ff')))
     fig.update_layout(height=180, margin=dict(l=0,r=0,t=10,b=0), template="plotly_dark")
     st.plotly_chart(fig, use_container_width=True)
 
@@ -100,39 +109,31 @@ with st.sidebar:
 engine["model"].eval()
 assets = ["TLT", "TBT", "VNQ", "SLV", "GLD", "CASH"]
 oos_idx = int(len(engine["returns"]) * 0.8)
-# Use features and returns from the same starting point
 oos_features = engine["features"][oos_idx:]
 actual_rets_df = engine["returns"].iloc[oos_idx:]
 
 picks, current_pick = [], None
 cost_decimal = tx_cost / 10000
 
-# Align sequence window
 for i in range(len(oos_features) - 30):
     seq = torch.FloatTensor(oos_features[i:i+30]).unsqueeze(0)
     pred = engine["model"](seq).detach().numpy()[0]
-    
     if current_pick:
-        pred[assets.index(current_pick)] += (cost_decimal * 1.5) 
-        
+        pred[assets.index(current_pick)] += (cost_decimal * 1.5) # Loyalty Bonus
     current_pick = assets[np.argmax(pred)]
     picks.append(current_pick)
 
-# --- 5. FIXED INDEX ALIGNMENT ---
-# The number of predictions (picks) must match the return slice
-# We skip the first 30 days used for the first sequence window
-available_rets = actual_rets_df.iloc[30:]
-# Truncate to match length of picks (solving the 859 vs 862 error)
-backtest_rets = available_rets.iloc[:len(picks)]
-
+# 5. ALIGNMENT & PERFORMANCE
+available_rets = actual_rets_df.iloc[30:].iloc[:len(picks)]
 final_rets_list = []
+
 for i, p in enumerate(picks):
-    day_ret = backtest_rets[p].iloc[i]
+    day_ret = available_rets[p].iloc[i]
     if i > 0 and picks[i] != picks[i-1]:
         day_ret -= cost_decimal
     final_rets_list.append(day_ret)
 
-final_rets_series = pd.Series(final_rets_list, index=backtest_rets.index)
+final_rets_series = pd.Series(final_rets_list, index=available_rets.index)
 wealth = (1 + final_rets_series).cumprod()
 
 # Display

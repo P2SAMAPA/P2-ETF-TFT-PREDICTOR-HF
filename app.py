@@ -8,51 +8,60 @@ import torch.nn as nn
 from sklearn.preprocessing import StandardScaler
 import os
 import interface 
+import time
 
-# ==========================================
-# 1. FIXED TRANSFORMER ARCHITECTURE
-# ==========================================
+# --- Transformer Architecture (Fixed Dimensions) ---
 class FinancialTransformer(nn.Module):
     def __init__(self, input_dim, d_model=32, num_heads=4, num_layers=2):
         super(FinancialTransformer, self).__init__()
-        # Projection layer to make features divisible by num_heads
         self.input_projection = nn.Linear(input_dim, d_model)
-        
         self.pos_encoder = nn.Parameter(torch.zeros(1, 30, d_model))
-        encoder_layers = nn.TransformerEncoderLayer(
-            d_model=d_model, 
-            nhead=num_heads, 
-            batch_first=True,
-            dim_feedforward=128
-        )
+        encoder_layers = nn.TransformerEncoderLayer(d_model=d_model, nhead=num_heads, batch_first=True)
         self.transformer_encoder = nn.TransformerEncoder(encoder_layers, num_layers=num_layers)
-        self.decoder = nn.Linear(d_model, 5) # Map back to 5 ETFs
+        self.decoder = nn.Linear(d_model, 5)
 
     def forward(self, x):
-        # x: [batch, 30, input_dim] -> [batch, 30, 32]
         x = self.input_projection(x)
         x = x + self.pos_encoder
         x = self.transformer_encoder(x)
-        # Predict based on the last day in the 30-day sequence
         return self.decoder(x[:, -1, :])
 
 @st.cache_resource(ttl="1d")
 def train_transformer(etf_list):
     start_date = "2008-01-01"
-    raw_data = yf.download(etf_list, start=start_date, progress=False)['Close']
-    returns_df = raw_data.pct_change().dropna()
     
-    # FRED Macro Gauges
-    fred = Fred(api_key=os.getenv("FRED_API_KEY"))
-    macro = pd.DataFrame(index=returns_df.index)
-    macro['10Y2Y'] = fred.get_series('T10Y2Y', start_date).reindex(returns_df.index).ffill()
-    m_raw = yf.download(["^VIX", "^MOVE", "HG=F"], start=start_date, progress=False)['Close']
+    # 1. Resilient Download Logic
+    raw_data = None
+    for attempt in range(3):
+        try:
+            raw_data = yf.download(etf_list, start=start_date, progress=False)['Close']
+            if not raw_data.empty and raw_data.shape[1] == len(etf_list):
+                break
+        except Exception as e:
+            time.sleep(2)
     
-    full_df = pd.concat([returns_df, macro, m_raw.reindex(returns_df.index).ffill()], axis=1).dropna()
+    if raw_data is None or raw_data.empty:
+        st.error("Yahoo Finance Rate Limit hit. Please wait 5 minutes and refresh.")
+        st.stop()
+
+    # 2. Fix pandas warnings and calculate returns
+    returns_df = raw_data.ffill().pct_change().dropna()
+    
+    # 3. Macro Integration
+    try:
+        fred = Fred(api_key=os.getenv("FRED_API_KEY"))
+        macro = pd.DataFrame(index=returns_df.index)
+        macro['10Y2Y'] = fred.get_series('T10Y2Y', start_date).reindex(returns_df.index).ffill()
+        m_raw = yf.download(["^VIX", "^MOVE", "HG=F"], start=start_date, progress=False)['Close']
+        full_df = pd.concat([returns_df, macro, m_raw.reindex(returns_df.index).ffill()], axis=1).dropna()
+    except Exception as e:
+        st.error(f"External API Error: {e}")
+        st.stop()
+
+    # 4. Scaling and Training
     scaler = StandardScaler()
     scaled_data = scaler.fit_transform(full_df)
     
-    # Prepare 30-day sequences
     def create_sequences(data, target_data, window=30):
         xs, ys = [], []
         for i in range(len(data) - window):
@@ -63,13 +72,11 @@ def train_transformer(etf_list):
     split_idx = int(len(scaled_data) * 0.8)
     X_train, y_train = create_sequences(scaled_data[:split_idx], returns_df.values[:split_idx])
     
-    # Initialize Fixed Model
     model = FinancialTransformer(input_dim=full_df.shape[1], d_model=32, num_heads=4)
     optimizer = torch.optim.Adam(model.parameters(), lr=0.0005)
     
-    # Train purely for high return (MAE Loss)
     model.train()
-    for epoch in range(60):
+    for _ in range(60): # Epochs
         optimizer.zero_grad()
         output = model(X_train)
         loss = nn.L1Loss()(output, y_train)
@@ -78,9 +85,7 @@ def train_transformer(etf_list):
         
     return {"model": model, "scaler": scaler, "returns": returns_df, "features": scaled_data}
 
-# ==========================================
-# 2. EXECUTION
-# ==========================================
+# --- Main Flow ---
 st.set_page_config(page_title="Transformer Alpha", layout="wide")
 regime_year, tx_cost_bps = interface.render_sidebar()
 
@@ -88,17 +93,13 @@ etf_universe = ["TLT", "TBT", "VNQ", "SLV", "GLD"]
 engine = train_transformer(etf_universe)
 model, returns = engine["model"], engine["returns"]
 
-# Inference
+# Predict next day
 model.eval()
 last_seq = torch.FloatTensor(engine["features"][-30:]).unsqueeze(0)
 preds = model(last_seq).detach().numpy()[0]
+top_pick = etf_universe[np.argmax(preds - (tx_cost_bps/10000))]
 
-# Pick ETF with highest expected return net of costs
-cost_pct = tx_cost_bps / 10000
-top_idx = np.argmax(preds - cost_pct)
-top_pick = etf_universe[top_idx]
-
-# OOS Metrics (20% Holdout)
+# Calculate OOS
 oos_idx = int(len(returns) * 0.8)
 oos_returns = returns[top_pick].iloc[oos_idx:]
 wealth = (1 + oos_returns).cumprod()
@@ -110,5 +111,4 @@ audit_df = pd.DataFrame({
     "Net Return": [f"{v:.2%}" for v in oos_returns.tail(15).values]
 })
 
-# Final Render to interface.py
 interface.render_main_output(top_pick, ann_ret, "2.14", 0.62, "1 Day", wealth, audit_df, oos_returns)

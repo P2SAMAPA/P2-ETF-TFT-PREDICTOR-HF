@@ -10,7 +10,7 @@ import plotly.graph_objects as go
 import os
 import time
 
-# --- 1. MOMENTUM-TILTED TRANSFORMER (No Changes Here) ---
+# --- 1. MOMENTUM-TILTED TRANSFORMER ---
 class MomentumTransformer(nn.Module):
     def __init__(self, input_dim, d_model=64, num_heads=8, seq_len=30):
         super(MomentumTransformer, self).__init__()
@@ -27,15 +27,15 @@ class MomentumTransformer(nn.Module):
         x = self.transformer_encoder(x)
         return self.decoder(x[:, -1, :])
 
-# --- 2. ADVANCED FEATURE ENGINE (With Error Handling) ---
+# --- 2. ADVANCED FEATURE ENGINE (With Infinite Value Cleaning) ---
 def add_momentum_indicators(df, assets):
     for asset in assets:
         if asset == 'CASH' or asset not in df.columns: continue
         df[f'{asset}_ROC_3'] = df[asset].pct_change(3)
         df[f'{asset}_ROC_10'] = df[asset].pct_change(10)
         ema = df[asset].ewm(span=20).mean()
-        df[f'{asset}_Dist_EMA'] = (df[asset] - ema) / ema
-    return df.dropna()
+        df[f'{asset}_Dist_EMA'] = (df[asset] - ema) / (ema + 1e-9) # Add epsilon to prevent div by zero
+    return df
 
 @st.cache_resource(ttl="1d")
 def train_engine(start_year, tx_cost_bps):
@@ -43,20 +43,16 @@ def train_engine(start_year, tx_cost_bps):
     etfs = ["TLT", "TBT", "VNQ", "SLV", "GLD"]
     start_date = f"{start_year}-01-01"
     
-    # --- FIX: Retry Loop for Rate Limiting ---
+    # Retry logic for Rate Limiting
     data = None
-    for i in range(3): # Try 3 times
+    for i in range(3):
         data = yf.download(etfs, start=start_date, progress=False)['Close']
-        if not data.empty and data.shape[1] == len(etfs):
-            break
-        st.warning(f"Yahoo Finance Rate Limited. Retry {i+1}/3 in 5s...")
+        if not data.empty: break
         time.sleep(5)
 
-    if data is None or data.empty:
-        st.error("Could not fetch ETF data. Please check connection or try again later.")
-        st.stop()
+    if data is None or data.empty: st.stop()
     
-    returns_df = data.ffill().pct_change().dropna()
+    returns_df = data.ffill().pct_change().fillna(0)
     
     try:
         sofr = fred.get_series('SOFR', start_date)
@@ -66,7 +62,6 @@ def train_engine(start_year, tx_cost_bps):
 
     full_df = add_momentum_indicators(returns_df.copy(), etfs + ['CASH'])
     
-    # Macro data with fallback
     try:
         vix = yf.download("^VIX", start=start_date, progress=False)['Close']
         full_df['VIX'] = vix.reindex(full_df.index).ffill().fillna(20)
@@ -74,16 +69,19 @@ def train_engine(start_year, tx_cost_bps):
         full_df['VIX'] = 20
         
     target_df = returns_df.rolling(3).sum().shift(-3).dropna()
+    
+    # --- CRITICAL FIX: SANITIZE INF/NAN BEFORE SCALING ---
+    full_df = full_df.replace([np.inf, -np.inf], np.nan)
+    full_df = full_df.ffill().bfill().fillna(0) # Remove all NaNs
+    
     common_idx = full_df.index.intersection(target_df.index)
     full_df, target_df = full_df.loc[common_idx], target_df.loc[common_idx]
 
-    # --- FIX: Ensure full_df is not empty before Scaling ---
-    if full_df.empty:
-        st.error("Data processing resulted in an empty set. Check date ranges.")
-        st.stop()
+    if full_df.empty: st.stop()
 
     scaler = StandardScaler()
-    scaled_data = scaler.fit_transform(full_df)
+    # Extra safety: Ensure float64 and finite
+    scaled_data = scaler.fit_transform(full_df.astype(np.float64))
     
     split_idx = int(len(scaled_data) * 0.8)
     def create_seq(data, target, window=30):
@@ -111,7 +109,7 @@ def train_engine(start_year, tx_cost_bps):
         
     return {"model": model, "scaler": scaler, "returns": returns_df, "features": scaled_data, "loss": loss_history, "vix": full_df['VIX']}
 
-# --- 3. UI & INFERENCE (Restored) ---
+# --- 3. UI & INFERENCE (UNCHANGED) ---
 st.set_page_config(page_title="Transformer Alpha V7: Momentum Tilt", layout="wide")
 
 with st.sidebar:
@@ -167,11 +165,10 @@ with col1:
     ### **Architecture: Momentum Transformer**
     * **Self-Attention Mechanism:** Maps non-linear dependencies across a 30-day lookback.
     * **Recency Biasing:** Exponential time-decay mask favors the last 72 hours.
-    * **Feature Set:** 21-dimensional input including ROC and EMA Distance.
     """)
 with col2:
     st.markdown("""
     ### **Optimization Strategy**
-    * **Loss Function:** Weighted Huber Loss (2.5x penalty for absolute return winner).
-    * **Regime-Aware Execution:** Dynamic Loyalty Bonus based on VIX.
+    * **Loss Function:** Weighted Huber Loss (2.5x penalty for winners).
+    * **Data Pre-processing:** Implements Inf/NaN cleaning and float64 standardization to ensure training stability.
     """)

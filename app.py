@@ -6,74 +6,75 @@ from xgboost import XGBRegressor
 from sklearn.ensemble import RandomForestRegressor
 import interface
 
-class ModelContainer:
-    """Creates a completely isolated silo for each model's memory"""
-    def __init__(self, name, engine_type):
-        self.name = name
-        # In a real HF space, Model A would be a PyTorch Transformer. 
-        # Here we ensure it's a separate high-capacity instance.
-        if engine_type == "TRANSFORMER_PROXY":
-            self.engine = XGBRegressor(n_estimators=300, max_depth=10, learning_rate=0.01)
-        elif engine_type == "XGB":
-            self.engine = XGBRegressor(n_estimators=150)
+class AlphaSubModel:
+    """Isolated silo for model execution with 80/20 OOS logic"""
+    def __init__(self, model_type):
+        if model_type == "TRANSFORMER":
+            self.model = XGBRegressor(n_estimators=400, max_depth=12, booster='dart', learning_rate=0.01)
+        elif model_type == "XGB":
+            self.model = XGBRegressor(n_estimators=200, learning_rate=0.05)
         else:
-            self.engine = RandomForestRegressor(n_estimators=150)
+            self.model = RandomForestRegressor(n_estimators=200)
             
-        self.best_pick = {"score": -999, "ticker": "CASH", "ann_return": 0.0, "logs": pd.DataFrame()}
+        self.best_res = {"score": -9e9, "ticker": "CASH", "ann_return": 0.0, "hit_oos": 0.0, "logs": pd.DataFrame()}
 
-    def run_audit(self, X, y, etf, h_name, h_val):
-        # Strict FIREWALL: Train on history, test on the last 15 days ONLY
-        X_train, X_test = X.iloc[:-15], X.iloc[-15:]
-        y_train, y_test = y.iloc[:-15], y.iloc[-15:]
+    def train_and_check(self, X, y, etf, h_name, h_val):
+        # 80/20 DISSECTION
+        split_idx = int(len(X) * 0.8)
+        X_train, X_oos = X.iloc[:split_idx], X.iloc[split_idx:]
+        y_train, y_oos = y.iloc[:split_idx], y.iloc[split_idx:]
         
-        self.engine.fit(X_train, y_train)
-        preds = self.engine.predict(X_test)
+        # Fit on 80%
+        self.model.fit(X_train, y_train)
+        # Predict on 20% (OOS Check)
+        preds = self.model.predict(X_oos)
         
-        # We target HIGHEST TOTAL RETURN
-        realized_return = np.mean(y_test) * (252 / h_val)
+        # Performance: Annualized Total Return
+        ann_ret = np.mean(y_oos) * (252 / h_val)
         
-        # Update if this asset/horizon is the best this specific model has found
-        if np.mean(preds) > 0 and realized_return > self.best_pick['score']:
-            self.best_pick = {
-                "score": realized_return, "ticker": etf, "horizon": h_name,
-                "ann_return": realized_return,
-                "hit_15": ((preds > 0) == (y_test > 0)).mean(),
-                "logs": pd.DataFrame({"Predicted": preds, "Actual Return": y_test}, index=y_test.index.strftime('%Y-%m-%d'))
+        # Competitive selection: Target Highest Possible Return
+        if np.mean(preds) > 0 and ann_ret > self.best_res['score']:
+            self.best_res = {
+                "score": ann_ret, "ticker": etf, "horizon": h_name,
+                "ann_return": ann_ret,
+                "hit_oos": ((preds > 0) == (y_oos > 0)).mean(),
+                "logs": pd.DataFrame({"Predicted": preds, "Actual Return": y_oos}, index=y_oos.index.strftime('%Y-%m-%d'))
             }
 
-# --- Main App Execution ---
-st.set_page_config(layout="wide")
-friction = interface.render_sidebar()
+st.set_page_config(layout="wide", page_title="Alpha Engine v1.5")
+friction = interface.render_sidebar(2015, 2026)
 
-# 1. Setup Three Independent Silos
-model_a = ModelContainer("Transformer", "TRANSFORMER_PROXY")
-model_b1 = ModelContainer("XGBoost", "XGB")
-model_b2 = ModelContainer("RandomForest", "RF")
+@st.cache_data(ttl="1h")
+def get_verified_data(tkrs):
+    d = yf.download(tkrs, start="2015-01-01")['Close'].ffill().dropna()
+    for t in tkrs:
+        d[f'{t}_mom'] = d[t].pct_change(10) # Momentum signal to help rotation (SLV vs GLD)
+    return d
 
-# 2. Get Data with Rotation Features (SLV vs GLD)
 tickers = ["GLD", "SLV", "VNQ", "TLT", "TBT"]
-data = yf.download(tickers, start="2018-01-01")['Close'].ffill().dropna()
+raw_data = get_verified_data(tickers)
 
-# Add Relative Strength Features to help models "see" SLV
-for t in tickers:
-    data[f'{t}_momentum'] = data[t].pct_change(10)
-
-if not data.empty:
-    features = data.pct_change().shift(1).dropna() # LAGGED to prevent cheating
+if not raw_data.empty:
+    # SANITIZER: Replace inf/NaN for XGBoost stability
+    returns = raw_data.pct_change().replace([np.inf, -np.inf], np.nan).dropna()
+    features = returns.shift(1).dropna() # LAGGED to stop data leakage
     
+    # WATER-TIGHT SEGREGATION (Three Models)
+    model_a = AlphaSubModel("TRANSFORMER")
+    model_b1 = AlphaSubModel("XGB") # Competition for Model B
+    model_b2 = AlphaSubModel("RF")  # Competition for Model B
+
     for h_val, h_name in {1: "1D", 3: "3D", 5: "5D"}.items():
         for etf in tickers:
-            target = data[etf].pct_change(h_val).shift(-h_val).dropna()
+            target = raw_data[etf].pct_change(h_val).shift(-h_val).dropna()
             idx = features.index.intersection(target.index)
             
-            # Run all three independently
-            model_a.run_audit(features.loc[idx], target.loc[idx], etf, h_name, h_val)
-            model_b1.run_audit(features.loc[idx], target.loc[idx], etf, h_name, h_val)
-            model_b2.run_audit(features.loc[idx], target.loc[idx], etf, h_name, h_val)
+            model_a.train_and_check(features.loc[idx], target.loc[idx], etf, h_name, h_val)
+            model_b1.train_and_check(features.loc[idx], target.loc[idx], etf, h_name, h_val)
+            model_b2.train_and_check(features.loc[idx], target.loc[idx], etf, h_name, h_val)
 
-    # Resolve Model B Tournament (XGB vs RF for Highest Return)
-    winner_b = model_b1.best_pick if model_b1.best_pick['score'] > model_b2.best_pick['score'] else model_b2.best_pick
+    # Model B Tournament: Highest Return between XGB and RF
+    best_b = model_b1.best_res if model_b1.best_res['score'] > model_b2.best_res['score'] else model_b2.best_res
 
-    # Render Final Comparison
-    interface.render_dashboard(model_a.best_pick, winner_b, 0.0363)
-    interface.render_logs(model_a.best_pick['logs'], winner_b['logs'])
+    interface.render_dashboard(model_a.best_res, best_b)
+    interface.render_logs(model_a.best_res['logs'], best_b['logs'])

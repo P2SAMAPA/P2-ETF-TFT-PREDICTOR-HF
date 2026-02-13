@@ -6,11 +6,10 @@ from fredapi import Fred
 import torch
 import torch.nn as nn
 from sklearn.preprocessing import StandardScaler
-import plotly.graph_objects as go
 import os
-import time
-from datetime import datetime, timedelta
+import gc
 import pytz
+from datetime import datetime, timedelta
 from huggingface_hub import hf_hub_download, HfApi
 from pandas.tseries.holiday import (
     AbstractHolidayCalendar, Holiday, nearest_workday,
@@ -34,6 +33,7 @@ def sync_data_persistent(assets, start_date_str):
         df = yf.download(assets, start=start_date_str, progress=False)['Close']
         save_to_hf(df)
         return df
+    
     yesterday = datetime.now() - timedelta(days=1)
     if last_date.date() < yesterday.date():
         delta_start = (last_date + timedelta(days=1)).strftime('%Y-%m-%d')
@@ -73,26 +73,26 @@ def get_market_execution_date():
             return curr.strftime('%B %d, %Y')
         curr += timedelta(days=1)
 
-# --- 3. MODEL CORE ---
+# --- 3. MODEL CORE (RAM OPTIMIZED) ---
 class MomentumTransformer(nn.Module):
-    def __init__(self, input_dim, d_model=64, num_heads=8, seq_len=30):
+    def __init__(self, input_dim, d_model=32, num_heads=4, seq_len=30):
         super(MomentumTransformer, self).__init__()
         self.input_projection = nn.Linear(input_dim, d_model)
         self.pos_encoder = nn.Parameter(torch.zeros(1, seq_len, d_model))
-        mask = torch.arange(seq_len).float()
-        self.register_buffer('time_mask', torch.exp(mask - seq_len + 1).unsqueeze(0).unsqueeze(0))
         encoder_layers = nn.TransformerEncoderLayer(d_model=d_model, nhead=num_heads, dropout=0.1, batch_first=True)
-        self.transformer_encoder = nn.TransformerEncoder(encoder_layers, num_layers=3)
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layers, num_layers=2)
         self.decoder = nn.Linear(d_model, 6) 
 
     def forward(self, x):
-        x = self.input_projection(x) * self.time_mask.transpose(1, 2) + self.pos_encoder
+        x = self.input_projection(x) + self.pos_encoder
         x = self.transformer_encoder(x)
         return self.decoder(x[:, -1, :])
 
-@st.cache_resource(ttl="1d")
+@st.cache_resource(ttl="1h")
 def train_engine(start_year, tx_cost_bps):
-    print(f">>> CRITICAL: Training initiated for {start_year}")
+    gc.collect() # Force clear RAM
+    print(f">>> Training {start_year} with Memory Guard...")
+    
     fred = Fred(api_key=os.getenv("FRED_API_KEY"))
     etfs = ["TLT", "TBT", "VNQ", "SLV", "GLD"]
     start_date = f"{start_year}-01-01"
@@ -107,7 +107,6 @@ def train_engine(start_year, tx_cost_bps):
         returns_df['CASH'] = 0.0001
 
     for asset in etfs + ['CASH']:
-        returns_df[f'{asset}_ROC_3'] = returns_df[asset].pct_change(3)
         returns_df[f'{asset}_ROC_10'] = returns_df[asset].pct_change(10)
 
     vix = yf.download("^VIX", start=start_date, progress=False)['Close']
@@ -129,20 +128,19 @@ def train_engine(start_year, tx_cost_bps):
     model = MomentumTransformer(input_dim=features_df.shape[1])
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
     
-    # ADJUSTED EPOCHS & LOGGING
-    epochs = 40 if start_year >= 2020 else 75
+    epochs = 40 if start_year >= 2020 else 75 # Speed optimization
     model.train()
     for e in range(epochs):
         optimizer.zero_grad()
         output = model(X_train)
         loss = nn.MSELoss()(output, y_train)
         loss.backward(); optimizer.step()
-        if e % 10 == 0: print(f"Progress: Epoch {e}/{epochs}")
-
-    print(">>> SUCCESS: Training complete.")
+        if e % 10 == 0: print(f"Progress: {e}/{epochs}")
+        
+    print(">>> Training Complete.")
     return {"model": model, "scaler": scaler, "returns": returns_df[etfs+['CASH']], "features": scaled_data, "vix": returns_df['VIX']}
 
-# --- 4. DASHBOARD ---
+# --- 4. DASHBOARD UI ---
 st.set_page_config(page_title="ETF Alpha Maximizer", layout="wide")
 
 with st.sidebar:
@@ -151,10 +149,12 @@ with st.sidebar:
     tx_cost = st.number_input("Tx Cost (BPS)", 0, 50, 15)
     engine = train_engine(regime_year, tx_cost)
 
+# Run Inference
 engine["model"].eval()
 assets = ["TLT", "TBT", "VNQ", "SLV", "GLD", "CASH"]
-oos_features = engine["features"][int(len(engine["features"])*0.8):]
-actual_rets = engine["returns"].iloc[int(len(engine["returns"])*0.8):]
+split_point = int(len(engine["features"])*0.8)
+oos_features = engine["features"][split_point:]
+actual_rets = engine["returns"].iloc[split_point:]
 
 picks = []
 for i in range(len(oos_features)-30):
@@ -162,19 +162,24 @@ for i in range(len(oos_features)-30):
         pred = engine["model"](torch.FloatTensor(oos_features[i:i+30]).unsqueeze(0)).numpy()[0]
     picks.append(assets[np.argmax(pred)])
 
+# Wealth Calculation
 final_series = pd.Series([actual_rets[p].iloc[i+30] for i, p in enumerate(picks)], index=actual_rets.index[30:30+len(picks)])
 wealth = (1 + final_series).cumprod()
 
+# Layout
 st.title("Fixed Income/Commodity ETF Alpha Maximizer")
 
 m1, m2, m3, m4 = st.columns(4)
 with m1:
     st.markdown(f"**Current Pick**\n<h2 style='margin:0;'>{picks[-1]}</h2><p style='font-size:12px; color:gray;'>Execution: {get_market_execution_date()}</p>", unsafe_allow_html=True)
 with m2:
-    st.markdown(f"**Ann. Return**\n<h2 style='margin:0;'>{(((1 + final_series.mean())**252) - 1) * 100:.1f}%</h2><p style='font-size:12px; color:gray;'>OOS Results</p>", unsafe_allow_html=True)
+    ann_ret = (((1 + final_series.mean())**252) - 1) * 100
+    st.markdown(f"**Ann. Return**\n<h2 style='margin:0;'>{ann_ret:.1f}%</h2><p style='font-size:12px; color:gray;'>OOS Results</p>", unsafe_allow_html=True)
 with m3:
-    st.markdown(f"**Sharpe Ratio**\n<h2 style='margin:0;'>{(final_series.mean() / final_series.std()) * np.sqrt(252):.2f}</h2><p style='font-size:12px; color:gray;'>Risk-Adjusted</p>", unsafe_allow_html=True)
+    sharpe = (final_series.mean() / final_series.std()) * np.sqrt(252)
+    st.markdown(f"**Sharpe Ratio**\n<h2 style='margin:0;'>{sharpe:.2f}</h2><p style='font-size:12px; color:gray;'>Risk-Adjusted</p>", unsafe_allow_html=True)
 with m4:
-    st.markdown(f"**Hit Ratio**\n<h2 style='margin:0;'>{(final_series > 0).sum() / len(final_series) * 100:.1f}%</h2><p style='font-size:12px; color:gray;'>Success Rate</p>", unsafe_allow_html=True)
+    hit_ratio = (final_series > 0).sum() / len(final_series) * 100
+    st.markdown(f"**Hit Ratio**\n<h2 style='margin:0;'>{hit_ratio:.1f}%</h2><p style='font-size:12px; color:gray;'>Success Rate</p>", unsafe_allow_html=True)
 
 st.line_chart(wealth)

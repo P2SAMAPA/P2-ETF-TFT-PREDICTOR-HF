@@ -11,10 +11,7 @@ import gc
 from datetime import datetime, timedelta
 from huggingface_hub import hf_hub_download, HfApi
 
-# --- 1. SEEDING REMOVED ---
-# Global seeding functions removed to allow for original random weight initialization.
-
-# --- 2. DATA PERSISTENCE ENGINE ---
+# --- 1. DATA PERSISTENCE ENGINE ---
 REPO_ID = "P2SAMAPA/etf-alpha-data" 
 FILENAME = "historical_cache.parquet"
 HF_TOKEN = os.getenv("HF_TOKEN")
@@ -34,13 +31,14 @@ def sync_data_persistent(assets, start_date_str):
     except:
         return yf.download(assets, start=start_date_str, progress=False)['Close']
 
-# --- 3. HIGH-CAPACITY TRANSFORMER MODEL ---
+# --- 2. TRANSFORMER MODEL (Dropout Updated to 0.3) ---
 class MomentumTransformer(nn.Module):
     def __init__(self, input_dim, d_model=64, num_heads=8, seq_len=30):
         super(MomentumTransformer, self).__init__()
         self.input_projection = nn.Linear(input_dim, d_model)
         self.pos_encoder = nn.Parameter(torch.zeros(1, seq_len, d_model))
-        encoder_layers = nn.TransformerEncoderLayer(d_model=d_model, nhead=num_heads, dropout=0.1, batch_first=True)
+        # Updated Dropout to 0.3 for better regularization
+        encoder_layers = nn.TransformerEncoderLayer(d_model=d_model, nhead=num_heads, dropout=0.3, batch_first=True)
         self.transformer_encoder = nn.TransformerEncoder(encoder_layers, num_layers=3)
         self.decoder = nn.Linear(d_model, 6) 
 
@@ -50,9 +48,8 @@ class MomentumTransformer(nn.Module):
         return self.decoder(x[:, -1, :])
 
 @st.cache_resource(ttl="1h")
-def train_engine(start_year, tx_cost):
+def train_engine(start_year, tx_cost, lookback):
     gc.collect()
-    # Manual seed removed here as well.
     fred = Fred(api_key=os.getenv("FRED_API_KEY"))
     etfs = ["TLT", "TBT", "VNQ", "SLV", "GLD"]
     
@@ -73,7 +70,6 @@ def train_engine(start_year, tx_cost):
     features_df = returns_df.replace([np.inf, -np.inf], np.nan).ffill().bfill().fillna(0)
     target_df = returns_df[etfs + ['CASH']].rolling(3).sum().shift(-3).dropna()
     
-    # --- DYNAMIC 80:20 MATH ---
     total_len = len(features_df)
     split_idx = int(total_len * 0.8)
     
@@ -84,10 +80,11 @@ def train_engine(start_year, tx_cost):
     scaled_train = scaler.fit_transform(train_feat.astype(np.float64))
     scaled_oos = scaler.transform(oos_feat.astype(np.float64))
     
-    X_train = torch.FloatTensor(np.array([scaled_train[i:i+30] for i in range(len(scaled_train)-30)]))
-    y_train = torch.FloatTensor(target_df.iloc[30:split_idx].values)
+    # Dynamic Lookback Windowing
+    X_train = torch.FloatTensor(np.array([scaled_train[i:i+lookback] for i in range(len(scaled_train)-lookback)]))
+    y_train = torch.FloatTensor(target_df.iloc[lookback:split_idx].values)
 
-    model = MomentumTransformer(input_dim=features_df.shape[1])
+    model = MomentumTransformer(input_dim=features_df.shape[1], seq_len=lookback)
     optimizer = torch.optim.Adam(model.parameters(), lr=0.0005)
     
     model.train()
@@ -97,9 +94,9 @@ def train_engine(start_year, tx_cost):
         loss = nn.MSELoss()(output, y_train[:len(output)])
         loss.backward(); optimizer.step()
         
-    return {"model": model, "scaler": scaler, "returns": returns_df[etfs+['CASH']], "oos_features": scaled_oos, "sofr": sofr_val, "oos_dates": oos_feat.index}
+    return {"model": model, "scaler": scaler, "returns": returns_df[etfs+['CASH']], "oos_features": scaled_oos, "sofr": sofr_val, "oos_dates": oos_feat.index, "lookback": lookback}
 
-# --- 4. STREAMLIT UI ---
+# --- 3. UI ---
 st.set_page_config(page_title="ETF Alpha Maximizer", layout="wide")
 
 with st.sidebar:
@@ -107,30 +104,34 @@ with st.sidebar:
     regime_year = st.slider("Year Anchor (Pool Start)", 2008, 2023, 2021)
     tx_cost_bps = st.slider("Transaction Cost (BPS)", 0, 50, 15)
     
+    # Sidebar toggle for Lookback Window
+    lookback_window = st.radio("Lookback Window (Days)", [30, 45, 60], index=0, horizontal=True)
+    
     with st.spinner("Training Deep Transformer..."):
-        engine = train_engine(regime_year, tx_cost_bps)
+        engine = train_engine(regime_year, tx_cost_bps, lookback_window)
     
     st.markdown("---")
     st.subheader("Model Status")
-    st.warning("Random Initialization (Non-Seeded)")
+    st.warning("Dropout: 0.3 | Random Init")
     st.info(f"OOS Range: {len(engine['oos_dates'])} days")
 
-# --- 5. INFERENCE & ALIGNMENT ---
+# --- 4. INFERENCE ---
 assets = ["TLT", "TBT", "VNQ", "SLV", "GLD", "CASH"]
 oos_features = engine["oos_features"]
 actual_rets = engine["returns"].loc[engine["oos_dates"]]
+lb = engine["lookback"]
 
 picks = []
 engine["model"].eval()
-for i in range(len(oos_features)-30):
+for i in range(len(oos_features)-lb):
     with torch.no_grad():
-        pred = engine["model"](torch.FloatTensor(oos_features[i:i+30]).unsqueeze(0)).numpy()[0]
+        pred = engine["model"](torch.FloatTensor(oos_features[i:i+lb]).unsqueeze(0)).numpy()[0]
     picks.append(assets[np.argmax(pred)])
 
-final_index = engine["oos_dates"][30 : 30 + len(picks)]
+final_index = engine["oos_dates"][lb : lb + len(picks)]
 res_df = pd.DataFrame({
     "Pick": picks, 
-    "Return": [actual_rets[p].iloc[i+30] for i, p in enumerate(picks)]
+    "Return": [actual_rets[p].iloc[i+lb] for i, p in enumerate(picks)]
 }, index=final_index)
 
 res_df['Return'] = res_df['Return'] - (tx_cost_bps / 10000)
@@ -164,8 +165,8 @@ st.table(audit_data.style.applymap(style_returns, subset=['Return']))
 st.markdown("---")
 st.subheader("🧠 Methodology & Process")
 st.info(f"""
-- **Random Initialization**: Seed removed to allow for dynamic pattern discovery during each training session.
-- **Dynamic 80:20 Slicing**: Boundary calculated as 80% of data from {regime_year} to present.
-- **High-Capacity Model**: Original 3-layer Transformer architecture.
-- **Training Depth**: 100 epochs per session.
+- **Dropout Adjusted**: Increased to 0.3 to reduce overfitting on stagnant assets.
+- **Variable Lookback**: User-selectable window ({lb} days) to calibrate signal sensitivity.
+- **Dynamic 80:20 Slicing**: Sliced boundary based on {regime_year} anchor.
+- **Random Weights**: Seeding removed to allow the model to explore new local minima during training.
 """)

@@ -19,55 +19,34 @@ from pandas.tseries.holiday import (
 )
 
 # --- 1. CONFIG & HF PERSISTENCE ---
-# Change "your-username" to your actual HF username
 REPO_ID = "P2SAMAPA/etf-alpha-data" 
 FILENAME = "historical_cache.parquet"
 HF_TOKEN = os.getenv("HF_TOKEN")
 
 def sync_data_persistent(assets, start_date_str):
-    """Downloads only missing data and saves to HF Dataset."""
     if not HF_TOKEN:
-        st.error("HF_TOKEN secret not found in Space Settings. Using direct download (no cache).")
         return yf.download(assets, start=start_date_str, progress=False)['Close']
-
-    api = HfApi()
-    
-    # Try to load existing cache from HF
     try:
         path = hf_hub_download(repo_id=REPO_ID, filename=FILENAME, repo_type="dataset", token=HF_TOKEN)
         df = pd.read_parquet(path)
         last_date = df.index.max()
-        st.sidebar.success(f"Loaded memory from HF. Last date: {last_date.date()}")
     except Exception:
-        st.sidebar.warning("No HF cache found. Performing full initial pull...")
         df = yf.download(assets, start=start_date_str, progress=False)['Close']
         save_to_hf(df)
         return df
-
-    # Check for incremental updates
     yesterday = datetime.now() - timedelta(days=1)
     if last_date.date() < yesterday.date():
         delta_start = (last_date + timedelta(days=1)).strftime('%Y-%m-%d')
         new_data = yf.download(assets, start=delta_start, progress=False)['Close']
-        
         if not new_data.empty:
             df = pd.concat([df, new_data]).drop_duplicates().sort_index()
             save_to_hf(df)
-            st.sidebar.info(f"Synced {len(new_data)} new days to HF.")
-    
     return df
 
 def save_to_hf(df):
-    """Pushes the updated dataframe to HF dataset."""
     df.to_parquet(FILENAME)
     api = HfApi()
-    api.upload_file(
-        path_or_fileobj=FILENAME,
-        path_in_repo=FILENAME,
-        repo_id=REPO_ID,
-        repo_type="dataset",
-        token=HF_TOKEN
-    )
+    api.upload_file(path_or_fileobj=FILENAME, path_in_repo=FILENAME, repo_id=REPO_ID, repo_type="dataset", token=HF_TOKEN)
 
 # --- 2. NYSE CALENDAR ---
 class USTradingCalendar(AbstractHolidayCalendar):
@@ -113,6 +92,7 @@ class MomentumTransformer(nn.Module):
 
 @st.cache_resource(ttl="1d")
 def train_engine(start_year, tx_cost_bps):
+    print(f">>> CRITICAL: Training initiated for {start_year}")
     fred = Fred(api_key=os.getenv("FRED_API_KEY"))
     etfs = ["TLT", "TBT", "VNQ", "SLV", "GLD"]
     start_date = f"{start_year}-01-01"
@@ -126,9 +106,7 @@ def train_engine(start_year, tx_cost_bps):
     except:
         returns_df['CASH'] = 0.0001
 
-    # Feature Engineering
     for asset in etfs + ['CASH']:
-        if asset not in returns_df.columns: continue
         returns_df[f'{asset}_ROC_3'] = returns_df[asset].pct_change(3)
         returns_df[f'{asset}_ROC_10'] = returns_df[asset].pct_change(10)
 
@@ -150,17 +128,19 @@ def train_engine(start_year, tx_cost_bps):
 
     model = MomentumTransformer(input_dim=features_df.shape[1])
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
-    loss_history = []
     
+    # ADJUSTED EPOCHS & LOGGING
+    epochs = 40 if start_year >= 2020 else 75
     model.train()
-    for _ in range(80):
+    for e in range(epochs):
         optimizer.zero_grad()
         output = model(X_train)
         loss = nn.MSELoss()(output, y_train)
         loss.backward(); optimizer.step()
-        loss_history.append(loss.item())
-        
-    return {"model": model, "scaler": scaler, "returns": returns_df[etfs+['CASH']], "features": scaled_data, "loss": loss_history, "vix": returns_df['VIX']}
+        if e % 10 == 0: print(f"Progress: Epoch {e}/{epochs}")
+
+    print(">>> SUCCESS: Training complete.")
+    return {"model": model, "scaler": scaler, "returns": returns_df[etfs+['CASH']], "features": scaled_data, "vix": returns_df['VIX']}
 
 # --- 4. DASHBOARD ---
 st.set_page_config(page_title="ETF Alpha Maximizer", layout="wide")
@@ -171,7 +151,6 @@ with st.sidebar:
     tx_cost = st.number_input("Tx Cost (BPS)", 0, 50, 15)
     engine = train_engine(regime_year, tx_cost)
 
-# Inference
 engine["model"].eval()
 assets = ["TLT", "TBT", "VNQ", "SLV", "GLD", "CASH"]
 oos_features = engine["features"][int(len(engine["features"])*0.8):]
@@ -199,7 +178,3 @@ with m4:
     st.markdown(f"**Hit Ratio**\n<h2 style='margin:0;'>{(final_series > 0).sum() / len(final_series) * 100:.1f}%</h2><p style='font-size:12px; color:gray;'>Success Rate</p>", unsafe_allow_html=True)
 
 st.line_chart(wealth)
-
-st.subheader("15-Day Strategy Audit")
-audit_df = pd.DataFrame({"Date": final_series.tail(15).index.strftime('%Y-%m-%d'), "Ticker": picks[-15:], "Return": [f"{v:+.2%}" for v in final_series.tail(15).values]})
-st.table(audit_df)

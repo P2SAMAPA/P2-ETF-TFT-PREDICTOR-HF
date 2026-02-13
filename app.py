@@ -11,43 +11,85 @@ import os
 import time
 from datetime import datetime, timedelta
 import pytz
+from huggingface_hub import hf_hub_download, HfApi
 from pandas.tseries.holiday import (
     AbstractHolidayCalendar, Holiday, nearest_workday,
     USMartinLutherKingJr, USPresidentsDay, GoodFriday,
     USMemorialDay, USLaborDay, USThanksgivingDay
 )
 
-# --- 1. NYSE CALENDAR LOGIC (TODAY-AWARE) ---
+# --- 1. CONFIG & HF PERSISTENCE ---
+# Change these to match your Hugging Face Setup
+REPO_ID = "your-username/etf-alpha-data" 
+FILENAME = "historical_cache.parquet"
+HF_TOKEN = os.getenv("HF_TOKEN")
+
+def sync_data_persistent(assets, start_date_str):
+    """Downloads only missing data and saves to HF Dataset."""
+    if not HF_TOKEN:
+        st.error("HF_TOKEN secret not found in Space Settings.")
+        return yf.download(assets, start=start_date_str, progress=False)['Close']
+
+    api = HfApi()
+    df = None
+    
+    # Try to load existing cache from HF
+    try:
+        path = hf_hub_download(repo_id=REPO_ID, filename=FILENAME, repo_type="dataset", token=HF_TOKEN)
+        df = pd.read_parquet(path)
+        last_date = df.index.max()
+    except Exception as e:
+        st.warning("No HF cache found. Performing full initial pull...")
+        df = yf.download(assets, start=start_date_str, progress=False)['Close']
+        save_to_hf(df)
+        return df
+
+    # Check for incremental updates (if today > last saved date)
+    yesterday = datetime.now() - timedelta(days=1)
+    if last_date.date() < yesterday.date():
+        # Only pull the 'delta' (from last date to now)
+        delta_start = (last_date + timedelta(days=1)).strftime('%Y-%m-%d')
+        new_data = yf.download(assets, start=delta_start, progress=False)['Close']
+        
+        if not new_data.empty:
+            df = pd.concat([df, new_data]).drop_duplicates().sort_index()
+            save_to_hf(df)
+            st.sidebar.success(f"Synced {len(new_data)} new market days to HF storage.")
+    
+    return df
+
+def save_to_hf(df):
+    """Saves the local dataframe as a parquet and pushes to HF."""
+    df.to_parquet(FILENAME)
+    api = HfApi()
+    api.upload_file(
+        path_or_fileobj=FILENAME,
+        path_in_repo=FILENAME,
+        repo_id=REPO_ID,
+        repo_type="dataset",
+        token=HF_TOKEN
+    )
+
+# --- 2. NYSE CALENDAR ---
 class USTradingCalendar(AbstractHolidayCalendar):
     rules = [
         Holiday('NewYearsDay', month=1, day=1, observance=nearest_workday),
-        USMartinLutherKingJr,
-        USPresidentsDay,
-        GoodFriday,
-        USMemorialDay,
+        USMartinLutherKingJr, USPresidentsDay, GoodFriday, USMemorialDay,
         Holiday('Juneteenth', month=6, day=19, start_date='2021-06-18', observance=nearest_workday),
         Holiday('USIndependenceDay', month=7, day=4, observance=nearest_workday),
-        USLaborDay,
-        USThanksgivingDay,
+        USLaborDay, USThanksgivingDay,
         Holiday('Christmas', month=12, day=25, observance=nearest_workday)
     ]
 
 def get_market_execution_date():
-    """Returns today if the market is open/opening, otherwise the next valid session."""
     tz = pytz.timezone('US/Eastern')
     now_et = datetime.now(tz)
     inst = USTradingCalendar()
-    
-    # Check if today is a weekend or holiday
     holidays = inst.holidays(start=now_et.date(), end=now_et.date() + timedelta(days=1))
     is_holiday = now_et.strftime('%Y-%m-%d') in holidays
     is_weekend = now_et.weekday() >= 5
-    
-    # Market closes at 4:00 PM ET
     if not is_holiday and not is_weekend and now_et.hour < 16:
         return now_et.strftime('%B %d, %Y')
-    
-    # Otherwise, find the next business day
     curr = now_et + timedelta(days=1)
     all_holidays = inst.holidays(start=now_et.date(), end=now_et.date() + timedelta(days=14))
     while True:
@@ -55,7 +97,7 @@ def get_market_execution_date():
             return curr.strftime('%B %d, %Y')
         curr += timedelta(days=1)
 
-# --- 2. CORE MODEL ARCHITECTURE ---
+# --- 3. MODEL ARCHITECTURE ---
 class MomentumTransformer(nn.Module):
     def __init__(self, input_dim, d_model=64, num_heads=8, seq_len=30):
         super(MomentumTransformer, self).__init__()
@@ -87,9 +129,10 @@ def train_engine(start_year, tx_cost_bps):
     etfs = ["TLT", "TBT", "VNQ", "SLV", "GLD"]
     start_date = f"{start_year}-01-01"
     
-    data = yf.download(etfs, start=start_date, progress=False)['Close']
-    returns_df = data.ffill().pct_change().fillna(0)
+    # NEW PERSISTENT SYNC LOGIC
+    data = sync_data_persistent(etfs, start_date)
     
+    returns_df = data.ffill().pct_change().fillna(0)
     try:
         sofr = fred.get_series('SOFR', start_date)
         returns_df['CASH'] = (sofr / 360 / 100).reindex(returns_df.index).ffill().fillna(0.0001)
@@ -134,7 +177,7 @@ def train_engine(start_year, tx_cost_bps):
         
     return {"model": model, "scaler": scaler, "returns": returns_df, "features": scaled_data, "loss": loss_history, "vix": full_df['VIX']}
 
-# --- 3. UI LAYOUT ---
+# --- 4. UI ---
 st.set_page_config(page_title="ETF Alpha Maximizer", layout="wide")
 
 with st.sidebar:
@@ -147,9 +190,7 @@ with st.sidebar:
     fig_loss = go.Figure(go.Scatter(y=engine["loss"], mode='lines', line=dict(color='#00d4ff')))
     fig_loss.update_layout(height=150, margin=dict(l=0,r=0,t=0,b=0), template="plotly_dark")
     st.plotly_chart(fig_loss, use_container_width=True)
-    st.caption("**Interpretation:** A sharp drop indicates the model has successfully learned patterns from the chosen anchor.")
 
-# Inference
 engine["model"].eval()
 assets = ["TLT", "TBT", "VNQ", "SLV", "GLD", "CASH"]
 oos_idx = int(len(engine["returns"]) * 0.8)
@@ -170,21 +211,15 @@ final_series = pd.Series([actual_rets[p].iloc[i+30] for i, p in enumerate(picks)
 wealth = (1 + final_series).cumprod()
 trade_date = get_market_execution_date()
 
-# --- DASHBOARD RENDER ---
 st.title("Fixed Income/Commodity ETF Alpha Maximizer")
 
-# Aligned Metrics Row
 m1, m2, m3, m4 = st.columns(4)
-
 with m1:
     st.markdown(f"**Current Pick**\n<h2 style='margin:0;'>{picks[-1]}</h2><p style='font-size:12px; color:gray;'>Execution: {trade_date}</p>", unsafe_allow_html=True)
-
 with m2:
     st.markdown(f"**Ann. Return**\n<h2 style='margin:0;'>{(((1 + final_series.mean())**252) - 1) * 100:.1f}%</h2><p style='font-size:12px; color:gray;'>{len(final_series)//21} OOS Months</p>", unsafe_allow_html=True)
-
 with m3:
     st.markdown(f"**Sharpe Ratio**\n<h2 style='margin:0;'>{(final_series.mean() / final_series.std()) * np.sqrt(252):.2f}</h2><p style='font-size:12px; color:gray;'>Risk-Adjusted</p>", unsafe_allow_html=True)
-
 with m4:
     st.markdown(f"**Hit Ratio**\n<h2 style='margin:0;'>{(final_series > 0).sum() / len(final_series) * 100:.1f}%</h2><p style='font-size:12px; color:gray;'>15-Day Strategy Window</p>", unsafe_allow_html=True)
 
@@ -206,7 +241,7 @@ with col1:
     """)
 with col2:
     st.markdown("""
-    ### **Optimization Strategy**
-    * **Loss Function:** Weighted Huber Loss with a 2.5x penalty on winners to prioritize absolute returns.
+    ### **Persistent Storage & Optimization**
+    * **Delta-Sync Memory:** Leverages a Hugging Face Dataset as a permanent Parquet store, reducing API pings by only downloading new trading days.
     * **Execution:** Integrated NYSE trading calendar ensures trade timing matches US market availability.
     """)

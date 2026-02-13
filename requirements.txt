@@ -5,5 +5,7 @@ yfinance
 fredapi
 torch
 scikit-learn
-xgboost
 plotly
+huggingface_hub
+pyarrow
+pytz

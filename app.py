@@ -8,11 +8,10 @@ import torch.nn as nn
 from sklearn.preprocessing import StandardScaler
 import os
 import gc
-import pytz
 from datetime import datetime, timedelta
 from huggingface_hub import hf_hub_download, HfApi
 
-# --- 1. CONFIG & HF PERSISTENCE ---
+# --- 1. DATA PERSISTENCE ---
 REPO_ID = "P2SAMAPA/etf-alpha-data" 
 FILENAME = "historical_cache.parquet"
 HF_TOKEN = os.getenv("HF_TOKEN")
@@ -30,8 +29,7 @@ def sync_data_persistent(assets, start_date_str):
                 HfApi().upload_file(path_or_fileobj=FILENAME, path_in_repo=FILENAME, repo_id=REPO_ID, repo_type="dataset", token=HF_TOKEN)
         return df
     except:
-        df = yf.download(assets, start=start_date_str, progress=False)['Close']
-        return df
+        return yf.download(assets, start=start_date_str, progress=False)['Close']
 
 # --- 2. MODEL ARCHITECTURE ---
 class MomentumTransformer(nn.Module):
@@ -49,8 +47,8 @@ class MomentumTransformer(nn.Module):
         return self.decoder(x[:, -1, :])
 
 @st.cache_resource(ttl="1h")
-def train_engine(start_year):
-    gc.collect() # Memory Guard
+def train_engine(start_year, tx_cost):
+    gc.collect()
     fred = Fred(api_key=os.getenv("FRED_API_KEY"))
     etfs = ["TLT", "TBT", "VNQ", "SLV", "GLD"]
     data = sync_data_persistent(etfs, f"{start_year}-01-01")
@@ -61,7 +59,7 @@ def train_engine(start_year):
         sofr_val = sofr_series.iloc[-1]
         returns_df['CASH'] = (sofr_val / 360 / 100)
     except:
-        sofr_val = 5.33 # Default 2026 approximation
+        sofr_val = 5.33
         returns_df['CASH'] = 0.0001
 
     for asset in etfs + ['CASH']:
@@ -83,7 +81,6 @@ def train_engine(start_year):
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
     loss_log = []
     
-    # Speed Optimization
     epochs = 40 if start_year >= 2020 else 70
     model.train()
     for e in range(epochs):
@@ -94,17 +91,21 @@ def train_engine(start_year):
         
     return {"model": model, "scaler": scaler, "returns": returns_df[etfs+['CASH']], "features": scaled_data, "loss": loss_log, "sofr": sofr_val}
 
-# --- 3. UI LAYOUT ---
+# --- 3. UI ---
 st.set_page_config(page_title="ETF Alpha Maximizer", layout="wide")
 
 with st.sidebar:
     st.header("⚙️ Strategy Settings")
     regime_year = st.slider("Year Anchor", 2008, 2023, 2021)
-    engine = train_engine(regime_year)
-    st.subheader("Convergence Chart")
-    st.line_chart(engine["loss"]) # Convergence chart on sidebar
+    tx_cost_bps = st.slider("Transaction Cost (BPS)", 0, 50, 15)
+    
+    engine = train_engine(regime_year, tx_cost_bps)
+    
+    st.markdown("---")
+    st.subheader("Model Training Loss")
+    st.line_chart(engine["loss"], height=150)
 
-# Run Inference
+# --- 4. INFERENCE & ALIGNMENT ---
 assets = ["TLT", "TBT", "VNQ", "SLV", "GLD", "CASH"]
 split_point = int(len(engine["features"])*0.8)
 oos_features = engine["features"][split_point:]
@@ -117,14 +118,16 @@ for i in range(len(oos_features)-30):
         pred = engine["model"](torch.FloatTensor(oos_features[i:i+30]).unsqueeze(0)).numpy()[0]
     picks.append(assets[np.argmax(pred)])
 
-# Calculations
+# Sync dates to predictions exactly
+final_index = actual_rets.index[30 : 30 + len(picks)]
 res_df = pd.DataFrame({
     "Pick": picks, 
     "Return": [actual_rets[p].iloc[i+30] for i, p in enumerate(picks)]
-}, index=actual_rets.index[30:])
+}, index=final_index)
 
+# Net of Fees calculation
+res_df['Return'] = res_df['Return'] - (tx_cost_bps / 10000)
 wealth = (1 + res_df["Return"]).cumprod()
-oos_years = round(len(res_df)/252, 1)
 
 st.title("Fixed Income/Commodity ETF Alpha Maximizer")
 
@@ -134,20 +137,19 @@ with m1:
     st.markdown(f"**Current Pick**\n<h2 style='margin:0;'>{picks[-1]}</h2><p style='font-size:12px; color:blue;'>Hold Type: 3-Day Target</p>", unsafe_allow_html=True)
 with m2:
     ann_ret = (res_df['Return'].mean() * 252) * 100
-    st.markdown(f"**Ann. Return**\n<h2 style='margin:0;'>{ann_ret:.1f}%</h2><p style='font-size:12px; color:gray;'>{oos_years} Years OOS</p>", unsafe_allow_html=True)
+    st.markdown(f"**Ann. Return**\n<h2 style='margin:0;'>{ann_ret:.1f}%</h2><p style='font-size:12px; color:gray;'>{round(len(res_df)/252,1)} Years OOS</p>", unsafe_allow_html=True)
 with m3:
     sharpe = (res_df['Return'].mean() / res_df['Return'].std()) * np.sqrt(252)
     st.markdown(f"**Sharpe Ratio**\n<h2 style='margin:0;'>{sharpe:.2f}</h2><p style='font-size:12px; color:green;'>SOFR: {engine['sofr']}%</p>", unsafe_allow_html=True)
 with m4:
-    last_15 = res_df.tail(15)
-    hit_15 = (last_15['Return'] > 0).sum() / 15 * 100
-    st.markdown(f"**Hit Ratio**\n<h2 style='margin:0;'>{hit_15:.1f}%</h2><p style='font-size:12px; color:gray;'>Last 15 Days</p>", unsafe_allow_html=True)
+    hit_15 = (res_df['Return'].tail(15) > 0).sum() / 15 * 100
+    st.markdown(f"**Hit Ratio**\n<h2 style='margin:0;'>{hit_15:.1f}%</h2><p style='font-size:12px; color:gray;'>Last 15 Trading Days</p>", unsafe_allow_html=True)
 
 st.line_chart(wealth)
 
-# --- 4. 15-DAY AUDIT TRAIL ---
+# --- 5. AUDIT TRAIL ---
 st.subheader("📋 15-Day Strategy Audit Trail")
-audit_data = last_15.copy()
+audit_data = res_df.tail(15).copy()
 audit_data['Return'] = audit_data['Return'].apply(lambda x: f"{x*100:+.2f}%")
 
 def style_returns(val):
@@ -156,12 +158,12 @@ def style_returns(val):
 
 st.table(audit_data.style.applymap(style_returns, subset=['Return']))
 
-# --- 5. METHODOLOGY FOOTER ---
+# --- 6. METHODOLOGY ---
 st.markdown("---")
 st.subheader("🧠 Methodology & Process")
 st.info("""
-**Transformer Architecture**: This model uses a Multi-Head Self-Attention mechanism to identify non-linear momentum patterns across correlated asset classes.
-- **Data Engine**: Historical data is loaded via a persistent Hugging Face Parquet cache and synced daily with live feeds.
-- **Model Logic**: A 2-layer Transformer Encoder processes 30-day sequences of price action and Rate-of-Change (ROC) features to predict the optimal asset for a 3-day holding window.
-- **Alpha Maximization**: The Year Anchor allows the model to re-calibrate its weights based on specific historical regimes (e.g., 2008 Financial Crisis vs. 2021 Inflationary Spike).
+**Transformer Architecture**: The system uses a Multi-Head Self-Attention mechanism to discover non-linear relationships between assets.
+- **Engine Logic**: A 2-layer Transformer Encoder analyzes 30-day sequences of price action and Rate-of-Change (ROC) features to forecast momentum.
+- **Constraint Management**: Mathematical alignment ensures the 3-day holding targets are synchronized with actual Out-of-Sample (OOS) data returns.
+- **Fee Realism**: Transaction costs are subtracted from daily performance to represent a realistic "Net of Fees" alpha profile.
 """)

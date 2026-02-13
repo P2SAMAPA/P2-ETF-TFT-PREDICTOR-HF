@@ -10,13 +10,14 @@ import plotly.graph_objects as go
 import os
 import time
 from datetime import datetime, timedelta
+import pytz
 from pandas.tseries.holiday import (
     AbstractHolidayCalendar, Holiday, nearest_workday,
     USMartinLutherKingJr, USPresidentsDay, GoodFriday,
     USMemorialDay, USLaborDay, USThanksgivingDay
 )
 
-# --- 1. NYSE CALENDAR (NO EXTERNAL LIB NEEDED) ---
+# --- 1. NYSE CALENDAR LOGIC (TODAY-AWARE) ---
 class USTradingCalendar(AbstractHolidayCalendar):
     rules = [
         Holiday('NewYearsDay', month=1, day=1, observance=nearest_workday),
@@ -31,20 +32,30 @@ class USTradingCalendar(AbstractHolidayCalendar):
         Holiday('Christmas', month=12, day=25, observance=nearest_workday)
     ]
 
-def get_next_trading_day():
+def get_market_execution_date():
+    """Returns today if the market is open/opening, otherwise the next valid session."""
+    tz = pytz.timezone('US/Eastern')
+    now_et = datetime.now(tz)
     inst = USTradingCalendar()
-    # Check next 10 days to find the first valid business day not in holiday list
-    start_search = datetime.now()
-    holidays = inst.holidays(start=start_search, end=start_search + timedelta(days=14))
     
-    curr = start_search + timedelta(days=1)
+    # Check if today is a weekend or holiday
+    holidays = inst.holidays(start=now_et.date(), end=now_et.date() + timedelta(days=1))
+    is_holiday = now_et.strftime('%Y-%m-%d') in holidays
+    is_weekend = now_et.weekday() >= 5
+    
+    # Market closes at 4:00 PM ET
+    if not is_holiday and not is_weekend and now_et.hour < 16:
+        return now_et.strftime('%B %d, %Y')
+    
+    # Otherwise, find the next business day
+    curr = now_et + timedelta(days=1)
+    all_holidays = inst.holidays(start=now_et.date(), end=now_et.date() + timedelta(days=14))
     while True:
-        # 5 = Saturday, 6 = Sunday
-        if curr.weekday() < 5 and curr.strftime('%Y-%m-%d') not in holidays:
+        if curr.weekday() < 5 and curr.strftime('%Y-%m-%d') not in all_holidays:
             return curr.strftime('%B %d, %Y')
         curr += timedelta(days=1)
 
-# --- 2. CORE MODEL (REVERTED TO BEST PERFORMER) ---
+# --- 2. CORE MODEL ARCHITECTURE ---
 class MomentumTransformer(nn.Module):
     def __init__(self, input_dim, d_model=64, num_heads=8, seq_len=30):
         super(MomentumTransformer, self).__init__()
@@ -124,7 +135,7 @@ def train_engine(start_year, tx_cost_bps):
     return {"model": model, "scaler": scaler, "returns": returns_df, "features": scaled_data, "loss": loss_history, "vix": full_df['VIX']}
 
 # --- 3. UI LAYOUT ---
-st.set_page_config(page_title="Transformer Alpha V7: Momentum", layout="wide")
+st.set_page_config(page_title="ETF Alpha Maximizer", layout="wide")
 
 with st.sidebar:
     st.header("⚙️ Strategy Settings")
@@ -157,26 +168,25 @@ for i in range(len(oos_features)-30):
 
 final_series = pd.Series([actual_rets[p].iloc[i+30] for i, p in enumerate(picks)], index=actual_rets.index[30:30+len(picks)])
 wealth = (1 + final_series).cumprod()
-oos_months = len(final_series) // 21
-next_trade_date = get_next_trading_day()
+trade_date = get_market_execution_date()
 
 # --- DASHBOARD RENDER ---
-st.title("🚀 Transformer Alpha: Multi-Asset Dashboard")
+st.title("Fixed Income/Commodity ETF Alpha Maximizer")
 
-# Unified Row of Metrics
+# Aligned Metrics Row
 m1, m2, m3, m4 = st.columns(4)
 
 with m1:
-    st.markdown(f"**Current Pick** \n<h2 style='margin:0;'>{picks[-1]}</h2><p style='font-size:12px; color:gray;'>NYSE Open: {next_trade_date}</p>", unsafe_allow_html=True)
+    st.markdown(f"**Current Pick**\n<h2 style='margin:0;'>{picks[-1]}</h2><p style='font-size:12px; color:gray;'>Execution: {trade_date}</p>", unsafe_allow_html=True)
 
 with m2:
-    st.markdown(f"**Ann. Return** \n<h2 style='margin:0;'>{(((1 + final_series.mean())**252) - 1) * 100:.1f}%</h2><p style='font-size:12px; color:gray;'>{oos_months} OOS Months</p>", unsafe_allow_html=True)
+    st.markdown(f"**Ann. Return**\n<h2 style='margin:0;'>{(((1 + final_series.mean())**252) - 1) * 100:.1f}%</h2><p style='font-size:12px; color:gray;'>{len(final_series)//21} OOS Months</p>", unsafe_allow_html=True)
 
 with m3:
-    st.markdown(f"**Sharpe Ratio** \n<h2 style='margin:0;'>{(final_series.mean() / final_series.std()) * np.sqrt(252):.2f}</h2><p style='font-size:12px; color:gray;'>Risk-Adjusted</p>", unsafe_allow_html=True)
+    st.markdown(f"**Sharpe Ratio**\n<h2 style='margin:0;'>{(final_series.mean() / final_series.std()) * np.sqrt(252):.2f}</h2><p style='font-size:12px; color:gray;'>Risk-Adjusted</p>", unsafe_allow_html=True)
 
 with m4:
-    st.markdown(f"**Hit Ratio** \n<h2 style='margin:0;'>{(final_series > 0).sum() / len(final_series) * 100:.1f}%</h2><p style='font-size:12px; color:gray;'>Calculated on 15d window</p>", unsafe_allow_html=True)
+    st.markdown(f"**Hit Ratio**\n<h2 style='margin:0;'>{(final_series > 0).sum() / len(final_series) * 100:.1f}%</h2><p style='font-size:12px; color:gray;'>15-Day Strategy Window</p>", unsafe_allow_html=True)
 
 st.subheader("Out-of-Sample Performance")
 st.line_chart(wealth)
@@ -198,5 +208,5 @@ with col2:
     st.markdown("""
     ### **Optimization Strategy**
     * **Loss Function:** Weighted Huber Loss with a 2.5x penalty on winners to prioritize absolute returns.
-    * **Execution Logic:** Features built-in NYSE holiday awareness using native Pandas toolsets for trade timing.
+    * **Execution:** Integrated NYSE trading calendar ensures trade timing matches US market availability.
     """)

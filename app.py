@@ -9,10 +9,42 @@ from sklearn.preprocessing import StandardScaler
 import plotly.graph_objects as go
 import os
 import time
-import pandas_market_calendars as mcal
 from datetime import datetime, timedelta
+from pandas.tseries.holiday import (
+    AbstractHolidayCalendar, Holiday, nearest_workday,
+    USMartinLutherKingJr, USPresidentsDay, GoodFriday,
+    USMemorialDay, USLaborDay, USThanksgivingDay
+)
 
-# --- 1. MODEL ARCHITECTURE (REVERTED TO HIGH-PERFORMANCE STATIC) ---
+# --- 1. NYSE CALENDAR (NO EXTERNAL LIB NEEDED) ---
+class USTradingCalendar(AbstractHolidayCalendar):
+    rules = [
+        Holiday('NewYearsDay', month=1, day=1, observance=nearest_workday),
+        USMartinLutherKingJr,
+        USPresidentsDay,
+        GoodFriday,
+        USMemorialDay,
+        Holiday('Juneteenth', month=6, day=19, start_date='2021-06-18', observance=nearest_workday),
+        Holiday('USIndependenceDay', month=7, day=4, observance=nearest_workday),
+        USLaborDay,
+        USThanksgivingDay,
+        Holiday('Christmas', month=12, day=25, observance=nearest_workday)
+    ]
+
+def get_next_trading_day():
+    inst = USTradingCalendar()
+    # Check next 10 days to find the first valid business day not in holiday list
+    start_search = datetime.now()
+    holidays = inst.holidays(start=start_search, end=start_search + timedelta(days=14))
+    
+    curr = start_search + timedelta(days=1)
+    while True:
+        # 5 = Saturday, 6 = Sunday
+        if curr.weekday() < 5 and curr.strftime('%Y-%m-%d') not in holidays:
+            return curr.strftime('%B %d, %Y')
+        curr += timedelta(days=1)
+
+# --- 2. CORE MODEL (REVERTED TO BEST PERFORMER) ---
 class MomentumTransformer(nn.Module):
     def __init__(self, input_dim, d_model=64, num_heads=8, seq_len=30):
         super(MomentumTransformer, self).__init__()
@@ -29,7 +61,6 @@ class MomentumTransformer(nn.Module):
         x = self.transformer_encoder(x)
         return self.decoder(x[:, -1, :])
 
-# --- 2. ENGINE & DATA ---
 def add_momentum_indicators(df, assets):
     for asset in assets:
         if asset == 'CASH' or asset not in df.columns: continue
@@ -45,14 +76,9 @@ def train_engine(start_year, tx_cost_bps):
     etfs = ["TLT", "TBT", "VNQ", "SLV", "GLD"]
     start_date = f"{start_year}-01-01"
     
-    data = None
-    for i in range(3):
-        data = yf.download(etfs, start=start_date, progress=False)['Close']
-        if not data.empty: break
-        time.sleep(5)
-    if data is None or data.empty: st.stop()
-    
+    data = yf.download(etfs, start=start_date, progress=False)['Close']
     returns_df = data.ffill().pct_change().fillna(0)
+    
     try:
         sofr = fred.get_series('SOFR', start_date)
         returns_df['CASH'] = (sofr / 360 / 100).reindex(returns_df.index).ffill().fillna(0.0001)
@@ -60,11 +86,8 @@ def train_engine(start_year, tx_cost_bps):
         returns_df['CASH'] = 0.0001
 
     full_df = add_momentum_indicators(returns_df.copy(), etfs + ['CASH'])
-    try:
-        vix = yf.download("^VIX", start=start_date, progress=False)['Close']
-        full_df['VIX'] = vix.reindex(full_df.index).ffill().fillna(20)
-    except:
-        full_df['VIX'] = 20
+    vix = yf.download("^VIX", start=start_date, progress=False)['Close']
+    full_df['VIX'] = vix.reindex(full_df.index).ffill().fillna(20)
         
     target_df = returns_df.rolling(3).sum().shift(-3).dropna()
     full_df = full_df.replace([np.inf, -np.inf], np.nan).ffill().bfill().fillna(0)
@@ -113,7 +136,7 @@ with st.sidebar:
     fig_loss = go.Figure(go.Scatter(y=engine["loss"], mode='lines', line=dict(color='#00d4ff')))
     fig_loss.update_layout(height=150, margin=dict(l=0,r=0,t=0,b=0), template="plotly_dark")
     st.plotly_chart(fig_loss, use_container_width=True)
-    st.caption("**Interpretation:** A sharp drop indicates the model has successfully learned historical momentum patterns from your chosen anchor year.")
+    st.caption("**Interpretation:** A sharp drop indicates the model has successfully learned patterns from the chosen anchor.")
 
 # Inference
 engine["model"].eval()
@@ -134,33 +157,26 @@ for i in range(len(oos_features)-30):
 
 final_series = pd.Series([actual_rets[p].iloc[i+30] for i, p in enumerate(picks)], index=actual_rets.index[30:30+len(picks)])
 wealth = (1 + final_series).cumprod()
-
-# NYSE Date Logic
-nyse = mcal.get_calendar('NYSE')
-next_day = nyse.valid_days(start_date=datetime.now(), end_date=datetime.now() + timedelta(days=7))[0]
-nyse_date_str = next_day.strftime('%B %d, %Y')
+oos_months = len(final_series) // 21
+next_trade_date = get_next_trading_day()
 
 # --- DASHBOARD RENDER ---
 st.title("🚀 Transformer Alpha: Multi-Asset Dashboard")
 
-oos_months = len(final_series) // 21
+# Unified Row of Metrics
 m1, m2, m3, m4 = st.columns(4)
 
 with m1:
-    st.write("Current Pick")
-    st.markdown(f"<h2 style='margin:0;'>{picks[-1]}</h2><p style='font-size:12px; color:gray;'>NYSE Open: {nyse_date_str}</p>", unsafe_allow_html=True)
+    st.markdown(f"**Current Pick** \n<h2 style='margin:0;'>{picks[-1]}</h2><p style='font-size:12px; color:gray;'>NYSE Open: {next_trade_date}</p>", unsafe_allow_html=True)
 
 with m2:
-    st.write("Ann. Return")
-    st.markdown(f"<h2 style='margin:0;'>{(((1 + final_series.mean())**252) - 1) * 100:.1f}%</h2><p style='font-size:12px; color:gray;'>{oos_months} OOS Months</p>", unsafe_allow_html=True)
+    st.markdown(f"**Ann. Return** \n<h2 style='margin:0;'>{(((1 + final_series.mean())**252) - 1) * 100:.1f}%</h2><p style='font-size:12px; color:gray;'>{oos_months} OOS Months</p>", unsafe_allow_html=True)
 
 with m3:
-    st.write("Sharpe Ratio")
-    st.markdown(f"<h2 style='margin:0;'>{(final_series.mean() / final_series.std()) * np.sqrt(252):.2f}</h2><p style='font-size:12px; color:gray;'>Risk-Adjusted</p>", unsafe_allow_html=True)
+    st.markdown(f"**Sharpe Ratio** \n<h2 style='margin:0;'>{(final_series.mean() / final_series.std()) * np.sqrt(252):.2f}</h2><p style='font-size:12px; color:gray;'>Risk-Adjusted</p>", unsafe_allow_html=True)
 
 with m4:
-    st.write("Hit Ratio")
-    st.markdown(f"<h2 style='margin:0;'>{(final_series > 0).sum() / len(final_series) * 100:.1f}%</h2><p style='font-size:12px; color:gray;'>Calculated on 15d window</p>", unsafe_allow_html=True)
+    st.markdown(f"**Hit Ratio** \n<h2 style='margin:0;'>{(final_series > 0).sum() / len(final_series) * 100:.1f}%</h2><p style='font-size:12px; color:gray;'>Calculated on 15d window</p>", unsafe_allow_html=True)
 
 st.subheader("Out-of-Sample Performance")
 st.line_chart(wealth)
@@ -182,5 +198,5 @@ with col2:
     st.markdown("""
     ### **Optimization Strategy**
     * **Loss Function:** Weighted Huber Loss with a 2.5x penalty on winners to prioritize absolute returns.
-    * **Execution:** Dynamic loyalty hurdles coupled with NYSE market calendar integration for precise entry timing.
+    * **Execution Logic:** Features built-in NYSE holiday awareness using native Pandas toolsets for trade timing.
     """)

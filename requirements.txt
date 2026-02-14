@@ -9,3 +9,4 @@ plotly
 huggingface_hub
 pyarrow
 pytz
+pandas_market_calendars

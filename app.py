@@ -1,152 +1,147 @@
 """
-P2-Transformer ETF Predictor – Professional Edition
-Architecture: Multi-Channel Temporal CNN + Bidirectional Sequence Encoding
-Data: HF Dataset (primary) + Alpha Vantage/FRED (incremental)
+P2-TRANSFORMER-ETF-PREDICTOR (Macro-Regime Edition)
+Features: VIX, TNX, DXY, Gold/Copper Ratio, GC_HG_Trend + CPI, UNRATE
 Author: P2SAMAPA
 """
 
 import streamlit as st
 import pandas as pd
 import numpy as np
-import requests
-from datetime import datetime, timedelta
+import yfinance as yf
 import os
-import time
-import warnings
-warnings.filterwarnings('ignore')
-
 import tensorflow as tf
-from tensorflow.keras.models import Sequential, Model
+from tensorflow.keras.models import Model
 from tensorflow.keras.layers import (
-    LSTM, Dense, Dropout, Input, Bidirectional, Conv1D,
-    GlobalMaxPooling1D, Concatenate, LayerNormalization, MultiHeadAttention
+    Input, LSTM, Dense, Dropout, Bidirectional, 
+    Conv1D, GlobalMaxPooling1D, Concatenate, MultiHeadAttention, LayerNormalization
 )
-from tensorflow.keras.optimizers import Adam
-from tensorflow.keras.callbacks import EarlyStopping
 from sklearn.preprocessing import MinMaxScaler
+from datasets import load_dataset
 import plotly.graph_objects as go
 
-# HF Dataset imports
-from datasets import load_dataset, Dataset
-from huggingface_hub import HfApi, login
-
-st.set_page_config(page_title="Transformer ETF Selector", layout="wide")
-st.title("🚀 P2‑TRANSFORMER‑ETF‑PREDICTOR")
+# ------------------------------
+# 1. UI & CONFIGURATION
+# ------------------------------
+st.set_page_config(page_title="P2-Transformer Alpha", layout="wide")
+st.title("🚀 P2-TRANSFORMER-ETF-PREDICTOR")
 st.markdown("---")
 
-# ------------------------------
-#  CONSTANTS
-# ------------------------------
-LOOKBACK = 30
-BATCH_SIZE = 32
-EPOCHS_QUICK = 30
-EPOCHS_PROF = 40
-TRAIN_SPLIT = 0.7
-VAL_SPLIT = 0.15
-ASSETS = ['TLT', 'TBT', 'VNQ', 'SLV', 'GLD', 'CASH']
-HORIZONS = [1, 3, 5]
-TRANSACTION_COST_BUY = 0.0010
-TRANSACTION_COST_SELL = 0.0010
-RETRAIN_INTERVAL_DAYS = 3
-CACHE_TTL = 86400
-
-HF_DATASET_REPO = "P2SAMAPA/my-etf-data"
-LOCAL_CACHE_DIR = os.path.join(os.getcwd(), "etf_cache")
-os.makedirs(LOCAL_CACHE_DIR, exist_ok=True)
+with st.sidebar:
+    st.header("⚙️ Strategy Settings")
+    start_year = st.slider("Training Start", 2008, 2024, 2016)
+    fee_bps = st.slider("Transaction Cost (bps)", 0, 100, 15) # RESTORED
+    fee_pct = fee_bps / 10000
+    lookback = st.slider("Lookback Window (Days)", 10, 60, 30)
+    epochs = st.number_input("Training Epochs", 10, 100, 40)
+    run_button = st.button("🔥 Execute Macro-Regime Training", type="primary")
 
 # ------------------------------
-#  API & DATA INTEGRATION (With Normalization Fix)
+# 2. DATA PIPELINE (Enriching the 5 Signals)
 # ------------------------------
-FRED_API_KEY = os.environ.get("FRED_API_KEY")
-ALPHA_VANTAGE_KEY = os.environ.get("ALPHA_VANTAGE_KEY")
-HF_TOKEN = os.environ.get("HF_TOKEN")
-
 @st.cache_data(ttl=3600)
-def load_hf_dataset():
-    try:
-        dataset = load_dataset(HF_DATASET_REPO, split="train")
-        df = dataset.to_pandas()
-        if 'date' in df.columns:
-            df['date'] = pd.to_datetime(df['date'])
-            df = df.set_index('date')
-        return df
-    except:
-        return pd.DataFrame()
-
-@st.cache_data(ttl=CACHE_TTL)
-def build_dataset_hf_first(start_year, end_year):
-    start = f"{start_year}-01-01"
-    end = datetime.now().strftime("%Y-%m-%d")
-    hf_df = load_hf_dataset()
+def load_and_enrich_data(repo_id):
+    # Load Existing (Returns, Vol, MA20, CPI, UNRATE)
+    ds = load_dataset(repo_id, split="train").to_pandas()
+    ds['Date'] = pd.to_datetime(ds['Date'])
+    ds = ds.set_index('Date').sort_index()
     
-    if hf_df.empty: return pd.DataFrame(), 0.05
+    # Fetch 5 New Macro Signals
+    st.info("🛰️ Pulling Macro Gauges (VIX, TNX, DXY, Gold, Copper)...")
+    tickers = {"^VIX": "VIX", "^TNX": "TNX", "DX-Y.NYB": "DXY", "GC=F": "GOLD", "HG=F": "COPPER"}
+    macro = yf.download(list(tickers.keys()), start=ds.index.min())['Close']
+    macro = macro.rename(columns=tickers)
     
-    # Normalization Fix
-    if isinstance(hf_df.columns, pd.MultiIndex):
-        hf_df.columns = hf_df.columns.get_level_values(-1)
-    hf_df.columns = [str(c).upper().strip() for c in hf_df.columns]
+    # Calculate Gold/Copper Ratio & Trend
+    macro['AU_CU_Ratio'] = macro['GOLD'] / macro['COPPER']
+    macro['AU_CU_Trend'] = macro['AU_CU_Ratio'].rolling(window=20).mean()
     
-    # Simple gap fill logic would go here if needed
-    final_df = add_technical_indicators(hf_df)
-    return final_df, 0.053 # Current SOFR approximation
-
-def add_technical_indicators(df):
-    df_out = df.copy()
-    for asset in ASSETS:
-        if asset == 'CASH' or asset not in df.columns: continue
-        close = df_out[asset].dropna()
-        if len(close) > 30:
-            # Feature Engineering for Transformer input
-            df_out[f'{asset}_ROC5'] = close.pct_change(5)
-            df_out[f'{asset}_RSI'] = (close.diff().where(close.diff() > 0, 0).rolling(14).mean() / 
-                                     close.diff().abs().rolling(14).mean()) * 100
-    return df_out.ffill().bfill()
+    # Join everything
+    full_df = ds.join(macro[['VIX', 'TNX', 'DXY', 'AU_CU_Ratio', 'AU_CU_Trend']], how='left')
+    return full_df.ffill().dropna()
 
 # ------------------------------
-#  TRANSFORMER-LITE ARCHITECTURE
+# 3. TRANSFORMER ARCHITECTURE
 # ------------------------------
-def build_transformer_model(input_shape):
-    """
-    Implements a Multi-Channel Temporal Convolutional Network 
-    combined with Bidirectional Encoding.
-    """
+def build_transformer(input_shape, num_assets=5):
     inputs = Input(shape=input_shape)
     
-    # Parallel Temporal Feature Extractors (Multi-Scale CNN)
-    conv1 = Conv1D(64, 3, padding='same', activation='relu')(inputs)
-    conv2 = Conv1D(64, 5, padding='same', activation='relu')(inputs)
+    # Multi-Head Attention Block
+    # This allows the model to "attend" to VIX vs. Price simultaneously
+    attn_out = MultiHeadAttention(num_heads=4, key_dim=input_shape[1])(inputs, inputs)
+    attn_out = LayerNormalization(epsilon=1e-6)(attn_out + inputs)
     
-    pool1 = GlobalMaxPooling1D()(conv1)
-    pool2 = GlobalMaxPooling1D()(conv2)
+    # Temporal Convolutional Layers
+    conv = Conv1D(filters=64, kernel_size=3, activation='relu', padding='same')(attn_out)
+    conv = GlobalMaxPooling1D()(conv)
     
-    # Sequence Encoding
-    lstm_out = Bidirectional(LSTM(128, return_sequences=False))(inputs)
+    # Sequence Processing
+    lstm = Bidirectional(LSTM(64, return_sequences=False))(inputs)
     
     # Feature Fusion
-    combined = Concatenate()([pool1, pool2, lstm_out])
+    merged = Concatenate()([conv, lstm])
+    x = Dense(128, activation='relu')(merged)
+    x = Dropout(0.2)(x)
+    outputs = Dense(num_assets) # Predicting Returns for TLT, TBT, VNQ, SLV, GLD
     
-    dense = Dense(128, activation='relu')(combined)
-    dense = Dropout(0.2)(dense)
-    output = Dense(1)(dense)
-    
-    model = Model(inputs=inputs, outputs=output)
-    model.compile(optimizer=Adam(learning_rate=0.0005), loss='mse')
+    model = Model(inputs, outputs)
+    model.compile(optimizer='adam', loss='mse')
     return model
 
 # ------------------------------
-#  CORE EXECUTION LOGIC
+# 4. MAIN EXECUTION (Backtest + Training)
 # ------------------------------
-# [Remaining backtest/metrics/UI logic remains functionally same but labeled 'Transformer']
-
-with st.sidebar:
-    st.header("⚙️ Model Configuration")
-    start_year = st.slider("Training Start", 2008, 2024, 2018)
-    run_button = st.button("🚀 Execute Transformer Alpha", type="primary")
-
 if run_button:
-    with st.spinner("Initializing Neural Attention Layers..."):
-        # This calls the build_transformer_model during the training loop
-        # (Integrating the logic from your previous run script)
-        st.success("Transformer Environment Initialized. Processing Tensors...")
-        # ... [Insert the scaled training & prediction loop from the previous stable version] ...
-        st.info("The logic is now running as a Transformer-Hybrid architecture.")
+    # 1. Prepare Data
+    df = load_and_enrich_data("P2SAMAPA/my-etf-data")
+    target_etfs = ['TLT_Ret', 'TBT_Ret', 'VNQ_Ret', 'SLV_Ret', 'GLD_Ret']
+    
+    st.success(f"📈 Macro-Regime Dataset Synchronized. Rows: {len(df)}")
+    
+    # 2. Scale & Windowing
+    scaler = MinMaxScaler()
+    scaled_data = scaler.fit_transform(df)
+    
+    X, y = [], []
+    for i in range(lookback, len(scaled_data)):
+        X.append(scaled_data[i-lookback:i])
+        y.append(df[target_etfs].iloc[i].values)
+    
+    X, y = np.array(X), np.array(y)
+    split = int(0.8 * len(X))
+    X_train, X_test = X[:split], X[split:]
+    y_train, y_test = y[:split], y[split:]
+
+    # 3. Model Training (with anti-hang UI update)
+    with st.spinner("🧠 Training Transformer Attention Heads..."):
+        model = build_transformer((X.shape[1], X.shape[2]))
+        # Small trick: Use a simple print or standard fit to avoid UI lock
+        model.fit(X_train, y_train, epochs=epochs, batch_size=32, verbose=0)
+    
+    # 4. Backtesting & Prediction
+    st.subheader("📊 Model Results & Predictions")
+    preds = model.predict(X_test)
+    
+    # Logic: Pick highest predicted return. If all < 0, pick CASH.
+    strategy_returns = []
+    for i in range(len(preds)):
+        best_asset_idx = np.argmax(preds[i])
+        best_return = preds[i][best_asset_idx]
+        
+        if best_return > fee_pct: # Must beat transaction cost
+            strategy_returns.append(y_test[i][best_asset_idx] - fee_pct)
+        else:
+            strategy_returns.append(0.0) # Stay in CASH (0% return)
+
+    # 5. Visualizing Alpha
+    cum_strat = np.cumprod(1 + np.array(strategy_returns))
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(y=cum_strat, name="Transformer Alpha Strategy"))
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.write("🔥 **Current Deployment Recommendation:**")
+    latest_pred = preds[-1]
+    top_pick = target_etfs[np.argmax(latest_pred)]
+    if np.max(latest_pred) <= fee_pct:
+        st.error("🚨 ALL SIGNALS NEGATIVE: ALLOCATE TO CASH")
+    else:
+        st.success(f"✅ TOP SIGNAL: {top_pick.split('_')[0]} (Pred: {np.max(latest_pred)*100:.2f}%)")

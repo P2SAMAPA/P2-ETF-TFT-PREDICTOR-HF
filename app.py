@@ -16,7 +16,7 @@ from huggingface_hub import login
 import plotly.graph_objects as go
 
 # ------------------------------
-# 1. SIDEBAR & CONFIG (DO NOT TOUCH)
+# 1. PERMANENT SIDEBAR (UNTOUCHED)
 # ------------------------------
 st.set_page_config(page_title="P2-Transformer Alpha", layout="wide")
 
@@ -33,17 +33,19 @@ with st.sidebar:
 st.title("🚀 P2-TRANSFORMER-ETF-PREDICTOR")
 
 # ------------------------------
-# 2. DATA ENGINE & SECRETS
+# 2. DATA ENGINE (FIXED: CPI & UNRATE INCLUDED)
 # ------------------------------
 HF_TOKEN = os.environ.get("HF_TOKEN")
 REPO_ID = "P2SAMAPA/my-etf-data"
 fee_pct = fee_bps / 10000
 
 def get_and_sync_data():
+    # Load dataset containing core ETF returns + CPI/UNRATE
     ds = load_dataset(REPO_ID, split="train").to_pandas()
     ds['Date'] = pd.to_datetime(ds['Date'])
     ds = ds.set_index('Date').sort_index()
     
+    # Live Macro Tickers for Regime Filtering
     tickers = {"^VIX": "VIX", "^TNX": "TNX", "DX-Y.NYB": "DXY", "GC=F": "GOLD", "HG=F": "COPPER"}
     try:
         macro = yf.download(list(tickers.keys()), start=ds.index.min(), progress=False)['Close']
@@ -52,6 +54,7 @@ def get_and_sync_data():
             macro['AU_CU_Ratio'] = macro['GOLD'] / macro['COPPER']
             macro['AU_CU_Trend'] = macro['AU_CU_Ratio'].rolling(window=20).mean()
         
+        # Merge macro signals into existing dataset (which includes CPI, UNRATE)
         macro_cols = ['VIX', 'TNX', 'DXY', 'AU_CU_Ratio', 'AU_CU_Trend']
         cols_to_add = [c for c in macro.columns if c in macro_cols and c not in ds.columns]
         full_df = ds.join(macro[cols_to_add], how='left') if cols_to_add else ds
@@ -65,13 +68,13 @@ def get_and_sync_data():
         return ds
 
 # ------------------------------
-# 3. CORE RUNTIME (MODEL)
+# 3. CORE RUNTIME (MODELING & PERFORMANCE)
 # ------------------------------
 if run_button:
     df = get_and_sync_data()
     target_etfs = ['TLT_Ret', 'TBT_Ret', 'VNQ_Ret', 'SLV_Ret', 'GLD_Ret']
     
-    # Prep Tensors
+    # Scaler & Tensors
     scaler = MinMaxScaler()
     scaled = scaler.fit_transform(df)
     X, y = [], []
@@ -80,7 +83,13 @@ if run_button:
         y.append(df[target_etfs].iloc[i].values)
     X, y = np.array(X), np.array(y)
 
-    # Hybrid Transformer Architecture
+    # Split 80:20 for proper OOS segmentation
+    split_idx = int(len(X) * 0.8)
+    X_train, X_test = X[:split_idx], X[split_idx:]
+    y_train, y_test = y[:split_idx], y[split_idx:]
+    oos_dates = df.index[-len(X_test):]
+
+    # Model
     inputs = Input(shape=(X.shape[1], X.shape[2]))
     attn = MultiHeadAttention(num_heads=4, key_dim=X.shape[2])(inputs, inputs)
     attn = LayerNormalization()(attn + inputs)
@@ -94,29 +103,23 @@ if run_button:
     model.compile(optimizer='adam', loss='mse')
     
     with st.spinner("🧠 Training Hybrid Transformer..."):
-        model.fit(X, y, epochs=epochs, batch_size=32, verbose=0)
+        model.fit(X_train, y_train, epochs=epochs, batch_size=32, verbose=0)
     
-    # OOS Inference
-    preds = model.predict(X)
+    # Inference on OOS
+    preds = model.predict(X_test)
     
-    # ------------------------------
-    # 4. PROFESSIONAL OUTPUT UI (REWRITTEN)
-    # ------------------------------
-    
-    # Calculations for Metrics
+    # Performance Calculations
     strat_rets = []
     audit_data = []
     for i in range(len(preds)):
         idx = np.argmax(preds[i])
-        real_ret = y[i][idx]
-        # Trade if prediction exceeds transaction hurdle
+        real_ret = y_test[i][idx]
         daily_pnl = (real_ret - fee_pct) if preds[i][idx] > fee_pct else 0.0
         strat_rets.append(daily_pnl)
         
-        # 15-Day Audit Data
         if i >= len(preds) - 15:
             audit_data.append({
-                "Date": df.index[-(len(preds)-i)].strftime('%Y-%m-%d'),
+                "Date": oos_dates[i].strftime('%Y-%m-%d'),
                 "Predicted": target_etfs[idx].split('_')[0] if preds[i][idx] > fee_pct else "CASH",
                 "Realized Return": real_ret
             })
@@ -124,68 +127,64 @@ if run_button:
     strat_rets = np.array(strat_rets)
     cum_strat = np.cumprod(1 + strat_rets)
     
-    # KPI 1: Prediction
-    top_idx = np.argmax(preds[-1])
-    current_prediction = target_etfs[top_idx].split('_')[0] if preds[-1][top_idx] > fee_pct else "CASH"
+    # 1. OOS Year Count
+    oos_years = len(oos_dates) / 252
     
-    # KPI 2: Annualized Return
-    ann_return = (cum_strat[-1] ** (252 / len(strat_rets))) - 1
+    # 2. Annualized Return
+    ann_return = (cum_strat[-1] ** (1 / oos_years)) - 1 if oos_years > 0 else 0
     
-    # KPI 3: Sharpe Ratio (SOFR adjusted ~5.3%)
+    # 3. Correct Max Drawdown
+    peak = np.maximum.accumulate(cum_strat)
+    drawdown = (cum_strat - peak) / peak
+    max_dd = np.min(drawdown) # Standard Peak-to-Trough calculation
+
+    # 4. Sharpe (SOFR 5.3%)
     rf_daily = 0.053 / 252
-    excess = strat_rets - rf_daily
-    sharpe = np.sqrt(252) * np.mean(excess) / np.std(excess) if np.std(excess) != 0 else 0
+    sharpe = np.sqrt(252) * np.mean(strat_rets - rf_daily) / np.std(strat_rets) if np.std(strat_rets) != 0 else 0
     
-    # KPI 4: Hit Ratio (Last 15 Days)
+    # 5. Hit Ratio (Last 15 days)
     recent_rets = strat_rets[-15:]
     hit_ratio = (np.sum(recent_rets > 0) / 15) * 100
-    
-    # KPI 5: Max Drawdown
-    peak = np.maximum.accumulate(cum_strat)
-    dd_series = (cum_strat - peak) / peak
-    mdd = np.min(dd_series)
 
-    # --- TOP ROW: KPI CARDS ---
+    # ------------------------------
+    # 4. PROFESSIONAL OUTPUT UI (FIXED)
+    # ------------------------------
     st.markdown("### 📈 Performance Scorecard")
     kpi1, kpi2, kpi3, kpi4, kpi5 = st.columns(5)
-    kpi1.metric("Predicted ETF", current_prediction, f"US Open {datetime.now().strftime('%Y-%m-%d')}")
-    kpi2.metric("Annualized Return", f"{ann_return*100:.2f}%", "OOS Period")
-    kpi3.metric("Sharpe Ratio", f"{sharpe:.2f}", "SOFR 5.3%")
+    
+    # Prediction Header
+    top_idx = np.argmax(model.predict(X[-1:])[0])
+    final_pred = target_etfs[top_idx].split('_')[0] if model.predict(X[-1:])[0][top_idx] > fee_pct else "CASH"
+    kpi1.metric("Predicted ETF", final_pred, f"US Open {datetime.now().strftime('%b %d, %Y')}")
+    
+    kpi2.metric("Annualized Return", f"{ann_return*100:.2f}%", f"{oos_years:.2f} OOS Years")
+    kpi3.metric("Sharpe Ratio", f"{sharpe:.2f}", "SOFR Adjusted")
     kpi4.metric("Hit Ratio (15d)", f"{hit_ratio:.1f}%", f"{np.sum(recent_rets > 0)}/15 Days")
-    kpi5.metric("Max Drawdown", f"{mdd*100:.2f}%", "Daily Peak")
+    kpi5.metric("Max Drawdown", f"{max_dd*100:.2f}%", "Daily Peak-to-Trough")
 
-    # --- MIDDLE ROW: EQUITY CURVE ---
+    # --- OOS GRAPH ---
     st.markdown("### 🚀 Out-of-Sample (OOS) Cumulative Returns")
     fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        x=df.index[-len(cum_strat):], 
-        y=cum_strat, 
-        fill='tozeroy',
-        line=dict(color='#00d1b2', width=2),
-        name="Strategy Equity"
-    ))
+    fig.add_trace(go.Scatter(x=oos_dates, y=cum_strat, fill='tozeroy', line=dict(color='#00d1b2', width=2)))
     fig.update_layout(template="plotly_dark", height=400, margin=dict(l=0,r=0,b=0,t=20))
     st.plotly_chart(fig, use_container_width=True)
 
-    # --- BOTTOM ROW: AUDIT TRAIL ---
+    # --- AUDIT TRAIL ---
     st.markdown("### 📋 15-Day Performance Audit Trail")
     audit_df = pd.DataFrame(audit_data)
-    
-    def style_returns(val):
-        color = 'green' if val > 0 else 'red'
-        return f'color: {color}; font-weight: bold'
+    st.table(audit_df.style.format({"Realized Return": "{:.2%}"}).applymap(
+        lambda x: 'color: green' if x > 0 else 'color: red', subset=['Realized Return']
+    ))
 
-    st.table(audit_df.style.format({"Realized Return": "{:.2%}"}).applymap(style_returns, subset=['Realized Return']))
-
-    # --- FOOTER: METHODOLOGY ---
+    # --- METHODOLOGY (UPDATED SIGNALS) ---
     st.markdown("---")
-    m_col1, m_col2, m_col3 = st.columns(3)
-    with m_col1:
+    m1, m2, m3 = st.columns(3)
+    with m1:
         st.write("**Architecture**")
-        st.caption("Hybrid Transformer-LSTM using Multi-Head Attention for cross-asset correlation modeling and Conv1D for feature extraction.")
-    with m_col2:
-        st.write("**ETFs & Universe**")
-        st.caption("TLT (20y Treasury), TBT (Short Treasury), VNQ (Real Estate), SLV (Silver), GLD (Gold).")
-    with m_col3:
-        st.write("**Macro & Gravity Signals**")
-        st.caption("Signals: VIX (Vol), TNX (Yield), DXY (USD), Gold/Copper Ratio (Growth). Targets: ETF daily returns.")
+        st.caption("Hybrid Transformer-LSTM with Multi-Head Attention. Optimizes for cross-asset correlations and macro regimes.")
+    with m2:
+        st.write("**ETFs Used**")
+        st.caption("TLT, TBT, VNQ, SLV, GLD.")
+    with m3:
+        st.write("**Signals (Gravity & Regime)**")
+        st.caption("Macro: CPI (Inflation), UNRATE (Labor). Sentiment: VIX, DXY. Gravity: TNX (10Y Yield). Barometer: Gold/Copper Ratio.")

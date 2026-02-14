@@ -20,30 +20,46 @@ st.set_page_config(page_title="Alpha Engine", layout="wide")
 # 2. DATASET-FIRST ENGINE (PREVENTS LOCKS)
 # ==========================================
 @st.cache_data(ttl=3600)
+@st.cache_data(ttl=3600)
 def get_smart_data(start_yr):
     try:
-        # Priority 1: Load from HF Dataset
+        # 1. Load from HF Dataset
         dataset = load_dataset("P2SAMAPA/my-etf-data", split="train")
         df = pd.DataFrame(dataset)
+        
+        # --- ADD THESE LINES HERE ---
+        # Normalize Date
         df['Date'] = pd.to_datetime(df['Date'])
         df.set_index('Date', inplace=True)
         
-        # Priority 2: Check for incremental gaps
+        # Flatten Multi-Index if it exists (e.g., 'Close', 'TLT')
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(-1)
+        
+        # Clean and Uppercase column names to match TICKERS list
+        df.columns = [str(c).upper().strip() for c in df.columns]
+        # -----------------------------
+
+        # 2. Check for incremental gaps
         last_date = df.index.max().date()
         target_date = datetime.now().date()
         
         if last_date < (target_date - timedelta(days=1)):
-            # Only download the tiny "gap" to avoid database locks
             gap_data = yf.download(TICKERS, start=last_date, progress=False, multi_level=False)
             if not gap_data.empty:
+                # Clean gap_data columns before merging
+                gap_data.columns = [str(c).upper().strip() for c in gap_data.columns]
                 df = pd.concat([df, gap_data]).drop_duplicates()
         
-        # Filter by user's requested Start Year
+        # 3. Filter by start year and ensure only requested tickers are returned
         df = df[df.index.year >= start_yr].ffill()
-        return df
+        return df[TICKERS] 
+        
     except Exception as e:
-        # Failover to direct download if Dataset repo is inaccessible
-        return yf.download(TICKERS, start=f"{start_yr}-01-01", progress=False, multi_level=False).ffill()
+        # Failover logic if dataset fails
+        df_fail = yf.download(TICKERS, start=f"{start_yr}-01-01", progress=False, multi_level=False).ffill()
+        df_fail.columns = [str(c).upper().strip() for c in df_fail.columns]
+        return df_fail[TICKERS]
 
 # ==========================================
 # 3. SIDEBAR UI

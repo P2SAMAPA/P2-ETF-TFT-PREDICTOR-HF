@@ -10,13 +10,20 @@ import os
 import gc
 from datetime import datetime, timedelta
 
-# --- 1. LOCAL DATA ENGINE ---
+# --- 1. LOCAL DATA ENGINE (Fixed Truncation) ---
 LOCAL_FILENAME = "historical_cache.parquet"
 
 def get_local_data(assets, start_date_str):
-    # Strictly local to avoid cloud-download memory spikes
+    """Ensures full historical depth for the chosen Year Anchor."""
     if os.path.exists(LOCAL_FILENAME):
         df = pd.read_parquet(LOCAL_FILENAME)
+        # Check if the existing file actually goes back far enough for the anchor
+        if df.index.min() > pd.to_datetime(start_date_str):
+            st.warning(f"Local cache incomplete. Fetching data from {start_date_str}...")
+            df = yf.download(assets, start=start_date_str, progress=False)['Close']
+            df.to_parquet(LOCAL_FILENAME)
+        
+        # Standard Daily Update
         last_date = df.index.max()
         if last_date.date() < (datetime.now() - timedelta(days=1)).date():
             new_data = yf.download(assets, start=(last_date + timedelta(days=1)).strftime('%Y-%m-%d'), progress=False)['Close']
@@ -29,13 +36,13 @@ def get_local_data(assets, start_date_str):
         df.to_parquet(LOCAL_FILENAME)
         return df
 
-# --- 2. TRANSFORMER MODEL (Dropout 0.3) ---
+# --- 2. TRANSFORMER MODEL (Hard-coded 60-day & 0.3 Dropout) ---
 class MomentumTransformer(nn.Module):
-    def __init__(self, input_dim, d_model=64, num_heads=8, seq_len=30):
+    def __init__(self, input_dim, d_model=64, num_heads=8, seq_len=60): # Hard-coded 60
         super(MomentumTransformer, self).__init__()
         self.input_projection = nn.Linear(input_dim, d_model)
         self.pos_encoder = nn.Parameter(torch.zeros(1, seq_len, d_model))
-        # 0.3 Dropout as requested to prevent the "VNQ Bias"
+        # Dropout 0.3 for cross-regime stability
         encoder_layers = nn.TransformerEncoderLayer(d_model=d_model, nhead=num_heads, dropout=0.3, batch_first=True)
         self.transformer_encoder = nn.TransformerEncoder(encoder_layers, num_layers=3)
         self.decoder = nn.Linear(d_model, 6) 
@@ -45,15 +52,17 @@ class MomentumTransformer(nn.Module):
         x = self.transformer_encoder(x)
         return self.decoder(x[:, -1, :])
 
-@st.cache_resource(ttl="30m", max_entries=1) # CRITICAL: Prevents 16Gi Memory Leak
-def train_engine(start_year, tx_cost, lookback):
-    # Force clear CPU memory and cache before training
+# --- 3. TRAINING ENGINE (Enforced 80:20 Split Logic) ---
+@st.cache_resource(ttl="30m", max_entries=1)
+def train_engine(start_year, tx_cost):
     gc.collect() 
     torch.cuda.empty_cache() if torch.cuda.is_available() else None
     
     fred = Fred(api_key=os.getenv("FRED_API_KEY"))
     etfs = ["TLT", "TBT", "VNQ", "SLV", "GLD"]
+    lookback = 60 # Fixed Lookback Window
     
+    # Load data from the specific Year Anchor requested
     data = get_local_data(etfs, f"{start_year}-01-01")
     returns_df = data.ffill().pct_change().fillna(0)
     
@@ -65,26 +74,28 @@ def train_engine(start_year, tx_cost, lookback):
         sofr_val = 5.33
         returns_df['CASH'] = 0.0001
 
+    # Features: ROC and Relative Strength
     for asset in etfs + ['CASH']:
         returns_df[f'{asset}_ROC_10'] = returns_df[asset].pct_change(10)
     
     features_df = returns_df.replace([np.inf, -np.inf], np.nan).ffill().bfill().fillna(0)
     target_df = returns_df[etfs + ['CASH']].rolling(3).sum().shift(-3).dropna()
     
-    # --- DYNAMIC 80:20 SPLIT LOGIC ---
-    total_len = len(features_df)
+    # --- RECTIFIED 80:20 SPLIT ---
+    # We only train/test on the subset defined by the start_year anchor
+    filtered_features = features_df[features_df.index >= pd.to_datetime(f"{start_year}-01-01")]
+    total_len = len(filtered_features)
     split_idx = int(total_len * 0.8)
     
-    train_feat = features_df.iloc[:split_idx]
-    oos_feat = features_df.iloc[split_idx:]
+    train_feat = filtered_features.iloc[:split_idx]
+    oos_feat = filtered_features.iloc[split_idx:]
     
     scaler = StandardScaler()
     scaled_train = scaler.fit_transform(train_feat.astype(np.float64))
     scaled_oos = scaler.transform(oos_feat.astype(np.float64))
     
-    # Sliding Lookback Window Logic
     X_train = torch.FloatTensor(np.array([scaled_train[i:i+lookback] for i in range(len(scaled_train)-lookback)]))
-    y_train = torch.FloatTensor(target_df.iloc[lookback:split_idx].values)
+    y_train = torch.FloatTensor(target_df.loc[train_feat.index].iloc[lookback:].values)
 
     model = MomentumTransformer(input_dim=features_df.shape[1], seq_len=lookback)
     optimizer = torch.optim.Adam(model.parameters(), lr=0.0005)
@@ -94,30 +105,31 @@ def train_engine(start_year, tx_cost, lookback):
         optimizer.zero_grad()
         output = model(X_train)
         loss = nn.MSELoss()(output, y_train[:len(output)])
-        loss.backward()
-        optimizer.step()
+        loss.backward(); optimizer.step()
         
-    return {"model": model, "scaler": scaler, "returns": returns_df[etfs+['CASH']], "oos_features": scaled_oos, "sofr": sofr_val, "oos_dates": oos_feat.index, "lookback": lookback}
+    return {
+        "model": model, "scaler": scaler, "returns": returns_df[etfs+['CASH']], 
+        "oos_features": scaled_oos, "sofr": sofr_val, "oos_dates": oos_feat.index, 
+        "lookback": lookback, "start_year": start_year
+    }
 
-# --- 3. UI SETUP ---
+# --- 4. UI ---
 st.set_page_config(page_title="ETF Alpha Maximizer", layout="wide")
 
 with st.sidebar:
     st.header("⚙️ Strategy Settings")
-    regime_year = st.slider("Year Anchor", 2008, 2023, 2021)
+    regime_year = st.slider("Year Anchor (Pool Start)", 2008, 2023, 2021)
     tx_cost_bps = st.slider("Transaction Cost (BPS)", 0, 50, 15)
     
-    # UI TOGGLE: 30, 45, or 60 days
-    lookback_window = st.radio("Lookback Window (Days)", [30, 45, 60], index=0, horizontal=True)
-    
-    with st.spinner("Training (Memory-Optimized)..."):
-        engine = train_engine(regime_year, tx_cost_bps, lookback_window)
+    with st.spinner("Training Alpha Engine..."):
+        engine = train_engine(regime_year, tx_cost_bps)
     
     st.markdown("---")
     st.subheader("Model Status")
     st.info(f"OOS Range: {len(engine['oos_dates'])} days")
+    st.success(f"Lookback: 60 Days (Fixed)")
 
-# --- 4. INFERENCE & METRICS ---
+# --- 5. INFERENCE ---
 assets = ["TLT", "TBT", "VNQ", "SLV", "GLD", "CASH"]
 oos_features = engine["oos_features"]
 actual_rets = engine["returns"].loc[engine["oos_dates"]]
@@ -136,13 +148,11 @@ res_df = pd.DataFrame({
     "Return": [actual_rets[p].iloc[i+lb] for i, p in enumerate(picks)]
 }, index=final_index)
 
-# Net-of-fees
 res_df['Return'] = res_df['Return'] - (tx_cost_bps / 10000)
 wealth = (1 + res_df["Return"]).cumprod()
 
 st.title("Fixed Income/Commodity ETF Alpha Maximizer")
 
-# KPI Columns
 m1, m2, m3, m4 = st.columns(4)
 with m1:
     st.metric("Current Pick", picks[-1])
@@ -158,16 +168,12 @@ with m4:
 
 st.line_chart(wealth)
 
-# Audit Trail
-st.subheader("📋 Strategy Audit Trail")
-st.dataframe(res_df.tail(15))
+st.subheader("📋 15-Day Strategy Audit Trail")
+audit_data = res_df.tail(15).copy()
+audit_data['Return'] = audit_data['Return'].apply(lambda x: f"{x*100:+.2f}%")
+def style_returns(val):
+    return 'color: green; font-weight: bold;' if '+' in val else 'color: red; font-weight: bold;'
+st.table(audit_data.style.applymap(style_returns, subset=['Return']))
 
-# Methodology Documentation
 st.markdown("---")
-st.subheader("🧠 System Logic")
-st.info(f"""
-- **Memory Management**: Cache is locked to a single entry (`max_entries=1`) to prevent 16Gi crashes.
-- **Lookback Toggle**: Currently using a {lb}-day window for momentum detection.
-- **Dropout (0.3)**: Applied to the Transformer layers to improve generalization across different interest rate regimes.
-- **Data Anchor**: Training on data starting from {regime_year}, with a strict 80:20 split.
-""")
+st.info(f"**Methodology**: Using a fixed 60-day window to maximize signal-to-noise ratio. The training set is 80% of data from {engine['start_year']} to present.")

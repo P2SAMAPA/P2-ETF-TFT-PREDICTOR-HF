@@ -53,14 +53,23 @@ class PositionalEncoding(tf.keras.layers.Layer):
         # Create position indices
         position = np.arange(0, seq_len, dtype=np.float32).reshape(-1, 1)
         
-        # Create dimension indices
+        # Create dimension indices - handle both even and odd d_model
         div_term = np.exp(np.arange(0, d_model, 2, dtype=np.float32) * 
                          -(np.log(10000.0) / d_model))
         
         # Calculate positional encodings
         pos_encoding = np.zeros((seq_len, d_model), dtype=np.float32)
-        pos_encoding[:, 0::2] = np.sin(position * div_term)
-        pos_encoding[:, 1::2] = np.cos(position * div_term)
+        
+        # For even dimensions: d_model = 10 → indices 0,2,4,6,8 (5 values each)
+        # For odd dimensions: d_model = 11 → indices 0,2,4,6,8,10 (sin gets 6, cos gets 5)
+        pos_encoding[:, 0::2] = np.sin(position * div_term)[:, :len(range(0, d_model, 2))]
+        
+        # Cosine for odd indices - handle case where we might have fewer odd indices
+        if d_model > 1:
+            cos_values = np.cos(position * div_term)
+            # Determine how many odd positions we have
+            odd_positions = range(1, d_model, 2)
+            pos_encoding[:, 1::2] = cos_values[:, :len(odd_positions)]
         
         # Store as a non-trainable weight
         self.pos_encoding = self.add_weight(

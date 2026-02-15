@@ -14,6 +14,7 @@ import pytz
 import tensorflow as tf
 from tensorflow.keras.models import Model
 from tensorflow.keras.layers import Input, Dense, Dropout, LayerNormalization, MultiHeadAttention, GlobalAveragePooling1D
+from tensorflow.keras.regularizers import l2
 from tensorflow.keras.callbacks import EarlyStopping
 from sklearn.preprocessing import MinMaxScaler
 import plotly.graph_objects as go
@@ -443,7 +444,30 @@ def get_data(start_year, force_refresh=False):
     return df
 
 # ------------------------------
-# 6. PURE TRANSFORMER MODEL
+# 6. CUSTOM LOSS FUNCTION
+# ------------------------------
+def directional_loss(y_true, y_pred):
+    """
+    Custom loss that penalizes incorrect direction predictions more heavily
+    This helps the model focus on getting the sign right (up vs down)
+    """
+    # Calculate absolute error
+    abs_error = tf.abs(y_true - y_pred)
+    
+    # Check if signs match
+    signs_match = tf.cast(tf.math.sign(y_true) == tf.math.sign(y_pred), tf.float32)
+    
+    # Penalize wrong direction 2x more
+    penalty = tf.where(
+        signs_match > 0.5,
+        abs_error,           # Correct direction: normal penalty
+        abs_error * 2.0      # Wrong direction: double penalty
+    )
+    
+    return tf.reduce_mean(penalty)
+
+# ------------------------------
+# 7. PURE TRANSFORMER MODEL
 # ------------------------------
 def build_pure_transformer(input_shape, num_outputs, num_heads=4, ff_dim=128, num_layers=2, dropout_rate=0.1):
     """
@@ -474,18 +498,18 @@ def build_pure_transformer(input_shape, num_outputs, num_heads=4, ff_dim=128, nu
         # Residual connection and layer normalization
         x = LayerNormalization(epsilon=1e-6)(x + attn_output)
         
-        # Feed-forward network
-        ff_output = Dense(ff_dim, activation='relu')(x)
+        # Feed-forward network with L2 regularization
+        ff_output = Dense(ff_dim, activation='relu', kernel_regularizer=l2(0.01))(x)
         ff_output = Dropout(dropout_rate)(ff_output)
-        ff_output = Dense(input_shape[1])(ff_output)
+        ff_output = Dense(input_shape[1], kernel_regularizer=l2(0.01))(ff_output)
         
         # Residual connection and layer normalization
         x = LayerNormalization(epsilon=1e-6)(x + ff_output)
     
-    # Global pooling and output
+    # Global pooling and output with L2 regularization
     x = GlobalAveragePooling1D()(x)
     x = Dropout(dropout_rate)(x)
-    x = Dense(ff_dim, activation='relu')(x)
+    x = Dense(ff_dim, activation='relu', kernel_regularizer=l2(0.01))(x)
     x = Dropout(dropout_rate)(x)
     outputs = Dense(num_outputs)(x)
     
@@ -530,9 +554,9 @@ with st.sidebar:
     
     st.subheader("🧠 Transformer Settings")
     epochs = st.number_input("Epochs", 10, 500, 100, step=10)
-    num_heads = st.selectbox("Attention Heads", [2, 4, 8], index=1)
-    num_layers = st.selectbox("Transformer Layers", [1, 2, 3, 4], index=1)
     lookback = st.slider("Lookback Days", 20, 60, 30, step=5)
+    
+    st.caption("ℹ️ Model uses optimized architecture: 2 heads, 1 layer, 64 FF dim")
     
     st.divider()
     
@@ -648,6 +672,80 @@ if run_button:
     
     st.info(f"🎯 **Targets:** {len(target_etfs)} ETFs | **Features:** {len(input_features)} signals")
     
+    # ==========================================
+    # DATA QUALITY DIAGNOSTICS
+    # ==========================================
+    st.subheader("🔍 Data Quality Diagnostics")
+    
+    diag_col1, diag_col2, diag_col3 = st.columns(3)
+    
+    with diag_col1:
+        # Check for NaN values
+        nan_counts = df[input_features].isna().sum()
+        total_nans = nan_counts.sum()
+        if total_nans > 0:
+            st.warning(f"⚠️ **NaN Values Found:** {total_nans}")
+            with st.expander("View NaN Details"):
+                nan_features = nan_counts[nan_counts > 0].sort_values(ascending=False)
+                st.dataframe(nan_features.to_frame(name='NaN Count'))
+        else:
+            st.success("✅ **No NaN Values**")
+    
+    with diag_col2:
+        # Check for constant/near-constant features
+        constant_features = []
+        for col in input_features:
+            if df[col].std() < 0.01:
+                constant_features.append(col)
+        
+        if constant_features:
+            st.error(f"❌ **Constant Features:** {len(constant_features)}")
+            with st.expander("View Constant Features"):
+                st.code("\n".join(constant_features))
+        else:
+            st.success("✅ **No Constant Features**")
+    
+    with diag_col3:
+        # Check for highly correlated features
+        corr_matrix = df[input_features].corr()
+        high_corr_pairs = []
+        for i in range(len(corr_matrix.columns)):
+            for j in range(i+1, len(corr_matrix.columns)):
+                if abs(corr_matrix.iloc[i, j]) > 0.95:
+                    high_corr_pairs.append((corr_matrix.columns[i], corr_matrix.columns[j], corr_matrix.iloc[i, j]))
+        
+        if high_corr_pairs:
+            st.warning(f"⚠️ **High Correlation:** {len(high_corr_pairs)} pairs")
+            with st.expander("View Correlated Pairs"):
+                for feat1, feat2, corr_val in high_corr_pairs[:5]:
+                    st.text(f"{feat1} ↔ {feat2}: {corr_val:.3f}")
+        else:
+            st.success("✅ **No High Correlation**")
+    
+    # Target distribution analysis
+    st.write("**📊 Target ETF Distribution (Historical Best Performers):**")
+    target_best = df[target_etfs].idxmax(axis=1).value_counts()
+    target_best.index = target_best.index.str.replace('_Ret', '')
+    
+    fig_target_dist = go.Figure(go.Bar(
+        x=target_best.values,
+        y=target_best.index,
+        orientation='h',
+        marker_color='#3b82f6',
+        text=target_best.values,
+        textposition='outside'
+    ))
+    fig_target_dist.update_layout(
+        template="plotly_dark",
+        height=250,
+        xaxis_title="Days as Top Performer",
+        yaxis_title="ETF",
+        showlegend=False
+    )
+    st.plotly_chart(fig_target_dist, use_container_width=True)
+    
+    st.divider()
+    
     # Prepare data for model
     with st.spinner("🔧 Preparing training data..."):
         scaler = MinMaxScaler()
@@ -679,15 +777,15 @@ if run_button:
         model = build_pure_transformer(
             input_shape=(X.shape[1], X.shape[2]),
             num_outputs=len(target_etfs),
-            num_heads=num_heads,
-            ff_dim=128,
-            num_layers=num_layers,
-            dropout_rate=0.1
+            num_heads=2,              # Reduced from 4 for smaller dataset
+            ff_dim=64,                # Reduced from 128
+            num_layers=1,             # Reduced from 2 to prevent overfitting
+            dropout_rate=0.2          # Increased from 0.1 for better regularization
         )
         
         model.compile(
             optimizer=tf.keras.optimizers.Adam(learning_rate=0.001),
-            loss='mse',
+            loss=directional_loss,  # Custom loss for better directional prediction
             metrics=['mae']
         )
         
@@ -721,31 +819,51 @@ if run_button:
         # Get SOFR rate for Sharpe calculation
         sofr = df['T10Y3M'].iloc[-1] / 100 if 'T10Y3M' in df.columns else 0.045
         
-        # Strategy execution
+        # Strategy execution with confidence threshold
         strat_rets = []
         audit_trail = []
+        confidence_threshold = 0.0005  # Minimum confidence required for trade
+        
+        skipped_trades = 0
         
         for i in range(len(preds)):
-            # Select best ETF based on predicted return
-            best_idx = np.argmax(preds[i])
-            signal_etf = target_etfs[best_idx].replace('_Ret', '')
+            pred_values = preds[i]
             
-            # Realized return
-            realized_ret = y_test[i][best_idx]
+            # Find best and second-best predictions
+            sorted_indices = np.argsort(pred_values)
+            best_idx = sorted_indices[-1]
+            second_best_idx = sorted_indices[-2] if len(sorted_indices) > 1 else sorted_indices[-1]
             
-            # Net return after fees
-            net_ret = realized_ret - (fee_bps / 10000)
+            # Calculate prediction confidence (difference between top 2)
+            confidence = pred_values[best_idx] - pred_values[second_best_idx]
+            
+            # Only take trade if confidence exceeds threshold
+            if confidence < confidence_threshold:
+                # Skip trade - use cash (0% return after fees)
+                signal_etf = "CASH"
+                realized_ret = 0.0
+                net_ret = -(fee_bps / 10000)  # Only pay transaction cost
+                skipped_trades += 1
+            else:
+                # Take the trade
+                signal_etf = target_etfs[best_idx].replace('_Ret', '')
+                realized_ret = y_test[i][best_idx]
+                net_ret = realized_ret - (fee_bps / 10000)
             
             strat_rets.append(net_ret)
             audit_trail.append({
                 'Date': test_dates[i].strftime('%Y-%m-%d'),
                 'Signal': signal_etf,
-                'Predicted': preds[i][best_idx],
+                'Confidence': confidence,
+                'Predicted': pred_values[best_idx],
                 'Realized': realized_ret,
                 'Net_Return': net_ret
             })
         
         strat_rets = np.array(strat_rets)
+        
+        # Show confidence metrics
+        st.info(f"📊 **Confidence Filter:** Skipped {skipped_trades}/{len(preds)} trades ({skipped_trades/len(preds)*100:.1f}%) due to low confidence")
     
     # ------------------------------
     # 9. PERFORMANCE ANALYTICS
@@ -912,10 +1030,22 @@ if run_button:
     def color_return(val):
         return 'color: #00ff00' if val > 0 else 'color: #ff4b4b'
     
+    def color_confidence(val):
+        if val < 0.0005:
+            return 'color: #ff4b4b'  # Red for low confidence
+        elif val < 0.002:
+            return 'color: #ffa500'  # Orange for medium
+        else:
+            return 'color: #00ff00'  # Green for high confidence
+    
     styled_audit = audit_df.style.applymap(
         color_return,
         subset=['Net_Return', 'Realized']
+    ).applymap(
+        color_confidence,
+        subset=['Confidence']
     ).format({
+        'Confidence': '{:.4f}',
         'Predicted': '{:.4f}',
         'Realized': '{:.2%}',
         'Net_Return': '{:.2%}'
@@ -927,9 +1057,13 @@ if run_button:
     with st.expander("🔧 Model Architecture Details"):
         st.text("Pure Transformer Configuration:")
         st.text(f"  - Input Shape: ({lookback}, {len(input_features)})")
-        st.text(f"  - Attention Heads: {num_heads}")
-        st.text(f"  - Transformer Layers: {num_layers}")
-        st.text(f"  - Feed-Forward Dim: 128")
+        st.text(f"  - Attention Heads: 2 (optimized)")
+        st.text(f"  - Transformer Layers: 1 (optimized)")
+        st.text(f"  - Feed-Forward Dim: 64 (optimized)")
+        st.text(f"  - Dropout Rate: 0.2 (increased regularization)")
+        st.text(f"  - L2 Regularization: 0.01")
+        st.text(f"  - Loss Function: Directional Loss (2x penalty for wrong sign)")
+        st.text(f"  - Confidence Threshold: 0.0005")
         st.text(f"  - Output Dimension: {len(target_etfs)}")
         st.text(f"  - Total Parameters: {model.count_params():,}")
         st.text(f"  - Training Samples: {len(X_train):,}")

@@ -34,9 +34,9 @@ def get_est_time():
     return datetime.now(pytz.timezone('US/Eastern'))
 
 def is_sync_window():
-    """Checks if current time is within 7pm-8pm or 8am-9am sync windows (EST)."""
+    """Checks if current time is within 7pm-8pm or 7am-8am sync windows (EST)."""
     now_est = get_est_time()
-    return (now_est.hour == 19) or (now_est.hour == 8)
+    return (now_est.hour == 7) or (now_est.hour == 8)
 
 # ------------------------------
 # 2. UI CONFIGURATION

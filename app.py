@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import yfinance as yf
+import pandas_datareader.data as web
 import pandas_market_calendars as mcal
 from datetime import datetime, timedelta
 import pytz
@@ -25,10 +26,8 @@ def get_next_open_date():
     return schedule.iloc[0].market_open.strftime('%b %d, %Y')
 
 def check_sync_status():
-    """Checks if we are past 6:00 PM EST for the daily incremental update."""
     est = pytz.timezone('US/Eastern')
     now_est = datetime.now(est)
-    # Returns a unique key for caching based on the date and sync hour
     if now_est.hour >= 18:
         return f"sync_{now_est.strftime('%Y-%m-%d')}_post6pm"
     return f"sync_{now_est.strftime('%Y-%m-%d')}_pre6pm"
@@ -36,7 +35,7 @@ def check_sync_status():
 # ------------------------------
 # 2. UI CONFIGURATION
 # ------------------------------
-st.set_page_config(page_title="P2-Transformer Alpha", layout="wide")
+st.set_page_config(page_title="P2-Transformer Pro", layout="wide")
 
 with st.sidebar:
     st.header("Model Configuration")
@@ -55,7 +54,7 @@ st.title("P2-TRANSFORMER-ETF-PREDICTOR")
 REPO_ID = "P2SAMAPA/my-etf-data"
 fee_pct = fee_bps / 10000
 
-@st.cache_data(ttl=3600) # Re-check sync every hour
+@st.cache_data(ttl=3600)
 def get_data(sync_key):
     try:
         ds = load_dataset(REPO_ID, split="train").to_pandas()
@@ -66,29 +65,28 @@ def get_data(sync_key):
     date_col = 'Date' if 'Date' in ds.columns else 'date'
     ds[date_col] = pd.to_datetime(ds[date_col]).dt.tz_localize(None)
     ds = ds.set_index(date_col).sort_index()
-    
     df = ds[ds.index.year >= start_year].copy()
     
-    # --- ADD EXTERNAL MACRO SIGNALS ---
-    # Tickers for FRED via YFinance (mirrored), MOVE, and SKEW
-    ext_tickers = {
-        "^MOVE": "MOVE", 
-        "^SKEW": "SKEW",
-        "T10Y2Y": "T10Y2Y", 
-        "T10Y3M": "T10Y3M",
-        "BAMLH0A0HYM2": "HY_Spread" # High Yield Option-Adjusted Spread
-    }
-    
+    # --- SPLIT FETCH LOGIC ---
+    # 1. MOVE and SKEW from YFinance
     try:
-        ext_data = yf.download(list(ext_tickers.keys()), start=df.index.min(), progress=False)['Close']
-        ext_data = ext_data.rename(columns=ext_tickers)
-        ext_data.index = ext_data.index.tz_localize(None)
-        df = df.join(ext_data, how='left')
+        yf_indices = yf.download(["^MOVE", "^SKEW"], start=df.index.min(), progress=False)['Close']
+        yf_indices = yf_indices.rename(columns={"^MOVE": "MOVE", "^SKEW": "SKEW"})
+        yf_indices.index = yf_indices.index.tz_localize(None)
+        df = df.join(yf_indices, how='left')
     except:
-        st.warning("External signal fetch (MOVE/FRED) failed. Using HF core only.")
+        st.warning("YFinance Volatility fetch failed.")
 
-    # 1. Z-SCORE FEATURE ENGINEERING (Idea #1)
-    # Calculates relative deviation to help Transformer see "extremes"
+    # 2. 10Y2Y, 10Y3M, HY_Spread from FRED
+    try:
+        fred_symbols = ["T10Y2Y", "T10Y3M", "BAMLH0A0HYM2"]
+        fred_data = web.DataReader(fred_symbols, "fred", df.index.min(), datetime.now())
+        fred_data = fred_data.rename(columns={"BAMLH0A0HYM2": "HY_Spread"})
+        df = df.join(fred_data, how='left')
+    except:
+        st.warning("FRED Macro fetch failed.")
+
+    # 3. Z-SCORE ENGINEERING (Idea #1)
     features_to_z = [c for c in df.columns if '_Ret' not in c and c != 'SOFR']
     for col in features_to_z:
         rolling_mean = df[col].rolling(window=20).mean()
@@ -98,17 +96,16 @@ def get_data(sync_key):
     return df.ffill().bfill().dropna()
 
 # ------------------------------
-# 4. OPTIMIZATION RUNTIME
+# 4. RUNTIME
 # ------------------------------
 if run_button:
     df = get_data(check_sync_status())
     
     if df.empty:
-        st.error("Error: Dataset empty after merging signals.")
+        st.error("Error: Dataset empty.")
     else:
         target_etfs = ['TLT_Ret', 'TBT_Ret', 'VNQ_Ret', 'SLV_Ret', 'GLD_Ret']
         target_etfs = [t for t in target_etfs if t in df.columns]
-        # Include Z-scored features in input
         input_features = [c for c in df.columns if c not in target_etfs and c != 'SOFR']
         
         scaler = MinMaxScaler()
@@ -116,99 +113,62 @@ if run_button:
         
         lookbacks = [30, 45, 60] if len(df) > 200 else [10, 20]
         holdings = [1, 3, 5]
-        best_conviction_score = -np.inf
+        best_score = -np.inf
         final_res = None
 
-        with st.spinner("Training Transformer with Z-Score Signals..."):
+        with st.spinner("Training Transformer with Macro Signals..."):
             split_idx = int(len(scaled_input) * 0.8)
-            
             for lb in lookbacks:
-                if len(scaled_input) <= lb: continue
                 X, y = [], []
                 for i in range(lb, len(scaled_input)):
                     X.append(scaled_input[i-lb:i])
                     y.append(df[target_etfs].iloc[i].values)
-                
                 X, y = np.array(X), np.array(y)
                 train_X, test_X = X[:split_idx - lb], X[split_idx - lb:]
                 train_y, test_y = y[:split_idx - lb], y[split_idx - lb:]
 
-                if len(train_X) < 10: continue
-
-                # Model Architecture
+                # Architecture
                 inputs = Input(shape=(X.shape[1], X.shape[2]))
-                attn_output, attn_weights = MultiHeadAttention(num_heads=4, key_dim=X.shape[2])(inputs, inputs, return_attention_scores=True)
-                attn_res = LayerNormalization()(attn_output + inputs)
-                conv = Conv1D(64, 3, activation='relu', padding='same')(attn_res)
-                pool = GlobalMaxPooling1D()(conv)
+                attn_out, _ = MultiHeadAttention(num_heads=4, key_dim=X.shape[2])(inputs, inputs, return_attention_scores=True)
+                attn_res = LayerNormalization()(attn_out + inputs)
+                pool = GlobalMaxPooling1D()(Conv1D(64, 3, activation='relu', padding='same')(attn_res))
                 lstm = Bidirectional(LSTM(64))(inputs)
-                merged = Concatenate()([pool, lstm])
-                x = Dense(128, activation='relu')(merged)
-                outputs = Dense(len(target_etfs))(x)
+                x = Dense(128, activation='relu')(Concatenate()([pool, lstm]))
+                model = Model(inputs, Dense(len(target_etfs))(x))
                 
-                model = Model(inputs, outputs)
-                weight_model = Model(inputs, attn_weights)
                 model.compile(optimizer='adam', loss='mse')
                 model.fit(train_X, train_y, epochs=int(epochs), batch_size=32, verbose=0)
                 preds = model.predict(test_X)
                 
-                # 2. CONVICTION THRESHOLD (Idea #2)
                 for hold in holdings:
                     daily_strat_rets = []
-                    sofr_series = df['SOFR'] if 'SOFR' in df.columns else pd.Series(0.04, index=df.index)
-                    
+                    sofr = df['SOFR'].iloc[split_idx:].values
                     for i in range(len(preds)):
                         idx = np.argmax(preds[i])
-                        # Sort to find the second best prediction
                         sorted_p = np.sort(preds[i])
-                        next_best = sorted_p[-2] if len(sorted_p) > 1 else 0
-                        
-                        daily_rf = sofr_series.iloc[split_idx + i] / 252
-                        hurdle = daily_rf + fee_pct
-                        
-                        # Logic: Must beat second best by 20% (1.2x) AND clear the fee hurdle
-                        if preds[i][idx] > (next_best * 1.2) and preds[i][idx] > hurdle:
+                        # 4. CONVICTION GATING (Idea #2)
+                        if preds[i][idx] > (sorted_p[-2] * 1.2) and preds[i][idx] > (sofr[i]/252 + fee_pct):
                             daily_strat_rets.append(test_y[i][idx] - (fee_pct if i % hold == 0 else 0))
                         else:
-                            daily_strat_rets.append(daily_rf) # Stay in Cash
+                            daily_strat_rets.append(sofr[i]/252)
                     
-                    score = np.mean(daily_strat_rets)
-                    if score > best_conviction_score:
-                        best_conviction_score = score
-                        final_res = {
-                            "lb": lb, "hold": hold, "preds": preds, 
-                            "test_y": test_y, "dates": df.index[split_idx:],
-                            "model": model, "strat_rets": daily_strat_rets, 
-                            "sofr": sofr_series.iloc[split_idx:].values,
-                            "last_x": X[-1:], "input_features": input_features,
-                            "target_names": target_etfs
-                        }
+                    if np.mean(daily_strat_rets) > best_score:
+                        best_score = np.mean(daily_strat_rets)
+                        final_res = {"model": model, "strat_rets": daily_strat_rets, "dates": df.index[split_idx:], "sofr": sofr, "last_x": X[-1:], "input_features": input_features, "target_names": target_etfs, "lb": lb, "hold": hold, "preds": preds}
 
-        # ------------------------------
-        # 5. UI: REFINED OUTPUT
-        # ------------------------------
         if final_res:
             res = final_res
             strat_rets = np.array(res["strat_rets"])
             cum_strat = np.cumprod(1 + strat_rets)
             oos_yrs = (res["dates"][-1] - res["dates"][0]).days / 365.25
-            ann_ret = (cum_strat[-1] ** (1/oos_yrs)) - 1 if oos_yrs > 0 else 0
-            sharpe = np.sqrt(252) * np.mean(strat_rets - (res["sofr"][:len(strat_rets)]/252)) / np.std(strat_rets)
+            ann_ret = (cum_strat[-1] ** (1/oos_yrs)) - 1
+            sharpe = np.sqrt(252) * np.mean(strat_rets - (res["sofr"]/252)) / np.std(strat_rets)
             
             st.markdown("### Performance Scorecard")
             k1, k2, k3, k4, k5 = st.columns(5)
-            
-            # Predict Next Move
             p_now = res["model"].predict(res["last_x"])[0]
             best_idx = np.argmax(p_now)
-            sorted_now = np.sort(p_now)
-            curr_hurdle = (res["sofr"][-1]/252) + fee_pct
-            
-            if p_now[best_idx] > (sorted_now[-2] * 1.2) and p_now[best_idx] > curr_hurdle:
-                final_asset = res["target_names"][best_idx].split('_')[0]
-            else:
-                final_asset = "CASH (SOFR)"
-            
+            final_asset = res["target_names"][best_idx].split('_')[0] if p_now[best_idx] > (np.sort(p_now)[-2]*1.2) else "CASH (SOFR)"
             k1.metric("Predicted Asset", final_asset, f"Next Open: {get_next_open_date()}")
             k2.metric("Annualized Return", f"{ann_ret*100:.2f}%", f"{oos_yrs:.2f} OOS Years")
             k3.metric("Sharpe Ratio", f"{sharpe:.2f}", "SOFR Adjusted")
@@ -216,46 +176,20 @@ if run_button:
             k5.metric("Max Daily Stress", f"{np.min(strat_rets)*100:.2f}%", "Worst Day")
 
             st.markdown("### OOS Equity Curve")
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(x=res["dates"][:len(cum_strat)], y=cum_strat, fill='tozeroy', line=dict(color='#00d1b2', width=1.5)))
+            fig = go.Figure(go.Scatter(x=res["dates"], y=cum_strat, fill='tozeroy', line=dict(color='#00d1b2')))
             fig.update_layout(template="plotly_dark", height=400, margin=dict(l=0,r=0,b=0,t=20))
             st.plotly_chart(fig, use_container_width=True)
 
-            # Signal Importance (Progress Bars)
             st.markdown("### Signal Contribution Analysis")
-            # Simple Importance Estimate (Model Weights Mean)
-            weights = np.abs(res["model"].layers[-2].get_weights()[0]).mean(axis=1)
-            # Match weights to input features
-            weights = weights[:len(res["input_features"])]
+            weights = np.abs(res["model"].layers[-2].get_weights()[0]).mean(axis=1)[:len(res["input_features"])]
             norm_w = (weights - weights.min()) / (weights.max() - weights.min() + 1e-9)
-            
-            feat_imp = pd.DataFrame({'Signal': res["input_features"], 'Weight': norm_w}).sort_values('Weight', ascending=False)
-            st.dataframe(
-                feat_imp.head(15),
-                column_config={"Weight": st.column_config.ProgressColumn("Relative Power", min_value=0, max_value=1, format="%.2f")},
-                hide_index=True, use_container_width=True
-            )
+            st.dataframe(pd.DataFrame({'Signal': res["input_features"], 'Relative Power': norm_w}).sort_values('Relative Power', ascending=False),
+                         column_config={"Relative Power": st.column_config.ProgressColumn(min_value=0, max_value=1, format="%.2f")}, hide_index=True, use_container_width=True)
 
-            # 15-Day Audit (NO SOFR COLUMN)
             st.markdown("### 15-Day Performance Audit Trail")
             audit = []
-            display_days = min(15, len(res["preds"]))
-            for i in range(1, display_days + 1):
+            for i in range(1, 16):
                 p = res["preds"][-i]
-                idx = np.argmax(p)
-                sorted_p = np.sort(p)
-                rf_daily = res["sofr"][-i]/252
-                # Apply Conviction Check
-                is_cash = not (p[idx] > (sorted_p[-2] * 1.2) and p[idx] > (rf_daily + fee_pct))
-                
-                audit.append({
-                    "Date": res["dates"][-i].strftime('%Y-%m-%d'),
-                    "Predicted": "CASH" if is_cash else res["target_names"][idx].split('_')[0],
-                    "Realized Daily Return": res["strat_rets"][-i]
-                })
-            
-            st.table(pd.DataFrame(audit).style.format({"Realized Daily Return": "{:.4%}"}).applymap(
-                lambda x: 'color: #00ff00' if x > 0 else 'color: #ff4b4b', subset=['Realized Daily Return']
-            ))
-        else:
-            st.error("No valid strategy found.")
+                is_cash = not (p[np.argmax(p)] > (np.sort(p)[-2] * 1.2))
+                audit.append({"Date": res["dates"][-i].strftime('%Y-%m-%d'), "Predicted": "CASH" if is_cash else res["target_names"][np.argmax(p)].split('_')[0], "Realized Daily Return": res["strat_rets"][-i]})
+            st.table(pd.DataFrame(audit).style.format({"Realized Daily Return": "{:.4%}"}).applymap(lambda x: 'color: #00ff00' if x > 0 else 'color: #ff4b4b', subset=['Realized Daily Return']))

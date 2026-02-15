@@ -813,16 +813,39 @@ if run_button:
     with st.spinner("🔮 Generating predictions..."):
         preds = model.predict(X_test, verbose=0)
         
+        # Analyze prediction confidence distribution
+        all_confidences = []
+        for i in range(len(preds)):
+            pred_values = preds[i]
+            sorted_indices = np.argsort(pred_values)
+            best_idx = sorted_indices[-1]
+            second_best_idx = sorted_indices[-2] if len(sorted_indices) > 1 else sorted_indices[-1]
+            confidence = pred_values[best_idx] - pred_values[second_best_idx]
+            all_confidences.append(confidence)
+        
+        all_confidences = np.array(all_confidences)
+        
+        # Show confidence distribution
+        st.write("**📊 Prediction Confidence Distribution:**")
+        conf_col1, conf_col2, conf_col3, conf_col4 = st.columns(4)
+        conf_col1.metric("Min", f"{all_confidences.min():.6f}")
+        conf_col2.metric("Mean", f"{all_confidences.mean():.6f}")
+        conf_col3.metric("Median", f"{np.median(all_confidences):.6f}")
+        conf_col4.metric("Max", f"{all_confidences.max():.6f}")
+        
         # Get test dates
         test_dates = df.index[lookback + train_size + val_size:]
         
         # Get SOFR rate for Sharpe calculation
         sofr = df['T10Y3M'].iloc[-1] / 100 if 'T10Y3M' in df.columns else 0.045
         
+        # Use adaptive threshold: 25th percentile of confidence values
+        confidence_threshold = np.percentile(all_confidences, 25)
+        st.info(f"🎯 **Adaptive Confidence Threshold:** {confidence_threshold:.6f} (25th percentile)")
+        
         # Strategy execution with confidence threshold
         strat_rets = []
         audit_trail = []
-        confidence_threshold = 0.0005  # Minimum confidence required for trade
         
         skipped_trades = 0
         
@@ -1031,9 +1054,9 @@ if run_button:
         return 'color: #00ff00' if val > 0 else 'color: #ff4b4b'
     
     def color_confidence(val):
-        if val < 0.0005:
+        if val < 0.00005:
             return 'color: #ff4b4b'  # Red for low confidence
-        elif val < 0.002:
+        elif val < 0.0002:
             return 'color: #ffa500'  # Orange for medium
         else:
             return 'color: #00ff00'  # Green for high confidence
@@ -1063,7 +1086,7 @@ if run_button:
         st.text(f"  - Dropout Rate: 0.2 (increased regularization)")
         st.text(f"  - L2 Regularization: 0.01")
         st.text(f"  - Loss Function: Directional Loss (2x penalty for wrong sign)")
-        st.text(f"  - Confidence Threshold: 0.0005")
+        st.text(f"  - Confidence Threshold: Adaptive (25th percentile)")
         st.text(f"  - Output Dimension: {len(target_etfs)}")
         st.text(f"  - Total Parameters: {model.count_params():,}")
         st.text(f"  - Training Samples: {len(X_train):,}")

@@ -2,6 +2,8 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import yfinance as yf
+import os
+from huggingface_hub import HfApi
 try:
     import pandas_datareader.data as web
 except ImportError:
@@ -32,10 +34,9 @@ def get_est_time():
     return datetime.now(pytz.timezone('US/Eastern'))
 
 def is_sync_window():
-    """Checks if current time is within 7pm-8pm or 7am-8am sync windows (EST)."""
+    """Checks if current time is within 7pm-8pm or 8am-9am sync windows (EST)."""
     now_est = get_est_time()
-    # 19 is 7 PM EST, 7 is 7 AM EST
-    return (now_est.hour == 19) or (now_est.hour == 7)
+    return (now_est.hour == 19) or (now_est.hour == 8)
 
 # ------------------------------
 # 2. UI CONFIGURATION
@@ -44,8 +45,6 @@ st.set_page_config(page_title="P2-Transformer Pro", layout="wide")
 
 with st.sidebar:
     st.header("Model Configuration")
-    
-    # Time Display to help track sync window
     est_now = get_est_time()
     st.write(f"🕒 **Server Time (EST):** {est_now.strftime('%H:%M:%S')}")
     
@@ -53,11 +52,8 @@ with st.sidebar:
     fee_bps = st.slider("Transaction Cost (bps)", 0, 100, 15)
     epochs = st.number_input("Training Epoch_Count", 5, 500, 50)
     
-    # Dynamic Sync Status Display
     sync_status = "ACTIVE 🟢" if is_sync_window() else "IDLE ⚪ (HF Cache Only)"
     st.info(f"Sync Engine: {sync_status}")
-    if not is_sync_window():
-        st.caption("Sync opens at 08:00 and 19:00 EST")
     
     st.markdown("---")
     run_button = st.button("Execute Transformer Alpha", type="primary")
@@ -65,12 +61,11 @@ with st.sidebar:
 st.title("P2-TRANSFORMER-ETF-PREDICTOR")
 
 # ------------------------------
-# 3. DATA ENGINE (HF-FIRST + GAP FILL)
+# 3. DATA ENGINE (AUTO-SYNC TO HUB)
 # ------------------------------
 REPO_ID = "P2SAMAPA/my-etf-data"
 fee_pct = fee_bps / 10000
 
-@st.cache_data(ttl=3600)
 def get_data():
     # 1. Load HF Dataset
     try:
@@ -90,36 +85,54 @@ def get_data():
     has_gap = last_date < today
 
     if has_gap and is_sync_window():
-        st.write(f"🔄 Syncing Gap: {last_date} to {today}...")
-        # Yahoo Finance Gap Fill (Full History for missing columns)
-        try:
-            yf_inc = yf.download(["^MOVE", "^SKEW"], start="2008-01-01", progress=False)['Close']
-            yf_inc = yf_inc.rename(columns={"^MOVE": "MOVE", "^SKEW": "SKEW"})
-            yf_inc.index = yf_inc.index.tz_localize(None)
-            df = df.combine_first(yf_inc)
-        except: pass
+        with st.status("🔄 Syncing & Updating HF Hub...", expanded=True) as status:
+            st.write("Fetching missing macro signals...")
+            try:
+                # Fetch full history for the missing columns
+                yf_inc = yf.download(["^MOVE", "^SKEW"], start="2008-01-01", progress=False)['Close']
+                yf_inc = yf_inc.rename(columns={"^MOVE": "MOVE", "^SKEW": "SKEW"})
+                yf_inc.index = yf_inc.index.tz_localize(None)
+                df = df.combine_first(yf_inc)
 
-        # FRED Gap Fill (Full History for missing columns)
-        try:
-            fred_syms = ["T10Y2Y", "T10Y3M", "BAMLH0A0HYM2"]
-            fred_inc = web.DataReader(fred_syms, "fred", "2008-01-01", datetime.now())
-            fred_inc = fred_inc.rename(columns={"BAMLH0A0HYM2": "HY_Spread"})
-            df = df.combine_first(fred_inc)
-        except: pass
+                fred_syms = ["T10Y2Y", "T10Y3M", "BAMLH0A0HYM2"]
+                fred_inc = web.DataReader(fred_syms, "fred", "2008-01-01", datetime.now())
+                fred_inc = fred_inc.rename(columns={"BAMLH0A0HYM2": "HY_Spread"})
+                df = df.combine_first(fred_inc)
+                
+                # AUTO-SAVE TO HF HUB
+                token = os.getenv("HF_TOKEN")
+                if token:
+                    st.write("Pushing updated dataset to Hugging Face...")
+                    # Save temporary csv
+                    df.to_csv("temp_sync_data.csv")
+                    api = HfApi()
+                    api.upload_file(
+                        path_or_fileobj="temp_sync_data.csv",
+                        path_in_repo="etf_data.csv", # Ensuring it saves as a readable CSV
+                        repo_id=REPO_ID,
+                        repo_type="dataset",
+                        token=token
+                    )
+                    st.success("✅ HF Hub Updated Successfully!")
+                else:
+                    st.warning("HF_TOKEN secret not found. Data updated in RAM only.")
+                
+            except Exception as e:
+                st.error(f"Sync failed: {e}")
+            status.update(label="Sync Process Complete", state="complete")
     
-    # 3. Error Validation
+    # 3. Validation
     critical_signals = ['MOVE', 'SKEW', 'HY_Spread']
     missing = [s for s in critical_signals if s not in df.columns]
     if missing:
-        st.error(f"CRITICAL ERROR: The following signals are missing from your HF dataset: {missing}")
-        st.warning("Note: External sync is only allowed between 08:00-09:00 and 19:00-20:00 EST.")
+        st.error(f"CRITICAL ERROR: Signals missing: {missing}")
+        st.info("Sync window opens at 19:00 EST.")
         return pd.DataFrame()
 
-    # 4. SOFR / Risk-Free Logic
     if 'SOFR' not in df.columns:
         df['SOFR'] = df['sofr'] if 'sofr' in df.columns else 0.04 
 
-    # 5. Z-Score Feature Engineering
+    # 4. Feature Engineering
     features_to_z = [c for c in df.columns if '_Ret' not in c and c != 'SOFR']
     for col in features_to_z:
         rolling_mean = df[col].rolling(window=20).mean()
@@ -135,15 +148,9 @@ if run_button:
     df = get_data()
     
     if not df.empty:
-        # DATA RECOVERY DOWNLOAD BUTTON (Sidebar)
-        csv = df.to_csv().encode('utf-8')
-        st.sidebar.download_button(
-            label="📥 Download Master Dataset",
-            data=csv,
-            file_name=f"etf_master_update_{datetime.now().strftime('%Y%m%d')}.csv",
-            mime="text/csv",
-            help="Click this after a 7PM sync to save the merged data."
-        )
+        # Keep the download button as a backup
+        csv_data = df.to_csv().encode('utf-8')
+        st.sidebar.download_button("📥 Manual Backup CSV", csv_data, "etf_backup.csv", "text/csv")
 
         target_etfs = [t for t in ['TLT_Ret', 'TBT_Ret', 'VNQ_Ret', 'SLV_Ret', 'GLD_Ret'] if t in df.columns]
         input_features = [c for c in df.columns if c not in target_etfs and c != 'SOFR']
@@ -156,7 +163,7 @@ if run_button:
         best_score = -np.inf
         final_res = None
 
-        with st.spinner("Training Transformer Alpha Engine..."):
+        with st.spinner("Training Transformer Alpha..."):
             split_idx = int(len(scaled_input) * 0.8)
             for lb in lookbacks:
                 X, y = [], []
@@ -222,10 +229,10 @@ if run_button:
             st.markdown("### Methodology Summary: P2-Transformer Pro")
             cols = st.columns(2)
             with cols[0]:
-                st.markdown("**1. Data & Incremental Sync**")
-                st.write("The engine prioritizes the HF Dataset. External calls (YF/FRED) are only triggered during 7pm/8am EST sync windows if a data gap is detected. All macro signals are transformed into rolling Z-scores for regime detection.")
+                st.markdown("**1. Data & Auto-Sync**")
+                st.write("Model prioritizes HF Hub. During 7pm/8am windows, it fetches missing signals and uses the HF_TOKEN secret to automatically push updates back to the dataset repository.")
             with cols[1]:
-                st.markdown("**2. Transformer-LSTM Architecture**")
-                st.write("A hybrid neural network: Multi-Head Attention layers isolate global correlations between macro signals and ETF returns, while Bidirectional LSTMs process the local sequential trend.")
-            st.markdown("**3. The 1.1x Conviction Hurdle**")
-            st.write("The model enters an ETF trade only if the top predicted return is 1.1x higher than the runner-up and covers the risk-free rate plus transaction costs. Otherwise, it defaults to CASH.")
+                st.markdown("**2. Neural Architecture**")
+                st.write("Hybrid Attention-LSTM model designed for regime classification. Uses Multi-Head Attention for signal weights and Bi-LSTM for temporal sequence.")
+            st.markdown("**3. 1.1x Conviction Rule**")
+            st.write("Aggressive conviction hurdle: Assets must outperform the runner-up by 10% to trigger an entry, otherwise the model stays in Cash.")

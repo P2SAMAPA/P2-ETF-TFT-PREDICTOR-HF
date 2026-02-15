@@ -44,7 +44,7 @@ with st.sidebar:
     st.header("Model Configuration")
     start_year = st.slider("Training Start Year", 2008, 2025, 2016)
     fee_bps = st.slider("Transaction Cost (bps)", 0, 100, 15)
-    epochs = st.number_input("Training Epoch_Count", 5, 200, 50)
+    epochs = st.number_input("Training Epoch_Count", 5, 500, 50)
     st.info(f"Data Sync: {check_sync_status()}")
     st.markdown("---")
     run_button = st.button("Execute Transformer Alpha", type="primary")
@@ -70,15 +70,9 @@ def get_data(sync_key):
     ds = ds.set_index(date_col).sort_index()
     df = ds[ds.index.year >= start_year].copy()
     
-    # --- SOFR NAME PROTECTION ---
     if 'SOFR' not in df.columns:
-        if 'sofr' in df.columns:
-            df['SOFR'] = df['sofr']
-        else:
-            # Absolute fallback to avoid crash
-            df['SOFR'] = 0.04 
+        df['SOFR'] = df['sofr'] if 'sofr' in df.columns else 0.04 
 
-    # 1. MOVE and SKEW from YFinance
     try:
         yf_indices = yf.download(["^MOVE", "^SKEW"], start=df.index.min(), progress=False)['Close']
         yf_indices = yf_indices.rename(columns={"^MOVE": "MOVE", "^SKEW": "SKEW"})
@@ -86,18 +80,16 @@ def get_data(sync_key):
             yf_indices.index = yf_indices.index.tz_localize(None)
         df = df.join(yf_indices, how='left')
     except:
-        st.warning("YFinance Volatility fetch failed.")
+        st.warning("YFinance fetch failed.")
 
-    # 2. FRED Macro
     try:
         fred_symbols = ["T10Y2Y", "T10Y3M", "BAMLH0A0HYM2"]
         fred_data = web.DataReader(fred_symbols, "fred", df.index.min(), datetime.now())
         fred_data = fred_data.rename(columns={"BAMLH0A0HYM2": "HY_Spread"})
         df = df.join(fred_data, how='left')
     except:
-        st.warning("FRED Macro fetch failed.")
+        st.warning("FRED fetch failed.")
 
-    # 3. Z-SCORE ENGINEERING
     features_to_z = [c for c in df.columns if '_Ret' not in c and c != 'SOFR']
     for col in features_to_z:
         rolling_mean = df[col].rolling(window=20).mean()
@@ -112,22 +104,20 @@ def get_data(sync_key):
 if run_button:
     df = get_data(check_sync_status())
     
-    if df.empty:
-        st.error("Error: Dataset empty.")
-    else:
-        target_etfs = ['TLT_Ret', 'TBT_Ret', 'VNQ_Ret', 'SLV_Ret', 'GLD_Ret']
-        target_etfs = [t for t in target_etfs if t in df.columns]
+    if not df.empty:
+        target_etfs = [t for t in ['TLT_Ret', 'TBT_Ret', 'VNQ_Ret', 'SLV_Ret', 'GLD_Ret'] if t in df.columns]
         input_features = [c for c in df.columns if c not in target_etfs and c != 'SOFR']
         
         scaler = MinMaxScaler()
         scaled_input = scaler.fit_transform(df[input_features])
         
+        # Hyperparameter search across holding periods and lookbacks
         lookbacks = [30, 45, 60] if len(df) > 200 else [10, 20]
         holdings = [1, 3, 5]
         best_score = -np.inf
         final_res = None
 
-        with st.spinner("Training Transformer with Macro Signals..."):
+        with st.spinner("Optimizing Transformer Conviction..."):
             split_idx = int(len(scaled_input) * 0.8)
             for lb in lookbacks:
                 X, y = [], []
@@ -139,13 +129,12 @@ if run_button:
                 train_y, test_y = y[:split_idx - lb], y[split_idx - lb:]
 
                 inputs = Input(shape=(X.shape[1], X.shape[2]))
-                attn_out, _ = MultiHeadAttention(num_heads=4, key_dim=X.shape[2])(inputs, inputs, return_attention_scores=True)
+                attn_out, _ = MultiHeadAttention(num_heads=4, key_dim=X.shape[2])(inputs, inputs)
                 attn_res = LayerNormalization()(attn_out + inputs)
                 pool = GlobalMaxPooling1D()(Conv1D(64, 3, activation='relu', padding='same')(attn_res))
                 lstm = Bidirectional(LSTM(64))(inputs)
                 x = Dense(128, activation='relu')(Concatenate()([pool, lstm]))
                 model = Model(inputs, Dense(len(target_etfs))(x))
-                
                 model.compile(optimizer='adam', loss='mse')
                 model.fit(train_X, train_y, epochs=int(epochs), batch_size=32, verbose=0)
                 preds = model.predict(test_X)
@@ -156,8 +145,8 @@ if run_button:
                     for i in range(len(preds)):
                         idx = np.argmax(preds[i])
                         sorted_p = np.sort(preds[i])
-                        # Conviction Rule
-                        if preds[i][idx] > (sorted_p[-2] * 1.2) and preds[i][idx] > (sofr_vals[i]/252 + fee_pct):
+                        # AGGRESSIVE CONVICTION: 1.1x Hurdle
+                        if preds[i][idx] > (sorted_p[-2] * 1.1) and preds[i][idx] > (sofr_vals[i]/252 + fee_pct):
                             daily_strat_rets.append(test_y[i][idx] - (fee_pct if i % hold == 0 else 0))
                         else:
                             daily_strat_rets.append(sofr_vals[i]/252)
@@ -178,28 +167,37 @@ if run_button:
             k1, k2, k3, k4, k5 = st.columns(5)
             p_now = res["model"].predict(res["last_x"])[0]
             best_idx = np.argmax(p_now)
-            final_asset = res["target_names"][best_idx].split('_')[0] if p_now[best_idx] > (np.sort(p_now)[-2]*1.2) else "CASH (SOFR)"
-            k1.metric("Predicted Asset", final_asset, f"Next Open: {get_next_open_date()}")
-            k2.metric("Annualized Return", f"{ann_ret*100:.2f}%", f"{oos_yrs:.2f} OOS Years")
+            
+            # Predict Logic with 1.1x UI display
+            is_valid = p_now[best_idx] > (np.sort(p_now)[-2]*1.1)
+            final_asset = res["target_names"][best_idx].split('_')[0] if is_valid else "CASH (SOFR)"
+            hold_period = f"{res['hold']}d" if is_valid else "N/A"
+            
+            k1.metric("Predicted Asset", final_asset, f"Hold: {hold_period}")
+            k2.metric("Annualized Return", f"{ann_ret*100:.2f}%", f"Opt Lookback: {res['lb']}d")
             k3.metric("Sharpe Ratio", f"{sharpe:.2f}", "SOFR Adjusted")
-            k4.metric("Hit Ratio (15d)", f"{(np.sum(strat_rets[-15:] > 0)/15)*100:.1f}%", f"Lookback: {res['lb']}d")
+            k4.metric("Hit Ratio (15d)", f"{(np.sum(strat_rets[-15:] > 0)/15)*100:.1f}%", f"Next: {get_next_open_date()}")
             k5.metric("Max Daily Stress", f"{np.min(strat_rets)*100:.2f}%", "Worst Day")
 
-            st.markdown("### OOS Equity Curve")
-            fig = go.Figure(go.Scatter(x=res["dates"], y=cum_strat, fill='tozeroy', line=dict(color='#00d1b2')))
-            fig.update_layout(template="plotly_dark", height=400, margin=dict(l=0,r=0,b=0,t=20))
-            st.plotly_chart(fig, use_container_width=True)
-
-            st.markdown("### Signal Contribution Analysis")
-            weights = np.abs(res["model"].layers[-2].get_weights()[0]).mean(axis=1)[:len(res["input_features"])]
-            norm_w = (weights - weights.min()) / (weights.max() - weights.min() + 1e-9)
-            st.dataframe(pd.DataFrame({'Signal': res["input_features"], 'Relative Power': norm_w}).sort_values('Relative Power', ascending=False),
-                         column_config={"Relative Power": st.column_config.ProgressColumn(min_value=0, max_value=1, format="%.2f")}, hide_index=True, use_container_width=True)
+            st.plotly_chart(go.Figure(go.Scatter(x=res["dates"], y=cum_strat, fill='tozeroy', line=dict(color='#00d1b2'))).update_layout(template="plotly_dark", height=400), use_container_width=True)
 
             st.markdown("### 15-Day Performance Audit Trail")
             audit = []
             for i in range(1, 16):
                 p = res["preds"][-i]
-                is_cash = not (p[np.argmax(p)] > (np.sort(p)[-2] * 1.2))
+                is_cash = not (p[np.argmax(p)] > (np.sort(p)[-2] * 1.1))
                 audit.append({"Date": res["dates"][-i].strftime('%Y-%m-%d'), "Predicted": "CASH" if is_cash else res["target_names"][np.argmax(p)].split('_')[0], "Realized Daily Return": res["strat_rets"][-i]})
-            st.table(pd.DataFrame(audit).style.format({"Realized Daily Return": "{:.4%}"}).applymap(lambda x: 'color: #00ff00' if x > 0 else 'color: #ff4b4b', subset=['Realized Daily Return']))
+            st.table(pd.DataFrame(audit).style.format({"Realized Daily Return": "{:.4%}"}))
+
+            # --- METHODOLOGY SUMMARY ---
+            st.markdown("---")
+            st.markdown("### Methodology Summary: P2-Transformer Pro")
+            cols = st.columns(2)
+            with cols[0]:
+                st.markdown("**1. Data & Regime Detection**")
+                st.write("The model synthesizes internal technicals from Hugging Face with external macro signals (FRED High Yield Spreads, Yield Curves, and MOVE Bond Volatility). All inputs are converted to 20-day rolling Z-scores to identify rate-of-change anomalies.")
+            with cols[1]:
+                st.markdown("**2. Neural Architecture**")
+                st.write("A hybrid Transformer-LSTM architecture: Multi-Head Attention layers identify global dependencies across the lookback period, while Bidirectional LSTMs capture local sequential price patterns.")
+            st.markdown("**3. Execution Logic (The 1.1x Rule)**")
+            st.write("To prevent over-trading and 'whipsaws,' the model only executes an ETF trade if the predicted return is at least 1.1x higher than the next-best alternative and exceeds the risk-free rate (SOFR) plus transaction costs. Otherwise, it defaults to the safety of Cash.")

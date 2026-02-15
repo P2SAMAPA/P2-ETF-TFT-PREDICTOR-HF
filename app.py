@@ -29,11 +29,11 @@ def get_next_open_date():
     return schedule.iloc[0].market_open.strftime('%b %d, %Y')
 
 def is_sync_window():
-    """Checks if current time is within the 8pm-9pm or 8am-9am sync windows (EST)."""
+    """Checks if current time is within the 7pm-8pm or 7am-8am sync windows (EST)."""
     est = pytz.timezone('US/Eastern')
     now_est = datetime.now(est)
-    # 8 PM Evening Window or 8 AM Morning Fallback
-    return (now_est.hour == 20) or (now_est.hour == 8)
+    # 7 PM Evening Window or 7 AM Morning Fallback
+    return (now_est.hour == 19) or (now_est.hour == 7)
 
 # ------------------------------
 # 2. UI CONFIGURATION

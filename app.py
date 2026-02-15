@@ -41,36 +41,47 @@ st.set_page_config(page_title="P2-Transformer Pro", layout="wide")
 class PositionalEncoding(tf.keras.layers.Layer):
     """Adds positional information to input sequences for Transformer"""
     
-    def __init__(self, **kwargs):
+    def __init__(self, max_seq_len=100, **kwargs):
         super(PositionalEncoding, self).__init__(**kwargs)
+        self.max_seq_len = max_seq_len
     
-    def call(self, inputs):
-        seq_len = tf.shape(inputs)[1]
-        d_model = tf.shape(inputs)[2]
+    def build(self, input_shape):
+        """Build the layer - create positional encoding matrix"""
+        seq_len = input_shape[1]
+        d_model = input_shape[2]
         
         # Create position indices
-        position = tf.range(start=0, limit=seq_len, delta=1, dtype=tf.float32)
-        position = tf.reshape(position, [-1, 1])
+        position = np.arange(0, seq_len, dtype=np.float32).reshape(-1, 1)
         
         # Create dimension indices
-        div_term = tf.exp(tf.range(0, d_model, 2, dtype=tf.float32) * 
-                         -(tf.math.log(10000.0) / tf.cast(d_model, tf.float32)))
+        div_term = np.exp(np.arange(0, d_model, 2, dtype=np.float32) * 
+                         -(np.log(10000.0) / d_model))
         
         # Calculate positional encodings
-        pos_encoding = tf.zeros((seq_len, d_model))
-        pos_encoding_sin = tf.sin(position * div_term)
-        pos_encoding_cos = tf.cos(position * div_term)
+        pos_encoding = np.zeros((seq_len, d_model), dtype=np.float32)
+        pos_encoding[:, 0::2] = np.sin(position * div_term)
+        pos_encoding[:, 1::2] = np.cos(position * div_term)
         
-        # Interleave sin and cos
-        pos_encoding = tf.concat([pos_encoding_sin, pos_encoding_cos], axis=-1)
-        if d_model % 2 != 0:
-            pos_encoding = pos_encoding[:, :-1]
+        # Store as a non-trainable weight
+        self.pos_encoding = self.add_weight(
+            name='positional_encoding',
+            shape=(1, seq_len, d_model),
+            initializer=tf.keras.initializers.Constant(pos_encoding),
+            trainable=False
+        )
         
-        # Add to inputs
-        return inputs + pos_encoding
+        super(PositionalEncoding, self).build(input_shape)
+    
+    def call(self, inputs):
+        """Add positional encoding to inputs"""
+        return inputs + self.pos_encoding
+    
+    def compute_output_shape(self, input_shape):
+        return input_shape
     
     def get_config(self):
         config = super(PositionalEncoding, self).get_config()
+        config.update({'max_seq_len': self.max_seq_len})
         return config
 
 # ------------------------------

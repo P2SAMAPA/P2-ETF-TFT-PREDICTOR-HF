@@ -326,9 +326,13 @@ def smart_update_hf_dataset(new_data, token):
 # ------------------------------
 # 5. MAIN DATA ENGINE
 # ------------------------------
-def get_data(start_year):
+def get_data(start_year, force_refresh=False):
     """
     Main data fetching and processing pipeline
+    
+    Args:
+        start_year: Filter data from this year onwards
+        force_refresh: If True, fetch fresh data regardless of sync window
     """
     # Always try to load from HF first
     raw_url = f"https://huggingface.co/datasets/{REPO_ID}/resolve/main/etf_data.csv"
@@ -353,10 +357,17 @@ def get_data(start_year):
     except Exception as e:
         st.warning(f"⚠️ Could not load from HuggingFace: {e}")
     
-    # Check if we should sync (during sync windows)
-    if is_sync_window():
-        with st.status("🔄 Sync Window Active - Updating Dataset...", expanded=True):
+    # Check if we should sync (during sync windows OR force refresh)
+    should_sync = is_sync_window() or force_refresh
+    
+    if should_sync:
+        sync_reason = "🔄 Manual Refresh Requested" if force_refresh else "🔄 Sync Window Active"
+        
+        with st.status(f"{sync_reason} - Updating Dataset...", expanded=True):
             st.write(f"🕒 Current time (EST): {get_est_time().strftime('%H:%M:%S')}")
+            
+            if force_refresh:
+                st.info("📡 Force refresh enabled - fetching data outside sync window")
             
             # Fetch fresh data
             etf_list = ["TLT", "TBT", "VNQ", "SLV", "GLD"]
@@ -374,8 +385,11 @@ def get_data(start_year):
                 # Update HF dataset
                 token = os.getenv("HF_TOKEN")
                 df = smart_update_hf_dataset(new_df, token)
+                
+                if force_refresh:
+                    st.success("✅ Manual refresh completed successfully!")
             else:
-                st.error("❌ Data fetch failed during sync window")
+                st.error("❌ Data fetch failed during sync")
     
     # If still empty, fetch fresh data anyway
     if df.empty:
@@ -486,6 +500,19 @@ with st.sidebar:
     
     st.divider()
     
+    # Manual Dataset Refresh Option
+    st.subheader("📥 Dataset Management")
+    force_refresh = st.checkbox(
+        "Force Dataset Refresh",
+        value=False,
+        help="Manually fetch fresh data and update HF dataset (ignores sync window)"
+    )
+    
+    if force_refresh:
+        st.warning("⚠️ Will fetch fresh data on next run")
+    
+    st.divider()
+    
     start_yr = st.slider("📅 Start Year", 2008, 2025, 2016)
     fee_bps = st.slider("💰 Transaction Fee (bps)", 0, 100, 15, 
                         help="Transaction cost in basis points")
@@ -519,6 +546,11 @@ with st.sidebar:
     st.divider()
     
     run_button = st.button("🚀 Execute Transformer Alpha", type="primary", use_container_width=True)
+    
+    st.divider()
+    
+    refresh_only_button = st.button("🔄 Refresh Dataset Only", type="secondary", use_container_width=True, 
+                                    help="Update HF dataset with latest data without training the model")
 
 # ------------------------------
 # 8. MAIN APPLICATION
@@ -526,9 +558,63 @@ with st.sidebar:
 st.title("🤖 P2-TRANSFORMER-ETF-PREDICTOR")
 st.caption("Pure Transformer Architecture with Multi-Source Macro Intelligence")
 
+# Handle dataset refresh only (no model training)
+if refresh_only_button:
+    st.info("🔄 Refreshing dataset without model training...")
+    
+    with st.status("📡 Fetching fresh data from all sources...", expanded=True):
+        # Fetch fresh data
+        etf_list = ["TLT", "TBT", "VNQ", "SLV", "GLD"]
+        
+        st.write("📊 Fetching ETF data...")
+        etf_data = fetch_etf_data(etf_list, start_date="2008-01-01")
+        
+        st.write("📊 Fetching macro signals...")
+        macro_data = fetch_macro_data_robust(start_date="2008-01-01")
+        
+        if not etf_data.empty and not macro_data.empty:
+            # Combine all
+            new_df = pd.concat([etf_data, macro_data], axis=1)
+            
+            st.write("💾 Updating HuggingFace dataset...")
+            token = os.getenv("HF_TOKEN")
+            
+            if token:
+                updated_df = smart_update_hf_dataset(new_df, token)
+                
+                st.success("✅ Dataset refresh completed!")
+                
+                # Show dataset summary
+                st.subheader("📊 Dataset Summary")
+                col1, col2, col3 = st.columns(3)
+                col1.metric("Total Rows", len(updated_df))
+                col2.metric("Total Columns", len(updated_df.columns))
+                col3.metric("Date Range", f"{updated_df.index[0].strftime('%Y-%m-%d')} to {updated_df.index[-1].strftime('%Y-%m-%d')}")
+                
+                # Show column breakdown
+                st.write("**Columns in Dataset:**")
+                etf_cols = [c for c in updated_df.columns if '_Ret' in c or '_Vol' in c]
+                macro_cols = [c for c in updated_df.columns if c not in etf_cols]
+                
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.write(f"📈 **ETF Signals:** {len(etf_cols)}")
+                    st.code("\n".join(sorted(etf_cols)[:10]))
+                
+                with col2:
+                    st.write(f"🌍 **Macro Signals:** {len(macro_cols)}")
+                    st.code("\n".join(sorted(macro_cols)[:10]))
+                
+            else:
+                st.error("❌ HF_TOKEN not found. Cannot update dataset.")
+        else:
+            st.error("❌ Failed to fetch data from sources")
+    
+    st.stop()  # Stop execution here, don't run model
+
 if run_button:
     # Load and prepare data
-    df = get_data(start_yr)
+    df = get_data(start_yr, force_refresh=force_refresh)
     
     if df.empty:
         st.error("❌ No data available. Please check data sources.")

@@ -40,28 +40,23 @@ with st.sidebar:
 st.title("P2-TRANSFORMER-ETF-PREDICTOR")
 
 # ------------------------------
-# 3. DATA ENGINE (PURE HF)
+# 3. DATA ENGINE
 # ------------------------------
 REPO_ID = "P2SAMAPA/my-etf-data"
 fee_pct = fee_bps / 10000
 
 def get_data():
     try:
-        # Load directly from HF - No YFinance needed
         ds = load_dataset(REPO_ID, split="train").to_pandas()
     except Exception as e:
         st.error(f"HF Dataset Load Failed: {e}")
         return pd.DataFrame()
 
-    # Standardize Dates
     date_col = 'Date' if 'Date' in ds.columns else 'date'
     ds[date_col] = pd.to_datetime(ds[date_col]).dt.tz_localize(None)
     ds = ds.set_index(date_col).sort_index()
     
-    # Filter by user-selected Training Window
     df = ds[ds.index.year >= start_year].copy()
-    
-    # Fill any gaps (ffill/bfill) and drop incomplete rows
     return df.ffill().bfill().dropna()
 
 # ------------------------------
@@ -71,28 +66,21 @@ if run_button:
     df = get_data()
     
     if df.empty:
-        st.error(f"Error: No data available for {start_year} in the HF dataset.")
+        st.error(f"Error: No data available for {start_year}.")
     else:
-        # Define the target columns for prediction
         target_etfs = ['TLT_Ret', 'TBT_Ret', 'VNQ_Ret', 'SLV_Ret', 'GLD_Ret']
-        # Dynamically find targets present in your HF columns
         target_etfs = [t for t in target_etfs if t in df.columns]
-        
-        # Everything else (CPI, UNRATE, VIX, Gold, etc.) becomes an input signal
-        # Exclude SOFR from inputs so it remains the "Risk-Free Bench"
         input_features = [c for c in df.columns if c not in target_etfs and c != 'SOFR']
         
-        # Scaling inputs for the Transformer 
         scaler = MinMaxScaler()
         scaled_input = scaler.fit_transform(df[input_features])
         
-        # Parameters
         lookbacks = [30, 45, 60] if len(df) > 200 else [10, 20]
         holdings = [1, 3, 5]
         best_conviction = -np.inf
         final_res = None
 
-        with st.spinner(f"Training on signals: {', '.join(input_features[:5])}..."):
+        with st.spinner(f"Training on signals..."):
             split_idx = int(len(scaled_input) * 0.8)
             
             for lb in lookbacks:
@@ -108,7 +96,7 @@ if run_button:
 
                 if len(train_X) < 10: continue
 
-                # Transformer + LSTM + CNN Hybrid
+                # Transformer Architecture
                 inputs = Input(shape=(X.shape[1], X.shape[2]))
                 attn_output, attn_weights = MultiHeadAttention(num_heads=4, key_dim=X.shape[2])(inputs, inputs, return_attention_scores=True)
                 attn_res = LayerNormalization()(attn_output + inputs)
@@ -126,10 +114,8 @@ if run_button:
                 model.fit(train_X, train_y, epochs=int(epochs), batch_size=32, verbose=0)
                 preds = model.predict(test_X)
                 
-                # Logic for Strategy Returns vs. SOFR (Risk-Free)
                 for hold in holdings:
                     daily_strat_rets = []
-                    # Get SOFR values (defaults to 4% / 252 if not found in HF)
                     sofr_series = df['SOFR'] if 'SOFR' in df.columns else pd.Series(0.04, index=df.index)
                     
                     for i in range(len(preds)):
@@ -168,8 +154,6 @@ if run_button:
             
             p_now = res["model"].predict(res["last_x"])[0]
             best_idx = np.argmax(p_now)
-            
-            # Prediction logic for "Next Open"
             curr_sofr = res["sofr"][-1]
             final_asset = res["target_names"][best_idx].split('_')[0] if p_now[best_idx] > ((curr_sofr/252) + fee_pct) else "CASH (SOFR)"
             
@@ -179,14 +163,16 @@ if run_button:
             k4.metric("Hit Ratio (15d)", f"{(np.sum(strat_rets[-15:] > 0)/15)*100:.1f}%", f"Search: {res['lb']}L|{res['hold']}H")
             k5.metric("Max Daily Stress", f"{np.min(strat_rets)*100:.2f}%", "Worst Day")
 
-            st.markdown(f"### OOS Equity Curve ({res['lb']}d Lookback | {res['hold']}d Holding)")
+            st.markdown(f"### OOS Equity Curve")
             fig = go.Figure()
             fig.add_trace(go.Scatter(x=res["dates"][:len(cum_strat)], y=cum_strat, fill='tozeroy', line=dict(color='#00d1b2', width=1.5)))
             fig.update_layout(template="plotly_dark", height=400, margin=dict(l=0,r=0,b=0,t=20))
             st.plotly_chart(fig, use_container_width=True)
 
+            # Signal Contribution
             st.markdown("---")
             st.markdown("### Signal Contribution Analysis")
+            
             raw_weights = res["weight_model"].predict(res["last_x"]) 
             importance = np.mean(raw_weights, axis=(0, 1, 2))
             importance = np.atleast_1d(importance)
@@ -196,19 +182,33 @@ if run_button:
             else:
                  importance = importance[:len(res["input_features"])]
 
-            feat_imp = pd.DataFrame({'Signal': res["input_features"], 'Weight': importance}).sort_values('Weight', ascending=False)
+            norm_importance = (importance - np.min(importance)) / (np.max(importance) - np.min(importance) + 1e-9)
+            feat_imp = pd.DataFrame({'Signal': res["input_features"], 'Weight': norm_importance}).sort_values('Weight', ascending=False)
             
             col_a, col_b = st.columns([1, 2])
             with col_a:
                 st.write("Predictive Power Ranking")
-                st.dataframe(feat_imp.style.background_gradient(cmap='Blues'))
+                st.dataframe(
+                    feat_imp,
+                    column_config={
+                        "Weight": st.column_config.ProgressColumn(
+                            "Relative Power",
+                            help="Transformer Attention Weight",
+                            format="%.2f",
+                            min_value=0,
+                            max_value=1,
+                        )
+                    },
+                    hide_index=True,
+                    use_container_width=True
+                )
             with col_b:
                 st.write("Temporal Attention Heatmap (Head 0)")
-                # 
-                fig_heat = px.imshow(raw_weights[0, 0], labels=dict(x="Lookback Steps", y="Feature Dimension", color="Weight"), color_continuous_scale="Viridis")
+                fig_heat = px.imshow(raw_weights[0, 0], labels=dict(x="Steps", y="Feature", color="Weight"), color_continuous_scale="Viridis")
                 fig_heat.update_layout(height=350, template="plotly_dark", margin=dict(l=0,r=0,b=0,t=0))
                 st.plotly_chart(fig_heat, use_container_width=True)
 
+            # Audit Table
             st.markdown("### 15-Day Performance Audit Trail")
             audit = []
             display_days = min(15, len(res["preds"]))
@@ -222,8 +222,9 @@ if run_button:
                     "SOFR (Ann)": f"{res['sofr'][-i]*100:.2f}%",
                     "Realized Daily Return": res["strat_rets"][-i]
                 })
+            
             st.table(pd.DataFrame(audit).style.format({"Realized Daily Return": "{:.4%}"}).applymap(
                 lambda x: 'color: #00ff00' if x > 0 else 'color: #ff4b4b', subset=['Realized Daily Return']
             ))
         else:
-            st.error("Model Search Failed. Verify that your HF dataset contains both 'SOFR' and the predicted ETFs.")
+            st.error("No valid strategy found.")

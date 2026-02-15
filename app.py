@@ -20,7 +20,7 @@ from datasets import load_dataset
 import plotly.graph_objects as go
 
 # ------------------------------
-# 1. UTILS & SYNC LOGIC
+# 1. SCHEDULER & SYNC LOGIC
 # ------------------------------
 def get_next_open_date():
     nyse = mcal.get_calendar('NYSE')
@@ -28,12 +28,12 @@ def get_next_open_date():
     if schedule.empty: return "TBD"
     return schedule.iloc[0].market_open.strftime('%b %d, %Y')
 
-def check_sync_status():
+def is_sync_window():
+    """Checks if current time is within the 8pm-9pm or 8am-9am sync windows (EST)."""
     est = pytz.timezone('US/Eastern')
     now_est = datetime.now(est)
-    if now_est.hour >= 18:
-        return f"sync_{now_est.strftime('%Y-%m-%d')}_post6pm"
-    return f"sync_{now_est.strftime('%Y-%m-%d')}_pre6pm"
+    # 8 PM Evening Window or 8 AM Morning Fallback
+    return (now_est.hour == 20) or (now_est.hour == 8)
 
 # ------------------------------
 # 2. UI CONFIGURATION
@@ -45,20 +45,24 @@ with st.sidebar:
     start_year = st.slider("Training Start Year", 2008, 2025, 2016)
     fee_bps = st.slider("Transaction Cost (bps)", 0, 100, 15)
     epochs = st.number_input("Training Epoch_Count", 5, 500, 50)
-    st.info(f"Data Sync: {check_sync_status()}")
+    
+    # Dynamic Sync Status Display
+    sync_status = "ACTIVE 🟢 (External Sync Allowed)" if is_sync_window() else "IDLE ⚪ (HF Cache Only)"
+    st.info(f"Sync Engine: {sync_status}")
     st.markdown("---")
     run_button = st.button("Execute Transformer Alpha", type="primary")
 
 st.title("P2-TRANSFORMER-ETF-PREDICTOR")
 
 # ------------------------------
-# 3. DATA ENGINE (FRED + YF + HF)
+# 3. DATA ENGINE (HF-FIRST + GAP FILL)
 # ------------------------------
 REPO_ID = "P2SAMAPA/my-etf-data"
 fee_pct = fee_bps / 10000
 
 @st.cache_data(ttl=3600)
-def get_data(sync_key):
+def get_data():
+    # 1. Load HF Dataset
     try:
         ds = load_dataset(REPO_ID, split="train").to_pandas()
     except Exception as e:
@@ -69,40 +73,55 @@ def get_data(sync_key):
     ds[date_col] = pd.to_datetime(ds[date_col]).dt.tz_localize(None)
     ds = ds.set_index(date_col).sort_index()
     df = ds[ds.index.year >= start_year].copy()
+
+    # 2. Check for Gaps & Sync Window
+    last_date = df.index.max().date()
+    today = datetime.now().date()
+    has_gap = last_date < today
+
+    if has_gap and is_sync_window():
+        st.write(f"🔄 Syncing Gap: {last_date} to {today}...")
+        # Yahoo Finance Gap Fill
+        try:
+            yf_inc = yf.download(["^MOVE", "^SKEW"], start=last_date, progress=False)['Close']
+            yf_inc = yf_inc.rename(columns={"^MOVE": "MOVE", "^SKEW": "SKEW"})
+            yf_inc.index = yf_inc.index.tz_localize(None)
+            df = df.combine_first(yf_inc)
+        except: pass
+
+        # FRED Gap Fill
+        try:
+            fred_syms = ["T10Y2Y", "T10Y3M", "BAMLH0A0HYM2"]
+            fred_inc = web.DataReader(fred_syms, "fred", last_date, datetime.now())
+            fred_inc = fred_inc.rename(columns={"BAMLH0A0HYM2": "HY_Spread"})
+            df = df.combine_first(fred_inc)
+        except: pass
     
+    # 3. Error Validation
+    critical_signals = ['MOVE', 'SKEW', 'HY_Spread']
+    missing = [s for s in critical_signals if s not in df.columns]
+    if missing:
+        st.error(f"CRITICAL ERROR: The following signals are missing from your HF dataset: {missing}")
+        return pd.DataFrame()
+
+    # 4. SOFR / Risk-Free Logic
     if 'SOFR' not in df.columns:
         df['SOFR'] = df['sofr'] if 'sofr' in df.columns else 0.04 
 
-    try:
-        yf_indices = yf.download(["^MOVE", "^SKEW"], start=df.index.min(), progress=False)['Close']
-        yf_indices = yf_indices.rename(columns={"^MOVE": "MOVE", "^SKEW": "SKEW"})
-        if isinstance(yf_indices.index, pd.DatetimeIndex):
-            yf_indices.index = yf_indices.index.tz_localize(None)
-        df = df.join(yf_indices, how='left')
-    except:
-        st.warning("YFinance fetch failed.")
-
-    try:
-        fred_symbols = ["T10Y2Y", "T10Y3M", "BAMLH0A0HYM2"]
-        fred_data = web.DataReader(fred_symbols, "fred", df.index.min(), datetime.now())
-        fred_data = fred_data.rename(columns={"BAMLH0A0HYM2": "HY_Spread"})
-        df = df.join(fred_data, how='left')
-    except:
-        st.warning("FRED fetch failed.")
-
+    # 5. Z-Score Feature Engineering
     features_to_z = [c for c in df.columns if '_Ret' not in c and c != 'SOFR']
     for col in features_to_z:
         rolling_mean = df[col].rolling(window=20).mean()
         rolling_std = df[col].rolling(window=20).std()
         df[f"{col}_Z"] = (df[col] - rolling_mean) / (rolling_std + 1e-9)
 
-    return df.ffill().bfill().dropna()
+    return df.ffill().dropna()
 
 # ------------------------------
 # 4. RUNTIME
 # ------------------------------
 if run_button:
-    df = get_data(check_sync_status())
+    df = get_data()
     
     if not df.empty:
         target_etfs = [t for t in ['TLT_Ret', 'TBT_Ret', 'VNQ_Ret', 'SLV_Ret', 'GLD_Ret'] if t in df.columns]
@@ -111,13 +130,12 @@ if run_button:
         scaler = MinMaxScaler()
         scaled_input = scaler.fit_transform(df[input_features])
         
-        # Hyperparameter search across holding periods and lookbacks
         lookbacks = [30, 45, 60] if len(df) > 200 else [10, 20]
         holdings = [1, 3, 5]
         best_score = -np.inf
         final_res = None
 
-        with st.spinner("Optimizing Transformer Conviction..."):
+        with st.spinner("Training Transformer Alpha Engine..."):
             split_idx = int(len(scaled_input) * 0.8)
             for lb in lookbacks:
                 X, y = [], []
@@ -145,7 +163,7 @@ if run_button:
                     for i in range(len(preds)):
                         idx = np.argmax(preds[i])
                         sorted_p = np.sort(preds[i])
-                        # AGGRESSIVE CONVICTION: 1.1x Hurdle
+                        # Aggressive 1.1x Conviction Rule
                         if preds[i][idx] > (sorted_p[-2] * 1.1) and preds[i][idx] > (sofr_vals[i]/252 + fee_pct):
                             daily_strat_rets.append(test_y[i][idx] - (fee_pct if i % hold == 0 else 0))
                         else:
@@ -167,14 +185,13 @@ if run_button:
             k1, k2, k3, k4, k5 = st.columns(5)
             p_now = res["model"].predict(res["last_x"])[0]
             best_idx = np.argmax(p_now)
-            
-            # Predict Logic with 1.1x UI display
             is_valid = p_now[best_idx] > (np.sort(p_now)[-2]*1.1)
+            
             final_asset = res["target_names"][best_idx].split('_')[0] if is_valid else "CASH (SOFR)"
             hold_period = f"{res['hold']}d" if is_valid else "N/A"
             
             k1.metric("Predicted Asset", final_asset, f"Hold: {hold_period}")
-            k2.metric("Annualized Return", f"{ann_ret*100:.2f}%", f"Opt Lookback: {res['lb']}d")
+            k2.metric("Annualized Return", f"{ann_ret*100:.2f}%", f"LB: {res['lb']}d")
             k3.metric("Sharpe Ratio", f"{sharpe:.2f}", "SOFR Adjusted")
             k4.metric("Hit Ratio (15d)", f"{(np.sum(strat_rets[-15:] > 0)/15)*100:.1f}%", f"Next: {get_next_open_date()}")
             k5.metric("Max Daily Stress", f"{np.min(strat_rets)*100:.2f}%", "Worst Day")
@@ -194,10 +211,10 @@ if run_button:
             st.markdown("### Methodology Summary: P2-Transformer Pro")
             cols = st.columns(2)
             with cols[0]:
-                st.markdown("**1. Data & Regime Detection**")
-                st.write("The model synthesizes internal technicals from Hugging Face with external macro signals (FRED High Yield Spreads, Yield Curves, and MOVE Bond Volatility). All inputs are converted to 20-day rolling Z-scores to identify rate-of-change anomalies.")
+                st.markdown("**1. Data & Incremental Sync**")
+                st.write("The engine prioritizes the HF Dataset. External calls (YF/FRED) are only triggered during 8pm/8am EST sync windows if a data gap is detected. All macro signals are transformed into rolling Z-scores for regime detection.")
             with cols[1]:
-                st.markdown("**2. Neural Architecture**")
-                st.write("A hybrid Transformer-LSTM architecture: Multi-Head Attention layers identify global dependencies across the lookback period, while Bidirectional LSTMs capture local sequential price patterns.")
-            st.markdown("**3. Execution Logic (The 1.1x Rule)**")
-            st.write("To prevent over-trading and 'whipsaws,' the model only executes an ETF trade if the predicted return is at least 1.1x higher than the next-best alternative and exceeds the risk-free rate (SOFR) plus transaction costs. Otherwise, it defaults to the safety of Cash.")
+                st.markdown("**2. Transformer-LSTM Architecture**")
+                st.write("A hybrid neural network: Multi-Head Attention layers isolate global correlations between macro signals and ETF returns, while Bidirectional LSTMs process the local sequential trend.")
+            st.markdown("**3. The 1.1x Conviction Hurdle**")
+            st.write("The model enters an ETF trade only if the top predicted return is 1.1x higher than the runner-up and covers the risk-free rate plus transaction costs. Otherwise, it defaults to CASH.")

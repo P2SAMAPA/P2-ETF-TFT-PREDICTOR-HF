@@ -7,7 +7,7 @@ from huggingface_hub import HfApi
 try:
     import pandas_datareader.data as web
 except ImportError:
-    st.error("Missing library: pandas_datareader. Please add it to requirements.txt")
+    st.error("Missing pandas_datareader. Please add it to requirements.txt")
 import pandas_market_calendars as mcal
 from datetime import datetime, timedelta
 import pytz
@@ -18,152 +18,109 @@ from tensorflow.keras.layers import (
     Conv1D, GlobalMaxPooling1D, Concatenate, MultiHeadAttention, LayerNormalization
 )
 from sklearn.preprocessing import MinMaxScaler
-from datasets import load_dataset
 import plotly.graph_objects as go
 
 # ------------------------------
-# 1. SCHEDULER & SYNC LOGIC
+# 1. CORE CONFIG & SYNC WINDOW
 # ------------------------------
-def get_next_open_date():
-    nyse = mcal.get_calendar('NYSE')
-    schedule = nyse.schedule(start_date=datetime.now(), end_date=datetime.now() + timedelta(days=10))
-    if schedule.empty: return "TBD"
-    return schedule.iloc[0].market_open.strftime('%b %d, %Y')
+REPO_ID = "P2SAMAPA/my-etf-data"
 
 def get_est_time():
     return datetime.now(pytz.timezone('US/Eastern'))
 
 def is_sync_window():
-    """Checks if current time is within 7-8 window (EST) based on server clock."""
+    # Adjusted to match your 07:06 server time
     now_est = get_est_time()
-    # Updated to include hour 7 to match your morning server time
-    return (now_est.hour == 7) or (now_est.hour == 8) or (now_est.hour == 19)
+    return (now_est.hour >= 7 and now_est.hour <= 9) or (now_est.hour >= 18 and now_est.hour <= 20)
 
-# ------------------------------
-# 2. UI CONFIGURATION
-# ------------------------------
 st.set_page_config(page_title="P2-Transformer Pro", layout="wide")
 
-with st.sidebar:
-    st.header("Model Configuration")
-    est_now = get_est_time()
-    st.write(f"🕒 **Server Time (EST):** {est_now.strftime('%H:%M:%S')}")
-    
-    start_year = st.slider("Training Start Year", 2008, 2025, 2016)
-    fee_bps = st.slider("Transaction Cost (bps)", 0, 100, 15)
-    epochs = st.number_input("Training Epoch_Count", 5, 500, 50)
-    
-    sync_status = "ACTIVE 🟢" if is_sync_window() else "IDLE ⚪ (HF Cache Only)"
-    st.info(f"Sync Engine: {sync_status}")
-    
-    st.markdown("---")
-    run_button = st.button("Execute Transformer Alpha", type="primary")
-
-st.title("P2-TRANSFORMER-ETF-PREDICTOR")
-
 # ------------------------------
-# 3. DATA ENGINE (AUTO-SYNC TO HUB)
+# 2. DATA ENGINE (RAW CSV FETCH)
 # ------------------------------
-REPO_ID = "P2SAMAPA/my-etf-data"
-fee_pct = fee_bps / 10000
-
-def get_data():
+def get_data(start_year):
+    # FORCE FETCH RAW CSV to bypass the old 'data/' folder
+    raw_url = f"https://huggingface.co/datasets/{REPO_ID}/resolve/main/etf_data.csv"
     try:
-        ds = load_dataset(REPO_ID, split="train").to_pandas()
+        df = pd.read_csv(raw_url)
     except Exception as e:
-        st.error(f"HF Dataset Load Failed: {e}")
+        st.error(f"Raw CSV fetch failed. Ensure etf_data.csv is in root. Error: {e}")
         return pd.DataFrame()
 
-    date_col = 'Date' if 'Date' in ds.columns else 'date'
-    ds[date_col] = pd.to_datetime(ds[date_col]).dt.tz_localize(None)
-    ds = ds.set_index(date_col).sort_index()
-    df = ds[ds.index.year >= start_year].copy()
+    # Standardize Index
+    date_col = 'Date' if 'Date' in df.columns else 'date'
+    df[date_col] = pd.to_datetime(df[date_col]).dt.tz_localize(None)
+    df = df.set_index(date_col).sort_index()
+    df = df[df.index.year >= start_year].copy()
 
-    last_date = df.index.max().date()
-    today = get_est_time().date()
-    has_gap = last_date < today
-
-    if has_gap and is_sync_window():
-        with st.status("🔄 Syncing & Updating HF Hub...", expanded=True) as status:
+    # Sync Missing Signals if in window
+    if is_sync_window():
+        with st.status("🔄 Syncing Macro Signals...", expanded=False):
             try:
-                # Pull full history for missing signals
                 yf_inc = yf.download(["^MOVE", "^SKEW"], start="2008-01-01", progress=False)['Close']
-                yf_inc = yf_inc.rename(columns={"^MOVE": "MOVE", "^SKEW": "SKEW"})
-                yf_inc.index = yf_inc.index.tz_localize(None)
+                yf_inc = yf_inc.rename(columns={"^MOVE": "MOVE", "^SKEW": "SKEW"}).tz_localize(None)
                 df = df.combine_first(yf_inc)
 
-                fred_syms = ["T10Y2Y", "T10Y3M", "BAMLH0A0HYM2"]
-                fred_inc = web.DataReader(fred_syms, "fred", "2008-01-01", datetime.now())
+                fred_inc = web.DataReader(["T10Y2Y", "T10Y3M", "BAMLH0A0HYM2"], "fred", "2008-01-01", datetime.now())
                 fred_inc = fred_inc.rename(columns={"BAMLH0A0HYM2": "HY_Spread"})
                 df = df.combine_first(fred_inc)
                 
                 token = os.getenv("HF_TOKEN")
                 if token:
-                    # Save to local CSV then push to Hub
-                    df.to_csv("temp_sync_data.csv")
-                    api = HfApi()
-                    api.upload_file(
-                        path_or_fileobj="temp_sync_data.csv",
-                        path_in_repo="etf_data.csv",
-                        repo_id=REPO_ID,
-                        repo_type="dataset",
-                        token=token
-                    )
-                    st.success("✅ HF Hub Updated!")
+                    df.to_csv("etf_data.csv")
+                    HfApi().upload_file(path_or_fileobj="etf_data.csv", path_in_repo="etf_data.csv", repo_id=REPO_ID, repo_type="dataset", token=token)
+                    st.toast("✅ Hub Pushed Successfully!")
             except Exception as e:
-                st.error(f"Sync failed: {e}")
-            status.update(label="Sync Process Complete", state="complete")
-    
-    # Critical signal check
-    critical_signals = ['MOVE', 'SKEW', 'HY_Spread']
-    missing = [s for s in critical_signals if s not in df.columns]
-    if missing:
-        st.error(f"CRITICAL ERROR: Signals missing: {missing}")
-        return pd.DataFrame()
+                st.warning(f"Sync Warning: {e}")
 
-    if 'SOFR' not in df.columns:
-        df['SOFR'] = df['sofr'] if 'sofr' in df.columns else 0.04 
-
-    # Z-Score Features
-    features_to_z = [c for c in df.columns if '_Ret' not in c and c != 'SOFR']
-    for col in features_to_z:
-        rolling_mean = df[col].rolling(window=20).mean()
-        rolling_std = df[col].rolling(window=20).std()
-        df[f"{col}_Z"] = (df[col] - rolling_mean) / (rolling_std + 1e-9)
+    # Feature Engineering (Z-Scores)
+    for col in [c for c in df.columns if '_Ret' not in c and c != 'SOFR']:
+        df[f"{col}_Z"] = (df[col] - df[col].rolling(20).mean()) / (df[col].rolling(20).std() + 1e-9)
 
     return df.ffill().dropna()
 
 # ------------------------------
-# 4. RUNTIME
+# 3. SIDEBAR & UI
+# ------------------------------
+with st.sidebar:
+    st.header("Model Configuration")
+    st.write(f"🕒 Server Time (EST): {get_est_time().strftime('%H:%M:%S')}")
+    start_yr = st.slider("Start Year", 2008, 2025, 2016)
+    fee_bps = st.slider("Fee (bps)", 0, 100, 15)
+    epochs = st.number_input("Epochs", 5, 500, 50)
+    st.info(f"Sync Engine: {'ACTIVE 🟢' if is_sync_window() else 'IDLE ⚪'}")
+    run_button = st.button("Execute Transformer Alpha", type="primary")
+
+st.title("P2-TRANSFORMER-ETF-PREDICTOR")
+
+# ------------------------------
+# 4. EXECUTION
 # ------------------------------
 if run_button:
-    df = get_data()
-    
+    df = get_data(start_yr)
     if not df.empty:
         target_etfs = [t for t in ['TLT_Ret', 'TBT_Ret', 'VNQ_Ret', 'SLV_Ret', 'GLD_Ret'] if t in df.columns]
         input_features = [c for c in df.columns if c not in target_etfs and c != 'SOFR']
         
-        scaler = MinMaxScaler()
-        scaled_input = scaler.fit_transform(df[input_features])
-        
-        lookbacks = [30, 45, 60] if len(df) > 200 else [10, 20]
-        holdings = [1, 3, 5]
-        best_score = -np.inf
-        final_res = None
-
-        with st.spinner("Training Transformer Alpha Engine..."):
-            split_idx = int(len(scaled_input) * 0.8)
-            for lb in lookbacks:
+        # Validate critical signals
+        missing = [s for s in ['MOVE', 'SKEW', 'HY_Spread'] if s not in df.columns]
+        if missing:
+            st.error(f"Still missing: {missing}. Run again during Sync Window.")
+        else:
+            scaler = MinMaxScaler()
+            scaled_input = scaler.fit_transform(df[input_features])
+            lb = 30
+            
+            with st.spinner("Training Transformer..."):
                 X, y = [], []
                 for i in range(lb, len(scaled_input)):
                     X.append(scaled_input[i-lb:i])
                     y.append(df[target_etfs].iloc[i].values)
                 X, y = np.array(X), np.array(y)
-                train_X, test_X = X[:split_idx - lb], X[split_idx - lb:]
-                train_y, test_y = y[:split_idx - lb], y[split_idx - lb:]
-
-                # FIXED: Unpacking removed to satisfy Keras 3 symbolic tensor requirements
+                split = int(len(X) * 0.8)
+                
                 inputs = Input(shape=(X.shape[1], X.shape[2]))
+                # FIXED: Removed symbolic iteration (no underscore)
                 attn_out = MultiHeadAttention(num_heads=4, key_dim=X.shape[2])(inputs, inputs)
                 attn_res = LayerNormalization()(attn_out + inputs)
                 pool = GlobalMaxPooling1D()(Conv1D(64, 3, activation='relu', padding='same')(attn_res))
@@ -171,45 +128,17 @@ if run_button:
                 x = Dense(128, activation='relu')(Concatenate()([pool, lstm]))
                 model = Model(inputs, Dense(len(target_etfs))(x))
                 model.compile(optimizer='adam', loss='mse')
-                model.fit(train_X, train_y, epochs=int(epochs), batch_size=32, verbose=0)
-                preds = model.predict(test_X)
+                model.fit(X[:split], y[:split], epochs=int(epochs), batch_size=32, verbose=0)
                 
-                for hold in holdings:
-                    daily_strat_rets = []
-                    sofr_vals = df['SOFR'].iloc[split_idx:].values
-                    for i in range(len(preds)):
-                        idx = np.argmax(preds[i])
-                        sorted_p = np.sort(preds[i])
-                        if preds[i][idx] > (sorted_p[-2] * 1.1) and preds[i][idx] > (sofr_vals[i]/252 + fee_pct):
-                            daily_strat_rets.append(test_y[i][idx] - (fee_pct if i % hold == 0 else 0))
-                        else:
-                            daily_strat_rets.append(sofr_vals[i]/252)
-                    
-                    if np.mean(daily_strat_rets) > best_score:
-                        best_score = np.mean(daily_strat_rets)
-                        final_res = {"model": model, "strat_rets": daily_strat_rets, "dates": df.index[split_idx:], "sofr": sofr_vals, "last_x": X[-1:], "target_names": target_etfs, "lb": lb, "hold": hold}
+                # Backtest Result
+                preds = model.predict(X[split:])
+                strat_rets = []
+                for i in range(len(preds)):
+                    idx = np.argmax(preds[i])
+                    if preds[i][idx] > (np.sort(preds[i])[-2] * 1.1):
+                        strat_rets.append(y[split:][i][idx] - (fee_bps/10000))
+                    else:
+                        strat_rets.append(0.04/252)
 
-        if final_res:
-            res = final_res
-            strat_rets = np.array(res["strat_rets"])
-            cum_strat = np.cumprod(1 + strat_rets)
-            oos_yrs = (res["dates"][-1] - res["dates"][0]).days / 365.25
-            ann_ret = (cum_strat[-1] ** (1/oos_yrs)) - 1
-            sharpe = np.sqrt(252) * np.mean(strat_rets - (res["sofr"]/252)) / (np.std(strat_rets) + 1e-9)
-            
-            st.markdown("### Performance Scorecard")
-            k1, k2, k3, k4, k5 = st.columns(5)
-            p_now = res["model"].predict(res["last_x"])[0]
-            best_idx = np.argmax(p_now)
-            is_valid = p_now[best_idx] > (np.sort(p_now)[-2]*1.1)
-            final_asset = res["target_names"][best_idx].split('_')[0] if is_valid else "CASH (SOFR)"
-            
-            k1.metric("Predicted Asset", final_asset)
-            k2.metric("Annualized Return", f"{ann_ret*100:.2f}%")
-            k3.metric("Sharpe Ratio", f"{sharpe:.2f}")
-            k4.metric("Hit Ratio (15d)", f"{(np.sum(strat_rets[-15:] > 0)/15)*100:.1f}%")
-            k5.metric("Max Daily Stress", f"{np.min(strat_rets)*100:.2f}%")
-
-            fig = go.Figure(go.Scatter(x=res["dates"], y=cum_strat, fill='tozeroy', line=dict(color='#00d1b2')))
-            fig.update_layout(template="plotly_dark", height=400, margin=dict(l=20, r=20, t=20, b=20))
-            st.plotly_chart(fig, use_container_width=True)
+                cum_strat = np.cumprod(1 + np.array(strat_rets))
+                st.plotly_chart(go.Figure(go.Scatter(y=cum_strat, fill='tozeroy', line=dict(color='#00d1b2'))).update_layout(template="plotly_dark"))

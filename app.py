@@ -1,9 +1,10 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
+import yfinance as yf
 import pandas_market_calendars as mcal
-import os
 from datetime import datetime, timedelta
+import pytz
 import tensorflow as tf
 from tensorflow.keras.models import Model
 from tensorflow.keras.layers import (
@@ -13,10 +14,9 @@ from tensorflow.keras.layers import (
 from sklearn.preprocessing import MinMaxScaler
 from datasets import load_dataset
 import plotly.graph_objects as go
-import plotly.express as px
 
 # ------------------------------
-# 1. NYSE CALENDAR & UTILS
+# 1. UTILS & SYNC LOGIC
 # ------------------------------
 def get_next_open_date():
     nyse = mcal.get_calendar('NYSE')
@@ -24,28 +24,39 @@ def get_next_open_date():
     if schedule.empty: return "TBD"
     return schedule.iloc[0].market_open.strftime('%b %d, %Y')
 
+def check_sync_status():
+    """Checks if we are past 6:00 PM EST for the daily incremental update."""
+    est = pytz.timezone('US/Eastern')
+    now_est = datetime.now(est)
+    # Returns a unique key for caching based on the date and sync hour
+    if now_est.hour >= 18:
+        return f"sync_{now_est.strftime('%Y-%m-%d')}_post6pm"
+    return f"sync_{now_est.strftime('%Y-%m-%d')}_pre6pm"
+
 # ------------------------------
 # 2. UI CONFIGURATION
 # ------------------------------
-st.set_page_config(page_title="P2-Transformer Pro", layout="wide")
+st.set_page_config(page_title="P2-Transformer Alpha", layout="wide")
 
 with st.sidebar:
     st.header("Model Configuration")
     start_year = st.slider("Training Start Year", 2008, 2025, 2016)
     fee_bps = st.slider("Transaction Cost (bps)", 0, 100, 15)
     epochs = st.number_input("Training Epoch_Count", 5, 200, 50)
+    st.info(f"Data Sync: {check_sync_status()}")
     st.markdown("---")
     run_button = st.button("Execute Transformer Alpha", type="primary")
 
 st.title("P2-TRANSFORMER-ETF-PREDICTOR")
 
 # ------------------------------
-# 3. DATA ENGINE
+# 3. DATA ENGINE (FRED + YF + HF)
 # ------------------------------
 REPO_ID = "P2SAMAPA/my-etf-data"
 fee_pct = fee_bps / 10000
 
-def get_data():
+@st.cache_data(ttl=3600) # Re-check sync every hour
+def get_data(sync_key):
     try:
         ds = load_dataset(REPO_ID, split="train").to_pandas()
     except Exception as e:
@@ -57,19 +68,47 @@ def get_data():
     ds = ds.set_index(date_col).sort_index()
     
     df = ds[ds.index.year >= start_year].copy()
+    
+    # --- ADD EXTERNAL MACRO SIGNALS ---
+    # Tickers for FRED via YFinance (mirrored), MOVE, and SKEW
+    ext_tickers = {
+        "^MOVE": "MOVE", 
+        "^SKEW": "SKEW",
+        "T10Y2Y": "T10Y2Y", 
+        "T10Y3M": "T10Y3M",
+        "BAMLH0A0HYM2": "HY_Spread" # High Yield Option-Adjusted Spread
+    }
+    
+    try:
+        ext_data = yf.download(list(ext_tickers.keys()), start=df.index.min(), progress=False)['Close']
+        ext_data = ext_data.rename(columns=ext_tickers)
+        ext_data.index = ext_data.index.tz_localize(None)
+        df = df.join(ext_data, how='left')
+    except:
+        st.warning("External signal fetch (MOVE/FRED) failed. Using HF core only.")
+
+    # 1. Z-SCORE FEATURE ENGINEERING (Idea #1)
+    # Calculates relative deviation to help Transformer see "extremes"
+    features_to_z = [c for c in df.columns if '_Ret' not in c and c != 'SOFR']
+    for col in features_to_z:
+        rolling_mean = df[col].rolling(window=20).mean()
+        rolling_std = df[col].rolling(window=20).std()
+        df[f"{col}_Z"] = (df[col] - rolling_mean) / (rolling_std + 1e-9)
+
     return df.ffill().bfill().dropna()
 
 # ------------------------------
 # 4. OPTIMIZATION RUNTIME
 # ------------------------------
 if run_button:
-    df = get_data()
+    df = get_data(check_sync_status())
     
     if df.empty:
-        st.error(f"Error: No data available for {start_year}.")
+        st.error("Error: Dataset empty after merging signals.")
     else:
         target_etfs = ['TLT_Ret', 'TBT_Ret', 'VNQ_Ret', 'SLV_Ret', 'GLD_Ret']
         target_etfs = [t for t in target_etfs if t in df.columns]
+        # Include Z-scored features in input
         input_features = [c for c in df.columns if c not in target_etfs and c != 'SOFR']
         
         scaler = MinMaxScaler()
@@ -77,10 +116,10 @@ if run_button:
         
         lookbacks = [30, 45, 60] if len(df) > 200 else [10, 20]
         holdings = [1, 3, 5]
-        best_conviction = -np.inf
+        best_conviction_score = -np.inf
         final_res = None
 
-        with st.spinner(f"Training on signals..."):
+        with st.spinner("Training Transformer with Z-Score Signals..."):
             split_idx = int(len(scaled_input) * 0.8)
             
             for lb in lookbacks:
@@ -96,7 +135,7 @@ if run_button:
 
                 if len(train_X) < 10: continue
 
-                # Transformer Architecture
+                # Model Architecture
                 inputs = Input(shape=(X.shape[1], X.shape[2]))
                 attn_output, attn_weights = MultiHeadAttention(num_heads=4, key_dim=X.shape[2])(inputs, inputs, return_attention_scores=True)
                 attn_res = LayerNormalization()(attn_output + inputs)
@@ -109,37 +148,44 @@ if run_button:
                 
                 model = Model(inputs, outputs)
                 weight_model = Model(inputs, attn_weights)
-                
                 model.compile(optimizer='adam', loss='mse')
                 model.fit(train_X, train_y, epochs=int(epochs), batch_size=32, verbose=0)
                 preds = model.predict(test_X)
                 
+                # 2. CONVICTION THRESHOLD (Idea #2)
                 for hold in holdings:
                     daily_strat_rets = []
                     sofr_series = df['SOFR'] if 'SOFR' in df.columns else pd.Series(0.04, index=df.index)
                     
                     for i in range(len(preds)):
                         idx = np.argmax(preds[i])
+                        # Sort to find the second best prediction
+                        sorted_p = np.sort(preds[i])
+                        next_best = sorted_p[-2] if len(sorted_p) > 1 else 0
+                        
                         daily_rf = sofr_series.iloc[split_idx + i] / 252
-                        if preds[i][idx] > (fee_pct + daily_rf):
+                        hurdle = daily_rf + fee_pct
+                        
+                        # Logic: Must beat second best by 20% (1.2x) AND clear the fee hurdle
+                        if preds[i][idx] > (next_best * 1.2) and preds[i][idx] > hurdle:
                             daily_strat_rets.append(test_y[i][idx] - (fee_pct if i % hold == 0 else 0))
                         else:
-                            daily_strat_rets.append(daily_rf)
+                            daily_strat_rets.append(daily_rf) # Stay in Cash
                     
                     score = np.mean(daily_strat_rets)
-                    if score > best_conviction:
-                        best_conviction = score
+                    if score > best_conviction_score:
+                        best_conviction_score = score
                         final_res = {
                             "lb": lb, "hold": hold, "preds": preds, 
                             "test_y": test_y, "dates": df.index[split_idx:],
-                            "model": model, "weight_model": weight_model,
-                            "strat_rets": daily_strat_rets, "sofr": sofr_series.iloc[split_idx:].values,
+                            "model": model, "strat_rets": daily_strat_rets, 
+                            "sofr": sofr_series.iloc[split_idx:].values,
                             "last_x": X[-1:], "input_features": input_features,
                             "target_names": target_etfs
                         }
 
         # ------------------------------
-        # 5. UI: OUTPUT RENDER
+        # 5. UI: REFINED OUTPUT
         # ------------------------------
         if final_res:
             res = final_res
@@ -152,74 +198,59 @@ if run_button:
             st.markdown("### Performance Scorecard")
             k1, k2, k3, k4, k5 = st.columns(5)
             
+            # Predict Next Move
             p_now = res["model"].predict(res["last_x"])[0]
             best_idx = np.argmax(p_now)
-            curr_sofr = res["sofr"][-1]
-            final_asset = res["target_names"][best_idx].split('_')[0] if p_now[best_idx] > ((curr_sofr/252) + fee_pct) else "CASH (SOFR)"
+            sorted_now = np.sort(p_now)
+            curr_hurdle = (res["sofr"][-1]/252) + fee_pct
+            
+            if p_now[best_idx] > (sorted_now[-2] * 1.2) and p_now[best_idx] > curr_hurdle:
+                final_asset = res["target_names"][best_idx].split('_')[0]
+            else:
+                final_asset = "CASH (SOFR)"
             
             k1.metric("Predicted Asset", final_asset, f"Next Open: {get_next_open_date()}")
             k2.metric("Annualized Return", f"{ann_ret*100:.2f}%", f"{oos_yrs:.2f} OOS Years")
             k3.metric("Sharpe Ratio", f"{sharpe:.2f}", "SOFR Adjusted")
-            k4.metric("Hit Ratio (15d)", f"{(np.sum(strat_rets[-15:] > 0)/15)*100:.1f}%", f"Search: {res['lb']}L|{res['hold']}H")
+            k4.metric("Hit Ratio (15d)", f"{(np.sum(strat_rets[-15:] > 0)/15)*100:.1f}%", f"Lookback: {res['lb']}d")
             k5.metric("Max Daily Stress", f"{np.min(strat_rets)*100:.2f}%", "Worst Day")
 
-            st.markdown(f"### OOS Equity Curve")
+            st.markdown("### OOS Equity Curve")
             fig = go.Figure()
             fig.add_trace(go.Scatter(x=res["dates"][:len(cum_strat)], y=cum_strat, fill='tozeroy', line=dict(color='#00d1b2', width=1.5)))
             fig.update_layout(template="plotly_dark", height=400, margin=dict(l=0,r=0,b=0,t=20))
             st.plotly_chart(fig, use_container_width=True)
 
-            # Signal Contribution
-            st.markdown("---")
+            # Signal Importance (Progress Bars)
             st.markdown("### Signal Contribution Analysis")
+            # Simple Importance Estimate (Model Weights Mean)
+            weights = np.abs(res["model"].layers[-2].get_weights()[0]).mean(axis=1)
+            # Match weights to input features
+            weights = weights[:len(res["input_features"])]
+            norm_w = (weights - weights.min()) / (weights.max() - weights.min() + 1e-9)
             
-            raw_weights = res["weight_model"].predict(res["last_x"]) 
-            importance = np.mean(raw_weights, axis=(0, 1, 2))
-            importance = np.atleast_1d(importance)
-            
-            if len(importance) < len(res["input_features"]):
-                 importance = np.pad(importance, (0, len(res["input_features"]) - len(importance)))
-            else:
-                 importance = importance[:len(res["input_features"])]
+            feat_imp = pd.DataFrame({'Signal': res["input_features"], 'Weight': norm_w}).sort_values('Weight', ascending=False)
+            st.dataframe(
+                feat_imp.head(15),
+                column_config={"Weight": st.column_config.ProgressColumn("Relative Power", min_value=0, max_value=1, format="%.2f")},
+                hide_index=True, use_container_width=True
+            )
 
-            norm_importance = (importance - np.min(importance)) / (np.max(importance) - np.min(importance) + 1e-9)
-            feat_imp = pd.DataFrame({'Signal': res["input_features"], 'Weight': norm_importance}).sort_values('Weight', ascending=False)
-            
-            col_a, col_b = st.columns([1, 2])
-            with col_a:
-                st.write("Predictive Power Ranking")
-                st.dataframe(
-                    feat_imp,
-                    column_config={
-                        "Weight": st.column_config.ProgressColumn(
-                            "Relative Power",
-                            help="Transformer Attention Weight",
-                            format="%.2f",
-                            min_value=0,
-                            max_value=1,
-                        )
-                    },
-                    hide_index=True,
-                    use_container_width=True
-                )
-            with col_b:
-                st.write("Temporal Attention Heatmap (Head 0)")
-                fig_heat = px.imshow(raw_weights[0, 0], labels=dict(x="Steps", y="Feature", color="Weight"), color_continuous_scale="Viridis")
-                fig_heat.update_layout(height=350, template="plotly_dark", margin=dict(l=0,r=0,b=0,t=0))
-                st.plotly_chart(fig_heat, use_container_width=True)
-
-            # Audit Table
+            # 15-Day Audit (NO SOFR COLUMN)
             st.markdown("### 15-Day Performance Audit Trail")
             audit = []
             display_days = min(15, len(res["preds"]))
             for i in range(1, display_days + 1):
-                idx = np.argmax(res["preds"][-i])
+                p = res["preds"][-i]
+                idx = np.argmax(p)
+                sorted_p = np.sort(p)
                 rf_daily = res["sofr"][-i]/252
-                is_cash = res["preds"][-i][idx] <= (rf_daily + fee_pct)
+                # Apply Conviction Check
+                is_cash = not (p[idx] > (sorted_p[-2] * 1.2) and p[idx] > (rf_daily + fee_pct))
+                
                 audit.append({
                     "Date": res["dates"][-i].strftime('%Y-%m-%d'),
                     "Predicted": "CASH" if is_cash else res["target_names"][idx].split('_')[0],
-                    "SOFR (Ann)": f"{res['sofr'][-i]*100:.2f}%",
                     "Realized Daily Return": res["strat_rets"][-i]
                 })
             

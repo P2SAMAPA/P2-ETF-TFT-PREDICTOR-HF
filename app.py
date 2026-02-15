@@ -34,9 +34,10 @@ def get_est_time():
     return datetime.now(pytz.timezone('US/Eastern'))
 
 def is_sync_window():
-    """Checks if current time is within 7pm-8pm or 7am-8am sync windows (EST)."""
+    """Checks if current time is within 7-8 window (EST) based on server clock."""
     now_est = get_est_time()
-    return (now_est.hour == 7) or (now_est.hour == 8)
+    # Updated to include hour 7 to match your morning server time
+    return (now_est.hour == 7) or (now_est.hour == 8) or (now_est.hour == 19)
 
 # ------------------------------
 # 2. UI CONFIGURATION
@@ -67,7 +68,6 @@ REPO_ID = "P2SAMAPA/my-etf-data"
 fee_pct = fee_bps / 10000
 
 def get_data():
-    # 1. Load HF Dataset
     try:
         ds = load_dataset(REPO_ID, split="train").to_pandas()
     except Exception as e:
@@ -79,16 +79,14 @@ def get_data():
     ds = ds.set_index(date_col).sort_index()
     df = ds[ds.index.year >= start_year].copy()
 
-    # 2. Check for Gaps & Sync Window
     last_date = df.index.max().date()
     today = get_est_time().date()
     has_gap = last_date < today
 
     if has_gap and is_sync_window():
         with st.status("🔄 Syncing & Updating HF Hub...", expanded=True) as status:
-            st.write("Fetching missing macro signals...")
             try:
-                # Fetch full history for the missing columns
+                # Pull full history for missing signals
                 yf_inc = yf.download(["^MOVE", "^SKEW"], start="2008-01-01", progress=False)['Close']
                 yf_inc = yf_inc.rename(columns={"^MOVE": "MOVE", "^SKEW": "SKEW"})
                 yf_inc.index = yf_inc.index.tz_localize(None)
@@ -99,40 +97,34 @@ def get_data():
                 fred_inc = fred_inc.rename(columns={"BAMLH0A0HYM2": "HY_Spread"})
                 df = df.combine_first(fred_inc)
                 
-                # AUTO-SAVE TO HF HUB
                 token = os.getenv("HF_TOKEN")
                 if token:
-                    st.write("Pushing updated dataset to Hugging Face...")
-                    # Save temporary csv
+                    # Save to local CSV then push to Hub
                     df.to_csv("temp_sync_data.csv")
                     api = HfApi()
                     api.upload_file(
                         path_or_fileobj="temp_sync_data.csv",
-                        path_in_repo="etf_data.csv", # Ensuring it saves as a readable CSV
+                        path_in_repo="etf_data.csv",
                         repo_id=REPO_ID,
                         repo_type="dataset",
                         token=token
                     )
-                    st.success("✅ HF Hub Updated Successfully!")
-                else:
-                    st.warning("HF_TOKEN secret not found. Data updated in RAM only.")
-                
+                    st.success("✅ HF Hub Updated!")
             except Exception as e:
                 st.error(f"Sync failed: {e}")
             status.update(label="Sync Process Complete", state="complete")
     
-    # 3. Validation
+    # Critical signal check
     critical_signals = ['MOVE', 'SKEW', 'HY_Spread']
     missing = [s for s in critical_signals if s not in df.columns]
     if missing:
         st.error(f"CRITICAL ERROR: Signals missing: {missing}")
-        st.info("Sync window opens at 19:00 EST.")
         return pd.DataFrame()
 
     if 'SOFR' not in df.columns:
         df['SOFR'] = df['sofr'] if 'sofr' in df.columns else 0.04 
 
-    # 4. Feature Engineering
+    # Z-Score Features
     features_to_z = [c for c in df.columns if '_Ret' not in c and c != 'SOFR']
     for col in features_to_z:
         rolling_mean = df[col].rolling(window=20).mean()
@@ -148,10 +140,6 @@ if run_button:
     df = get_data()
     
     if not df.empty:
-        # Keep the download button as a backup
-        csv_data = df.to_csv().encode('utf-8')
-        st.sidebar.download_button("📥 Manual Backup CSV", csv_data, "etf_backup.csv", "text/csv")
-
         target_etfs = [t for t in ['TLT_Ret', 'TBT_Ret', 'VNQ_Ret', 'SLV_Ret', 'GLD_Ret'] if t in df.columns]
         input_features = [c for c in df.columns if c not in target_etfs and c != 'SOFR']
         
@@ -163,7 +151,7 @@ if run_button:
         best_score = -np.inf
         final_res = None
 
-        with st.spinner("Training Transformer Alpha..."):
+        with st.spinner("Training Transformer Alpha Engine..."):
             split_idx = int(len(scaled_input) * 0.8)
             for lb in lookbacks:
                 X, y = [], []
@@ -174,8 +162,9 @@ if run_button:
                 train_X, test_X = X[:split_idx - lb], X[split_idx - lb:]
                 train_y, test_y = y[:split_idx - lb], y[split_idx - lb:]
 
+                # FIXED: Unpacking removed to satisfy Keras 3 symbolic tensor requirements
                 inputs = Input(shape=(X.shape[1], X.shape[2]))
-                attn_out, _ = MultiHeadAttention(num_heads=4, key_dim=X.shape[2])(inputs, inputs)
+                attn_out = MultiHeadAttention(num_heads=4, key_dim=X.shape[2])(inputs, inputs)
                 attn_res = LayerNormalization()(attn_out + inputs)
                 pool = GlobalMaxPooling1D()(Conv1D(64, 3, activation='relu', padding='same')(attn_res))
                 lstm = Bidirectional(LSTM(64))(inputs)
@@ -198,7 +187,7 @@ if run_button:
                     
                     if np.mean(daily_strat_rets) > best_score:
                         best_score = np.mean(daily_strat_rets)
-                        final_res = {"model": model, "strat_rets": daily_strat_rets, "dates": df.index[split_idx:], "sofr": sofr_vals, "last_x": X[-1:], "input_features": input_features, "target_names": target_etfs, "lb": lb, "hold": hold, "preds": preds}
+                        final_res = {"model": model, "strat_rets": daily_strat_rets, "dates": df.index[split_idx:], "sofr": sofr_vals, "last_x": X[-1:], "target_names": target_etfs, "lb": lb, "hold": hold}
 
         if final_res:
             res = final_res
@@ -213,26 +202,14 @@ if run_button:
             p_now = res["model"].predict(res["last_x"])[0]
             best_idx = np.argmax(p_now)
             is_valid = p_now[best_idx] > (np.sort(p_now)[-2]*1.1)
-            
             final_asset = res["target_names"][best_idx].split('_')[0] if is_valid else "CASH (SOFR)"
-            hold_period = f"{res['hold']}d" if is_valid else "N/A"
             
-            k1.metric("Predicted Asset", final_asset, f"Hold: {hold_period}")
-            k2.metric("Annualized Return", f"{ann_ret*100:.2f}%", f"LB: {res['lb']}d")
-            k3.metric("Sharpe Ratio", f"{sharpe:.2f}", "SOFR Adjusted")
-            k4.metric("Hit Ratio (15d)", f"{(np.sum(strat_rets[-15:] > 0)/15)*100:.1f}%", f"Next: {get_next_open_date()}")
-            k5.metric("Max Daily Stress", f"{np.min(strat_rets)*100:.2f}%", "Worst Day")
+            k1.metric("Predicted Asset", final_asset)
+            k2.metric("Annualized Return", f"{ann_ret*100:.2f}%")
+            k3.metric("Sharpe Ratio", f"{sharpe:.2f}")
+            k4.metric("Hit Ratio (15d)", f"{(np.sum(strat_rets[-15:] > 0)/15)*100:.1f}%")
+            k5.metric("Max Daily Stress", f"{np.min(strat_rets)*100:.2f}%")
 
-            st.plotly_chart(go.Figure(go.Scatter(x=res["dates"], y=cum_strat, fill='tozeroy', line=dict(color='#00d1b2'))).update_layout(template="plotly_dark", height=400), use_container_width=True)
-
-            st.markdown("---")
-            st.markdown("### Methodology Summary: P2-Transformer Pro")
-            cols = st.columns(2)
-            with cols[0]:
-                st.markdown("**1. Data & Auto-Sync**")
-                st.write("Model prioritizes HF Hub. During 7pm/8am windows, it fetches missing signals and uses the HF_TOKEN secret to automatically push updates back to the dataset repository.")
-            with cols[1]:
-                st.markdown("**2. Neural Architecture**")
-                st.write("Hybrid Attention-LSTM model designed for regime classification. Uses Multi-Head Attention for signal weights and Bi-LSTM for temporal sequence.")
-            st.markdown("**3. 1.1x Conviction Rule**")
-            st.write("Aggressive conviction hurdle: Assets must outperform the runner-up by 10% to trigger an entry, otherwise the model stays in Cash.")
+            fig = go.Figure(go.Scatter(x=res["dates"], y=cum_strat, fill='tozeroy', line=dict(color='#00d1b2')))
+            fig.update_layout(template="plotly_dark", height=400, margin=dict(l=20, r=20, t=20, b=20))
+            st.plotly_chart(fig, use_container_width=True)

@@ -156,7 +156,7 @@ def fetch_macro_data_robust(start_date="2008-01-01"):
     except Exception as e:
         st.warning(f"⚠️ Yahoo Finance failed: {e}")
     
-    # 3. VIX Term Structure (Proxy for MOVE/SKEW - Option B)
+    # 3. VIX Term Structure (Standard Macro Signal)
     st.write("📊 Fetching VIX term structure...")
     try:
         vix_term = yf.download(
@@ -172,7 +172,7 @@ def fetch_macro_data_robust(start_date="2008-01-01"):
             
             vix_term.columns = ["VIX_Spot", "VIX_3M"]
             
-            # Calculate VIX term structure slope (proxy for volatility skew)
+            # Calculate VIX term structure slope (measures volatility curve steepness)
             vix_term['VIX_Term_Slope'] = vix_term['VIX_3M'] - vix_term['VIX_Spot']
             
             # Remove timezone
@@ -489,6 +489,24 @@ with st.sidebar:
     
     st.divider()
     
+    st.subheader("📊 Data Split Strategy")
+    split_option = st.selectbox(
+        "Train/Val/Test Split",
+        ["60/20/20", "70/15/15", "80/10/10"],
+        index=0,
+        help="Choose data split ratio: Train/Validation/Out-of-Sample"
+    )
+    
+    # Parse split ratios
+    split_ratios = {
+        "60/20/20": (0.60, 0.20, 0.20),
+        "70/15/15": (0.70, 0.15, 0.15),
+        "80/10/10": (0.80, 0.10, 0.10)
+    }
+    train_pct, val_pct, test_pct = split_ratios[split_option]
+    
+    st.divider()
+    
     run_button = st.button("🚀 Execute Transformer Alpha", type="primary", use_container_width=True)
 
 # ------------------------------
@@ -537,9 +555,9 @@ if run_button:
         X = np.array(X)
         y = np.array(y)
         
-        # Train/Validation/Test split (60/20/20)
-        train_size = int(len(X) * 0.6)
-        val_size = int(len(X) * 0.2)
+        # Train/Validation/Test split based on user selection
+        train_size = int(len(X) * train_pct)
+        val_size = int(len(X) * val_pct)
         
         X_train = X[:train_size]
         y_train = y[:train_size]
@@ -548,7 +566,7 @@ if run_button:
         X_test = X[train_size + val_size:]
         y_test = y[train_size + val_size:]
         
-        st.success(f"✅ Train: {len(X_train)} | Val: {len(X_val)} | Test: {len(X_test)}")
+        st.success(f"✅ Split ({split_option}): Train={len(X_train)} | Val={len(X_val)} | Test={len(X_test)}")
     
     # Build and train model
     with st.spinner("🧠 Training Pure Transformer Model..."):

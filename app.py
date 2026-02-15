@@ -32,10 +32,10 @@ def get_est_time():
     return datetime.now(pytz.timezone('US/Eastern'))
 
 def is_sync_window():
-    """Checks if current time is within 7pm-8pm or 7am-8am sync windows (EST)."""
+    """Checks if current time is within 7pm-8pm or 8am-9am sync windows (EST)."""
     now_est = get_est_time()
-    # 19 is 7 PM EST, 7 is 7 AM EST
-    return (now_est.hour == 19) or (now_est.hour == 7)
+    # 19 is 7 PM EST, 8 is 8 AM EST
+    return (now_est.hour == 19) or (now_est.hour == 8)
 
 # ------------------------------
 # 2. UI CONFIGURATION
@@ -91,18 +91,18 @@ def get_data():
 
     if has_gap and is_sync_window():
         st.write(f"🔄 Syncing Gap: {last_date} to {today}...")
-        # Yahoo Finance Gap Fill
+        # Yahoo Finance Gap Fill (Full History for missing columns)
         try:
-            yf_inc = yf.download(["^MOVE", "^SKEW"], start=last_date, progress=False)['Close']
+            yf_inc = yf.download(["^MOVE", "^SKEW"], start="2008-01-01", progress=False)['Close']
             yf_inc = yf_inc.rename(columns={"^MOVE": "MOVE", "^SKEW": "SKEW"})
             yf_inc.index = yf_inc.index.tz_localize(None)
             df = df.combine_first(yf_inc)
         except: pass
 
-        # FRED Gap Fill
+        # FRED Gap Fill (Full History for missing columns)
         try:
             fred_syms = ["T10Y2Y", "T10Y3M", "BAMLH0A0HYM2"]
-            fred_inc = web.DataReader(fred_syms, "fred", last_date, datetime.now())
+            fred_inc = web.DataReader(fred_syms, "fred", "2008-01-01", datetime.now())
             fred_inc = fred_inc.rename(columns={"BAMLH0A0HYM2": "HY_Spread"})
             df = df.combine_first(fred_inc)
         except: pass
@@ -135,6 +135,16 @@ if run_button:
     df = get_data()
     
     if not df.empty:
+        # DATA RECOVERY DOWNLOAD BUTTON (Sidebar)
+        csv = df.to_csv().encode('utf-8')
+        st.sidebar.download_button(
+            label="📥 Download Master Dataset",
+            data=csv,
+            file_name=f"etf_master_update_{datetime.now().strftime('%Y%m%d')}.csv",
+            mime="text/csv",
+            help="Click this after a 7PM sync to save the merged data."
+        )
+
         target_etfs = [t for t in ['TLT_Ret', 'TBT_Ret', 'VNQ_Ret', 'SLV_Ret', 'GLD_Ret'] if t in df.columns]
         input_features = [c for c in df.columns if c not in target_etfs and c != 'SOFR']
         
@@ -213,7 +223,7 @@ if run_button:
             cols = st.columns(2)
             with cols[0]:
                 st.markdown("**1. Data & Incremental Sync**")
-                st.write("The engine prioritizes the HF Dataset. External calls (YF/FRED) are only triggered during 8pm/8am EST sync windows if a data gap is detected. All macro signals are transformed into rolling Z-scores for regime detection.")
+                st.write("The engine prioritizes the HF Dataset. External calls (YF/FRED) are only triggered during 7pm/8am EST sync windows if a data gap is detected. All macro signals are transformed into rolling Z-scores for regime detection.")
             with cols[1]:
                 st.markdown("**2. Transformer-LSTM Architecture**")
                 st.write("A hybrid neural network: Multi-Head Attention layers isolate global correlations between macro signals and ETF returns, while Bidirectional LSTMs process the local sequential trend.")

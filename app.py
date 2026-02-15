@@ -28,12 +28,14 @@ def get_next_open_date():
     if schedule.empty: return "TBD"
     return schedule.iloc[0].market_open.strftime('%b %d, %Y')
 
+def get_est_time():
+    return datetime.now(pytz.timezone('US/Eastern'))
+
 def is_sync_window():
-    """Checks if current time is within the 7pm-8pm or 7am-8am sync windows (EST)."""
-    est = pytz.timezone('US/Eastern')
-    now_est = datetime.now(est)
-    # 7 PM Evening Window or 7 AM Morning Fallback
-    return (now_est.hour == 19) or (now_est.hour == 7)
+    """Checks if current time is within 7pm-8pm or 8am-9am sync windows (EST)."""
+    now_est = get_est_time()
+    # 19 is 7 PM EST, 8 is 8 AM EST
+    return (now_est.hour == 19) or (now_est.hour == 8)
 
 # ------------------------------
 # 2. UI CONFIGURATION
@@ -42,13 +44,21 @@ st.set_page_config(page_title="P2-Transformer Pro", layout="wide")
 
 with st.sidebar:
     st.header("Model Configuration")
+    
+    # Time Display to help track sync window
+    est_now = get_est_time()
+    st.write(f"🕒 **Server Time (EST):** {est_now.strftime('%H:%M:%S')}")
+    
     start_year = st.slider("Training Start Year", 2008, 2025, 2016)
     fee_bps = st.slider("Transaction Cost (bps)", 0, 100, 15)
     epochs = st.number_input("Training Epoch_Count", 5, 500, 50)
     
     # Dynamic Sync Status Display
-    sync_status = "ACTIVE 🟢 (External Sync Allowed)" if is_sync_window() else "IDLE ⚪ (HF Cache Only)"
+    sync_status = "ACTIVE 🟢" if is_sync_window() else "IDLE ⚪ (HF Cache Only)"
     st.info(f"Sync Engine: {sync_status}")
+    if not is_sync_window():
+        st.caption("Sync opens at 08:00 and 19:00 EST")
+    
     st.markdown("---")
     run_button = st.button("Execute Transformer Alpha", type="primary")
 
@@ -76,7 +86,7 @@ def get_data():
 
     # 2. Check for Gaps & Sync Window
     last_date = df.index.max().date()
-    today = datetime.now().date()
+    today = get_est_time().date()
     has_gap = last_date < today
 
     if has_gap and is_sync_window():
@@ -102,6 +112,7 @@ def get_data():
     missing = [s for s in critical_signals if s not in df.columns]
     if missing:
         st.error(f"CRITICAL ERROR: The following signals are missing from your HF dataset: {missing}")
+        st.warning("Note: External sync is only allowed between 08:00-09:00 and 19:00-20:00 EST.")
         return pd.DataFrame()
 
     # 4. SOFR / Risk-Free Logic
@@ -163,7 +174,6 @@ if run_button:
                     for i in range(len(preds)):
                         idx = np.argmax(preds[i])
                         sorted_p = np.sort(preds[i])
-                        # Aggressive 1.1x Conviction Rule
                         if preds[i][idx] > (sorted_p[-2] * 1.1) and preds[i][idx] > (sofr_vals[i]/252 + fee_pct):
                             daily_strat_rets.append(test_y[i][idx] - (fee_pct if i % hold == 0 else 0))
                         else:
@@ -198,15 +208,6 @@ if run_button:
 
             st.plotly_chart(go.Figure(go.Scatter(x=res["dates"], y=cum_strat, fill='tozeroy', line=dict(color='#00d1b2'))).update_layout(template="plotly_dark", height=400), use_container_width=True)
 
-            st.markdown("### 15-Day Performance Audit Trail")
-            audit = []
-            for i in range(1, 16):
-                p = res["preds"][-i]
-                is_cash = not (p[np.argmax(p)] > (np.sort(p)[-2] * 1.1))
-                audit.append({"Date": res["dates"][-i].strftime('%Y-%m-%d'), "Predicted": "CASH" if is_cash else res["target_names"][np.argmax(p)].split('_')[0], "Realized Daily Return": res["strat_rets"][-i]})
-            st.table(pd.DataFrame(audit).style.format({"Realized Daily Return": "{:.4%}"}))
-
-            # --- METHODOLOGY SUMMARY ---
             st.markdown("---")
             st.markdown("### Methodology Summary: P2-Transformer Pro")
             cols = st.columns(2)

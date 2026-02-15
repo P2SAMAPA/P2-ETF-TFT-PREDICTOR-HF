@@ -22,10 +22,8 @@ import plotly.graph_objects as go
 def get_next_open_date():
     nyse = mcal.get_calendar('NYSE')
     schedule = nyse.schedule(start_date=datetime.now(), end_date=datetime.now() + timedelta(days=10))
-    if schedule.empty:
-        return "TBD"
-    next_open = schedule.iloc[0].market_open
-    return next_open.strftime('%b %d, %Y')
+    if schedule.empty: return "TBD"
+    return schedule.iloc[0].market_open.strftime('%b %d, %Y')
 
 # ------------------------------
 # 2. UI CONFIGURATION
@@ -55,27 +53,26 @@ def get_data():
     ds['Date'] = pd.to_datetime(ds['Date'])
     ds = ds.set_index('Date').sort_index()
     
-    # TRUNCATION FIX: Filter by year FIRST before joining/splitting
-    ds = ds[ds.index.year >= start_year]
+    # TRUNCATION: Filter by start year
+    df = ds[ds.index.year >= start_year].copy()
     
+    # Fresh Macro
     tickers = {"^VIX": "VIX", "^TNX": "TNX", "DX-Y.NYB": "DXY", "GC=F": "GOLD", "HG=F": "COPPER"}
-    macro = yf.download(list(tickers.keys()), start=ds.index.min(), progress=False)['Close']
+    macro = yf.download(list(tickers.keys()), start=df.index.min(), progress=False)['Close']
     macro = macro.rename(columns=tickers)
     
-    # Resolve Overlap
-    cols_to_drop = [c for c in macro.columns if c in ds.columns]
-    ds_cleaned = ds.drop(columns=cols_to_drop)
+    # Merge & Clean
+    cols_to_drop = [c for c in macro.columns if c in df.columns]
+    df = df.drop(columns=cols_to_drop).join(macro, how='left').ffill().dropna()
     
-    full_df = ds_cleaned.join(macro, how='left').ffill().dropna()
-    
-    # Fetch SOFR (Risk Free) - fallback to 3.65% if live fetch fails
+    # SOFR (Risk Free Rate)
     try:
-        sofr_data = yf.download("^IRX", start=ds.index.min(), progress=False)['Close'] / 100
-        full_df['SOFR'] = sofr_data.reindex(full_df.index).ffill().fillna(0.0365)
+        sofr = yf.download("^IRX", start=df.index.min(), progress=False)['Close'] / 100
+        df['SOFR'] = sofr.reindex(df.index).ffill().fillna(0.04)
     except:
-        full_df['SOFR'] = 0.0365
+        df['SOFR'] = 0.04
         
-    return full_df
+    return df
 
 # ------------------------------
 # 4. OPTIMIZATION RUNTIME
@@ -87,26 +84,31 @@ if run_button:
     scaler = MinMaxScaler()
     scaled = scaler.fit_transform(df)
     
+    # Search Params
     lookbacks = [30, 45, 60]
     holdings = [1, 3, 5]
     
-    best_overall_conviction = -np.inf
-    final_results = None
+    best_conviction = -np.inf
+    final_res = None
 
-    with st.spinner("Analyzing Temporal Scales..."):
-        # 80/20 split on the truncated data
+    with st.spinner("Processing Signal Pattern Search..."):
+        # Split 80/20 on the truncated time-series
         split_idx = int(len(scaled) * 0.8)
         
         for lb in lookbacks:
             X, y = [], []
-            for i in range(lb, len(scaled) - 5): 
+            for i in range(lb, len(scaled)):
                 X.append(scaled[i-lb:i])
                 y.append(df[target_etfs].iloc[i].values)
             
             X, y = np.array(X), np.array(y)
-            X_train, X_test = X[:split_idx-lb], X[split_idx-lb:]
-            y_train, y_test = y[:split_idx-lb], y[split_idx-lb:]
+            # Align indices for split
+            train_X = X[:split_idx - lb]
+            test_X = X[split_idx - lb:]
+            train_y = y[:split_idx - lb]
+            test_y = y[split_idx - lb:]
 
+            # Architecture
             inputs = Input(shape=(X.shape[1], X.shape[2]))
             attn = MultiHeadAttention(num_heads=4, key_dim=X.shape[2])(inputs, inputs)
             attn = LayerNormalization()(attn + inputs)
@@ -119,85 +121,82 @@ if run_button:
             
             model = Model(inputs, outputs)
             model.compile(optimizer='adam', loss='mse')
-            model.fit(X_train, y_train, epochs=int(epochs), batch_size=32, verbose=0)
+            model.fit(train_X, train_y, epochs=int(epochs), batch_size=32, verbose=0)
             
-            preds = model.predict(X_test)
+            preds = model.predict(test_X)
             
             for hold in holdings:
-                hold_rets = []
-                for i in range(len(preds) - hold):
+                daily_strat_rets = []
+                for i in range(len(preds)):
                     idx = np.argmax(preds[i])
-                    # Logic: If max pred return < fee + SOFR hurdle, choose CASH
-                    daily_sofr = df['SOFR'].iloc[split_idx + i] / 360
+                    daily_sofr = df['SOFR'].iloc[split_idx + i] / 252 # Daily hurdle
                     
+                    # Selection Logic: Compare predicted potential vs hurdle
                     if preds[i][idx] > (fee_pct + daily_sofr):
-                        real_cum_ret = np.sum(y_test[i:i+hold, idx]) - fee_pct
+                        # REALIZED: Use actual 1-day return for that asset
+                        daily_strat_rets.append(test_y[i][idx] - (fee_pct if i % hold == 0 else 0))
                     else:
-                        # Earn SOFR interest, zero fee
-                        real_cum_ret = np.sum(df['SOFR'].iloc[split_idx+i : split_idx+i+hold].values / 360)
-                    
-                    hold_rets.append(real_cum_ret)
+                        # REALIZED: Use daily SOFR interest for CASH
+                        daily_strat_rets.append(daily_sofr)
                 
-                avg_conviction = np.mean(hold_rets)
-                if avg_conviction > best_overall_conviction:
-                    best_overall_conviction = avg_conviction
-                    final_results = {
+                score = np.mean(daily_strat_rets)
+                if score > best_conviction:
+                    best_conviction = score
+                    final_res = {
                         "lb": lb, "hold": hold, "preds": preds, 
-                        "y_test": y_test, "dates": df.index[split_idx:],
-                        "model": model, "strat_rets": hold_rets,
+                        "test_y": test_y, "dates": df.index[split_idx:],
+                        "model": model, "strat_rets": daily_strat_rets,
                         "sofr": df['SOFR'].iloc[split_idx:].values
                     }
 
     # ------------------------------
-    # 5. OUTPUT UI
+    # 5. OUTPUT DISPLAY
     # ------------------------------
-    res = final_results
+    res = final_res
     strat_rets = np.array(res["strat_rets"])
     cum_strat = np.cumprod(1 + strat_rets)
     
-    # Correct Year Calculation
-    oos_days = (res["dates"][-1] - res["dates"][0]).days
-    oos_years = oos_days / 365.25
-    ann_ret = (cum_strat[-1] ** (1/oos_years)) - 1 if oos_years > 0 else 0
-    
-    # Sharpe using dynamic SOFR
-    excess_rets = strat_rets - (res["sofr"][:len(strat_rets)] / 360)
-    sharpe = np.sqrt(252) * np.mean(excess_rets) / np.std(strat_rets) if np.std(strat_rets) != 0 else 0
+    # Calcs
+    oos_yrs = (res["dates"][-1] - res["dates"][0]).days / 365.25
+    ann_ret = (cum_strat[-1] ** (1/oos_yrs)) - 1 if oos_yrs > 0 else 0
+    sharpe = np.sqrt(252) * np.mean(strat_rets - (res["sofr"]/252)) / np.std(strat_rets)
     
     st.markdown("### Performance Scorecard")
-    kpi1, kpi2, kpi3, kpi4, kpi5 = st.columns(5)
+    k1, k2, k3, k4, k5 = st.columns(5)
     
-    with kpi1:
-        latest_pred = res["model"].predict(scaled[-res["lb"]:].reshape(1, res["lb"], -1))[0]
-        top_idx = np.argmax(latest_pred)
-        daily_sofr_now = df['SOFR'].iloc[-1] / 360
-        top_asset = target_etfs[top_idx].split('_')[0] if latest_pred[top_idx] > (fee_pct + daily_sofr_now) else "CASH (SOFR)"
-        st.metric("Predicted Asset", top_asset, f"Next Open: {get_next_open_date()}")
+    # Real-time Prediction
+    latest_feat = scaled[-res["lb"]:].reshape(1, res["lb"], -1)
+    p_now = res["model"].predict(latest_feat)[0]
+    best_idx = np.argmax(p_now)
+    current_hurdle = (df['SOFR'].iloc[-1]/252) + fee_pct
+    final_asset = target_etfs[best_idx].split('_')[0] if p_now[best_idx] > current_hurdle else "CASH (SOFR)"
     
-    kpi2.metric("Annualized Return", f"{ann_ret*100:.2f}%", f"{oos_years:.2f} OOS Years")
-    kpi3.metric("Sharpe Ratio", f"{sharpe:.2f}", "Dynamic SOFR Adj")
-    kpi4.metric("Hit Ratio (15d)", f"{(np.sum(strat_rets[-15:] > 0)/15)*100:.1f}%", f"Hold: {res['hold']}D")
-    kpi5.metric("Max Daily Stress", f"{np.min(strat_rets)*100:.2f}%", "Worst Day")
+    k1.metric("Predicted Asset", final_asset, f"Next Open: {get_next_open_date()}")
+    k2.metric("Annualized Return", f"{ann_ret*100:.2f}%", f"{oos_yrs:.2f} OOS Years")
+    k3.metric("Sharpe Ratio", f"{sharpe:.2f}", "SOFR Adjusted")
+    k4.metric("Hit Ratio (15d)", f"{(np.sum(strat_rets[-15:] > 0)/15)*100:.1f}%", f"Search: {res['lb']}L|{res['hold']}H")
+    k5.metric("Max Daily Stress", f"{np.min(strat_rets)*100:.2f}%", "Worst Daily Move")
 
     st.markdown(f"### OOS Equity Curve ({res['lb']}d Lookback | {res['hold']}d Holding)")
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=res["dates"][:len(cum_strat)], y=cum_strat, fill='tozeroy', line=dict(color='#00d1b2')))
+    fig.add_trace(go.Scatter(x=res["dates"], y=cum_strat, fill='tozeroy', line=dict(color='#00d1b2', width=1.5)))
     fig.update_layout(template="plotly_dark", height=400, margin=dict(l=0,r=0,b=0,t=20))
     st.plotly_chart(fig, use_container_width=True)
 
     st.markdown("### 15-Day Performance Audit Trail")
-    audit_list = []
+    audit = []
     for i in range(1, 16):
-        p_idx = np.argmax(res["preds"][-i])
-        daily_sofr_audit = res["sofr"][-i] / 360
-        is_cash = res["preds"][-i][p_idx] <= (fee_pct + daily_sofr_audit)
+        idx = np.argmax(res["preds"][-i])
+        daily_hurdle = res["sofr"][-i]/252
+        is_cash = res["preds"][-i][idx] <= (daily_hurdle + fee_pct)
         
-        audit_list.append({
+        audit.append({
             "Date": res["dates"][-i].strftime('%Y-%m-%d'),
-            "Predicted": "CASH" if is_cash else target_etfs[p_idx].split('_')[0],
+            "Predicted": "CASH" if is_cash else target_etfs[idx].split('_')[0],
             "SOFR (Ann)": f"{res['sofr'][-i]*100:.2f}%",
-            "Realized Return": res["strat_rets"][-i]
+            "Realized Daily Return": res["strat_rets"][-i]
         })
-    st.table(pd.DataFrame(audit_list).style.format({"Realized Return": "{:.4%}"}).applymap(
-        lambda x: 'color: green' if x > 0 else 'color: red', subset=['Realized Return']
+    
+    st.table(pd.DataFrame(audit).style.format({"Realized Daily Return": "{:.4%}"}).applymap(
+        lambda x: 'color: #00ff00' if x > 0 else 'color: #ff4b4b', subset=['Realized Daily Return']
     ))

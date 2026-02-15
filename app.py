@@ -8,16 +8,16 @@ try:
     import pandas_datareader.data as web
 except ImportError:
     st.error("Missing pandas_datareader. Please add it to requirements.txt")
+    st.stop()
 from datetime import datetime, timedelta
 import pytz
 import tensorflow as tf
 from tensorflow.keras.models import Model
-from tensorflow.keras.layers import (
-    Input, LSTM, Dense, Bidirectional, 
-    Conv1D, GlobalMaxPooling1D, Concatenate, MultiHeadAttention, LayerNormalization
-)
+from tensorflow.keras.layers import Input, Dense, Dropout, LayerNormalization, MultiHeadAttention, GlobalAveragePooling1D
+from tensorflow.keras.callbacks import EarlyStopping
 from sklearn.preprocessing import MinMaxScaler
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
 # ------------------------------
 # 1. CORE CONFIG & SYNC WINDOW
@@ -25,150 +25,802 @@ import plotly.graph_objects as go
 REPO_ID = "P2SAMAPA/my-etf-data"
 
 def get_est_time():
+    """Get current time in US Eastern timezone"""
     return datetime.now(pytz.timezone('US/Eastern'))
 
 def is_sync_window():
+    """Check if current time is within sync windows (7-8am or 7-8pm EST)"""
     now_est = get_est_time()
-    return (now_est.hour >= 7 and now_est.hour <= 9) or (now_est.hour >= 18 and now_est.hour <= 21)
+    return (7 <= now_est.hour < 8) or (19 <= now_est.hour < 20)
 
 st.set_page_config(page_title="P2-Transformer Pro", layout="wide")
 
 # ------------------------------
-# 2. DATA ENGINE (ALIGNED MACRO)
+# 2. POSITIONAL ENCODING LAYER
 # ------------------------------
-def get_data(start_year):
-    raw_url = f"https://huggingface.co/datasets/{REPO_ID}/resolve/main/etf_data.csv"
+class PositionalEncoding(tf.keras.layers.Layer):
+    """Adds positional information to input sequences for Transformer"""
+    
+    def __init__(self, **kwargs):
+        super(PositionalEncoding, self).__init__(**kwargs)
+    
+    def call(self, inputs):
+        seq_len = tf.shape(inputs)[1]
+        d_model = tf.shape(inputs)[2]
+        
+        # Create position indices
+        position = tf.range(start=0, limit=seq_len, delta=1, dtype=tf.float32)
+        position = tf.reshape(position, [-1, 1])
+        
+        # Create dimension indices
+        div_term = tf.exp(tf.range(0, d_model, 2, dtype=tf.float32) * 
+                         -(tf.math.log(10000.0) / tf.cast(d_model, tf.float32)))
+        
+        # Calculate positional encodings
+        pos_encoding = tf.zeros((seq_len, d_model))
+        pos_encoding_sin = tf.sin(position * div_term)
+        pos_encoding_cos = tf.cos(position * div_term)
+        
+        # Interleave sin and cos
+        pos_encoding = tf.concat([pos_encoding_sin, pos_encoding_cos], axis=-1)
+        if d_model % 2 != 0:
+            pos_encoding = pos_encoding[:, :-1]
+        
+        # Add to inputs
+        return inputs + pos_encoding
+    
+    def get_config(self):
+        config = super(PositionalEncoding, self).get_config()
+        return config
+
+# ------------------------------
+# 3. ROBUST DATA FETCHING ENGINE
+# ------------------------------
+def fetch_macro_data_robust(start_date="2008-01-01"):
+    """
+    Fetch macro signals from multiple sources with proper error handling
+    Returns: Combined DataFrame with all available macro signals
+    """
+    all_data = []
+    data_sources = {}
+    
+    # 1. FRED Data (Most Reliable)
+    st.write("📊 Fetching FRED data...")
     try:
-        df = pd.read_csv(raw_url)
-        df.columns = df.columns.str.strip()
-        # Fix the Unnamed: 0 issue seen in Dataset Viewer
-        date_col = next((c for c in df.columns if c.lower() in ['date', 'unnamed: 0']), df.columns[0])
-        df[date_col] = pd.to_datetime(df[date_col]).dt.tz_localize(None)
-        df = df.set_index(date_col).sort_index()
+        fred_symbols = {
+            "T10Y2Y": "T10Y2Y",      # 10Y-2Y Treasury Spread
+            "T10Y3M": "T10Y3M",      # 10Y-3M Treasury Spread  
+            "BAMLH0A0HYM2": "HY_Spread",  # High Yield Credit Spread
+            "VIXCLS": "VIX",         # VIX from FRED
+            "DTWEXBGS": "DXY"        # Dollar Index from FRED
+        }
+        
+        fred_data = web.DataReader(
+            list(fred_symbols.keys()), 
+            "fred", 
+            start_date, 
+            datetime.now()
+        )
+        fred_data.columns = [fred_symbols[col] for col in fred_data.columns]
+        
+        # Remove timezone if present
+        if fred_data.index.tz is not None:
+            fred_data.index = fred_data.index.tz_localize(None)
+        
+        all_data.append(fred_data)
+        data_sources['FRED'] = list(fred_data.columns)
+        st.success(f"✅ FRED: {len(fred_data.columns)} signals fetched")
+        
     except Exception as e:
-        st.error(f"Fetch failed: {e}")
+        st.warning(f"⚠️ FRED partial failure: {e}")
+        # Try individual symbols
+        for symbol, name in fred_symbols.items():
+            try:
+                temp = web.DataReader(symbol, "fred", start_date, datetime.now())
+                temp.columns = [name]
+                if temp.index.tz is not None:
+                    temp.index = temp.index.tz_localize(None)
+                all_data.append(temp)
+            except:
+                pass
+    
+    # 2. Yahoo Finance Data
+    st.write("📊 Fetching Yahoo Finance data...")
+    try:
+        yf_symbols = {
+            "GC=F": "GOLD",      # Gold Futures
+            "HG=F": "COPPER",    # Copper Futures
+            "^VIX": "VIX_YF",    # VIX (backup if FRED fails)
+        }
+        
+        yf_data = yf.download(
+            list(yf_symbols.keys()), 
+            start=start_date, 
+            progress=False,
+            auto_adjust=True
+        )['Close']
+        
+        if isinstance(yf_data, pd.Series):
+            yf_data = yf_data.to_frame()
+        
+        yf_data.columns = [yf_symbols.get(col, col) for col in yf_data.columns]
+        
+        # Remove timezone if present
+        if yf_data.index.tz is not None:
+            yf_data.index = yf_data.index.tz_localize(None)
+        
+        all_data.append(yf_data)
+        data_sources['Yahoo'] = list(yf_data.columns)
+        st.success(f"✅ Yahoo: {len(yf_data.columns)} signals fetched")
+        
+    except Exception as e:
+        st.warning(f"⚠️ Yahoo Finance failed: {e}")
+    
+    # 3. VIX Term Structure (Proxy for MOVE/SKEW - Option B)
+    st.write("📊 Fetching VIX term structure...")
+    try:
+        vix_term = yf.download(
+            ["^VIX", "^VIX3M"],  # VIX and 3-month VIX
+            start=start_date,
+            progress=False,
+            auto_adjust=True
+        )['Close']
+        
+        if not vix_term.empty:
+            if isinstance(vix_term, pd.Series):
+                vix_term = vix_term.to_frame()
+            
+            vix_term.columns = ["VIX_Spot", "VIX_3M"]
+            
+            # Calculate VIX term structure slope (proxy for volatility skew)
+            vix_term['VIX_Term_Slope'] = vix_term['VIX_3M'] - vix_term['VIX_Spot']
+            
+            # Remove timezone
+            if vix_term.index.tz is not None:
+                vix_term.index = vix_term.index.tz_localize(None)
+            
+            all_data.append(vix_term)
+            data_sources['VIX_Term'] = list(vix_term.columns)
+            st.success(f"✅ VIX Term Structure: {len(vix_term.columns)} signals")
+    
+    except Exception as e:
+        st.warning(f"⚠️ VIX Term Structure failed: {e}")
+    
+    # Combine all data sources
+    if all_data:
+        combined = pd.concat(all_data, axis=1, join='outer')
+        
+        # Remove duplicate columns (keep first occurrence)
+        combined = combined.loc[:, ~combined.columns.duplicated()]
+        
+        # Forward fill missing values (max 5 days)
+        combined = combined.fillna(method='ffill', limit=5)
+        
+        st.info(f"📈 Total macro signals: {len(combined.columns)} from {len(data_sources)} sources")
+        
+        return combined
+    else:
+        st.error("❌ Failed to fetch any macro data!")
         return pd.DataFrame()
 
-    if is_sync_window():
-        with st.status("🔄 Synchronizing Aligned Macro Signals...", expanded=False):
-            try:
-                # Syncing MOVE/SKEW specifically to fill the 'Signal Blindness'
-                yf_inc = yf.download(["^MOVE", "^SKEW"], start="2008-01-01", progress=False)['Close']
-                yf_inc = yf_inc.rename(columns={"^MOVE": "MOVE", "^SKEW": "SKEW"}).tz_localize(None)
-                
-                # FRED Signals for regime detection
-                fred_inc = web.DataReader(["T10Y2Y", "T10Y3M", "BAMLH0A0HYM2"], "fred", "2008-01-01", datetime.now())
-                fred_inc = fred_inc.rename(columns={"BAMLH0A0HYM2": "HY_Spread"})
-                
-                # Combine with strict forward-fill to prevent NaN gaps during training
-                df = df.combine_first(yf_inc).combine_first(fred_inc)
-                
-                token = os.getenv("HF_TOKEN")
-                if token:
-                    df.index.name = "Date"
-                    df.to_csv("etf_data.csv", index=True)
-                    HfApi().upload_file(path_or_fileobj="etf_data.csv", path_in_repo="etf_data.csv", repo_id=REPO_ID, repo_type="dataset", token=token)
-            except: pass
-
-    # Robust Feature Engineering: Using Z-Scores for all Macro Inputs
-    macro_cols = ['MOVE', 'SKEW', 'HY_Spread', 'T10Y2Y', 'T10Y3M', 'VIX', 'DXY', 'COPPER', 'GOLD']
-    for col in [c for c in df.columns if c in macro_cols or '_Vol' in c]:
-        df[f"{col}_Z"] = (df[col] - df[col].rolling(60).mean()) / (df[col].rolling(60).std() + 1e-9)
-
-    return df[df.index.year >= start_year].ffill().dropna()
+def fetch_etf_data(etfs, start_date="2008-01-01"):
+    """
+    Fetch ETF price data and calculate returns
+    """
+    st.write(f"📊 Fetching ETF data for: {', '.join(etfs)}...")
+    
+    try:
+        etf_data = yf.download(
+            etfs,
+            start=start_date,
+            progress=False,
+            auto_adjust=True
+        )['Close']
+        
+        if isinstance(etf_data, pd.Series):
+            etf_data = etf_data.to_frame()
+        
+        # Remove timezone
+        if etf_data.index.tz is not None:
+            etf_data.index = etf_data.index.tz_localize(None)
+        
+        # Calculate daily returns
+        etf_returns = etf_data.pct_change()
+        etf_returns.columns = [f"{col}_Ret" for col in etf_returns.columns]
+        
+        # Calculate 20-day realized volatility
+        etf_vol = etf_data.pct_change().rolling(20).std() * np.sqrt(252)
+        etf_vol.columns = [f"{col}_Vol" for col in etf_vol.columns]
+        
+        # Combine
+        result = pd.concat([etf_returns, etf_vol], axis=1)
+        
+        st.success(f"✅ ETF data: {len(etf_data.columns)} ETFs, {len(result.columns)} features")
+        
+        return result
+        
+    except Exception as e:
+        st.error(f"❌ ETF fetch failed: {e}")
+        return pd.DataFrame()
 
 # ------------------------------
-# 3. SIDEBAR
+# 4. HF DATASET SMART UPDATE
+# ------------------------------
+def smart_update_hf_dataset(new_data, token):
+    """
+    Smart update: Only uploads if new data exists or gaps are filled
+    """
+    if not token:
+        st.warning("⚠️ No HF_TOKEN found. Skipping dataset update.")
+        return new_data
+    
+    raw_url = f"https://huggingface.co/datasets/{REPO_ID}/resolve/main/etf_data.csv"
+    
+    try:
+        # Download existing dataset
+        existing_df = pd.read_csv(raw_url)
+        existing_df.columns = existing_df.columns.str.strip()
+        
+        # Find date column
+        date_col = next((c for c in existing_df.columns 
+                        if c.lower() in ['date', 'unnamed: 0']), existing_df.columns[0])
+        
+        existing_df[date_col] = pd.to_datetime(existing_df[date_col])
+        existing_df = existing_df.set_index(date_col).sort_index()
+        
+        # Remove timezone if present
+        if existing_df.index.tz is not None:
+            existing_df.index = existing_df.index.tz_localize(None)
+        
+        st.info(f"📥 Existing dataset: {len(existing_df)} rows, {len(existing_df.columns)} columns")
+        
+        # Merge: New data takes priority for overlapping dates
+        combined = new_data.combine_first(existing_df)
+        
+        # Calculate improvements
+        new_rows = len(combined) - len(existing_df)
+        old_nulls = existing_df.isna().sum().sum()
+        new_nulls = combined.isna().sum().sum()
+        filled_gaps = old_nulls - new_nulls
+        
+        # Decide if upload is needed
+        needs_update = new_rows > 0 or filled_gaps > 0
+        
+        if needs_update:
+            # Prepare and upload
+            combined.index.name = "Date"
+            combined.reset_index().to_csv("etf_data.csv", index=False)
+            
+            api = HfApi()
+            api.upload_file(
+                path_or_fileobj="etf_data.csv",
+                path_in_repo="etf_data.csv",
+                repo_id=REPO_ID,
+                repo_type="dataset",
+                token=token,
+                commit_message=f"Update: {get_est_time().strftime('%Y-%m-%d %H:%M EST')} | +{new_rows} rows, filled {filled_gaps} gaps"
+            )
+            
+            st.success(f"✅ Dataset updated: +{new_rows} rows, filled {filled_gaps} gaps")
+            
+            return combined
+        else:
+            st.info("📊 Dataset already up-to-date. No upload needed.")
+            return existing_df
+            
+    except Exception as e:
+        st.warning(f"⚠️ Dataset update failed: {e}. Using new data only.")
+        return new_data
+
+# ------------------------------
+# 5. MAIN DATA ENGINE
+# ------------------------------
+def get_data(start_year):
+    """
+    Main data fetching and processing pipeline
+    """
+    # Always try to load from HF first
+    raw_url = f"https://huggingface.co/datasets/{REPO_ID}/resolve/main/etf_data.csv"
+    df = pd.DataFrame()
+    
+    try:
+        st.info("📥 Loading dataset from HuggingFace...")
+        df = pd.read_csv(raw_url)
+        df.columns = df.columns.str.strip()
+        
+        # Fix date column
+        date_col = next((c for c in df.columns if c.lower() in ['date', 'unnamed: 0']), df.columns[0])
+        df[date_col] = pd.to_datetime(df[date_col])
+        df = df.set_index(date_col).sort_index()
+        
+        # Remove timezone
+        if df.index.tz is not None:
+            df.index = df.index.tz_localize(None)
+        
+        st.success(f"✅ Loaded {len(df)} rows from HuggingFace")
+        
+    except Exception as e:
+        st.warning(f"⚠️ Could not load from HuggingFace: {e}")
+    
+    # Check if we should sync (during sync windows)
+    if is_sync_window():
+        with st.status("🔄 Sync Window Active - Updating Dataset...", expanded=True):
+            st.write(f"🕒 Current time (EST): {get_est_time().strftime('%H:%M:%S')}")
+            
+            # Fetch fresh data
+            etf_list = ["TLT", "TBT", "VNQ", "SLV", "GLD"]
+            
+            # Fetch ETF data
+            etf_data = fetch_etf_data(etf_list, start_date="2008-01-01")
+            
+            # Fetch macro data
+            macro_data = fetch_macro_data_robust(start_date="2008-01-01")
+            
+            # Combine all
+            if not etf_data.empty and not macro_data.empty:
+                new_df = pd.concat([etf_data, macro_data], axis=1)
+                
+                # Update HF dataset
+                token = os.getenv("HF_TOKEN")
+                df = smart_update_hf_dataset(new_df, token)
+            else:
+                st.error("❌ Data fetch failed during sync window")
+    
+    # If still empty, fetch fresh data anyway
+    if df.empty:
+        st.warning("📊 Fetching fresh data (no cached dataset available)...")
+        etf_list = ["TLT", "TBT", "VNQ", "SLV", "GLD"]
+        etf_data = fetch_etf_data(etf_list, start_date="2008-01-01")
+        macro_data = fetch_macro_data_robust(start_date="2008-01-01")
+        
+        if not etf_data.empty and not macro_data.empty:
+            df = pd.concat([etf_data, macro_data], axis=1)
+    
+    # Feature Engineering: Z-Scores for macro signals
+    st.write("🔧 Engineering features...")
+    
+    macro_cols = ['VIX', 'DXY', 'COPPER', 'GOLD', 'HY_Spread', 'T10Y2Y', 'T10Y3M', 
+                  'VIX_Spot', 'VIX_3M', 'VIX_Term_Slope']
+    
+    for col in df.columns:
+        # Create Z-scores for macro signals and volatility
+        if any(m in col for m in macro_cols) or '_Vol' in col:
+            # Use expanding window to avoid NaNs
+            rolling_mean = df[col].rolling(60, min_periods=20).mean()
+            rolling_std = df[col].rolling(60, min_periods=20).std()
+            df[f"{col}_Z"] = (df[col] - rolling_mean) / (rolling_std + 1e-9)
+    
+    # Filter by start year and clean
+    df = df[df.index.year >= start_year]
+    
+    # Forward fill gaps (max 5 days)
+    df = df.fillna(method='ffill', limit=5)
+    
+    # Drop remaining NaNs
+    initial_len = len(df)
+    df = df.dropna()
+    dropped = initial_len - len(df)
+    
+    if dropped > 0:
+        st.info(f"🧹 Dropped {dropped} rows with remaining NaNs")
+    
+    st.success(f"✅ Final dataset: {len(df)} rows, {len(df.columns)} columns")
+    
+    return df
+
+# ------------------------------
+# 6. PURE TRANSFORMER MODEL
+# ------------------------------
+def build_pure_transformer(input_shape, num_outputs, num_heads=4, ff_dim=128, num_layers=2, dropout_rate=0.1):
+    """
+    Build a pure Transformer architecture for time series prediction
+    
+    Args:
+        input_shape: (sequence_length, num_features)
+        num_outputs: Number of output predictions
+        num_heads: Number of attention heads
+        ff_dim: Feed-forward network dimension
+        num_layers: Number of Transformer blocks
+        dropout_rate: Dropout rate
+    """
+    inputs = Input(shape=input_shape)
+    
+    # Add positional encoding
+    x = PositionalEncoding()(inputs)
+    
+    # Stack Transformer blocks
+    for _ in range(num_layers):
+        # Multi-head self-attention
+        attn_output = MultiHeadAttention(
+            num_heads=num_heads,
+            key_dim=input_shape[1] // num_heads,
+            dropout=dropout_rate
+        )(x, x)
+        
+        # Residual connection and layer normalization
+        x = LayerNormalization(epsilon=1e-6)(x + attn_output)
+        
+        # Feed-forward network
+        ff_output = Dense(ff_dim, activation='relu')(x)
+        ff_output = Dropout(dropout_rate)(ff_output)
+        ff_output = Dense(input_shape[1])(ff_output)
+        
+        # Residual connection and layer normalization
+        x = LayerNormalization(epsilon=1e-6)(x + ff_output)
+    
+    # Global pooling and output
+    x = GlobalAveragePooling1D()(x)
+    x = Dropout(dropout_rate)(x)
+    x = Dense(ff_dim, activation='relu')(x)
+    x = Dropout(dropout_rate)(x)
+    outputs = Dense(num_outputs)(x)
+    
+    model = Model(inputs=inputs, outputs=outputs)
+    
+    return model
+
+# ------------------------------
+# 7. SIDEBAR CONFIGURATION
 # ------------------------------
 with st.sidebar:
-    st.header("Model Configuration")
-    st.write(f"🕒 Server Time (EST): {get_est_time().strftime('%H:%M:%S')}")
-    start_yr = st.slider("Start Year", 2008, 2025, 2016)
-    fee_bps = st.slider("Fee (bps)", 0, 100, 15)
-    epochs = st.number_input("Epochs", 5, 500, 100)
-    run_button = st.button("Execute Transformer Alpha", type="primary")
-
-st.title("P2-TRANSFORMER-ETF-PREDICTOR")
+    st.header("⚙️ Model Configuration")
+    
+    current_time = get_est_time()
+    st.write(f"🕒 **Server Time (EST):** {current_time.strftime('%H:%M:%S')}")
+    
+    if is_sync_window():
+        st.success("✅ **Sync Window Active**")
+    else:
+        st.info("⏸️ Sync Window Inactive")
+    
+    st.divider()
+    
+    start_yr = st.slider("📅 Start Year", 2008, 2025, 2016)
+    fee_bps = st.slider("💰 Transaction Fee (bps)", 0, 100, 15, 
+                        help="Transaction cost in basis points")
+    
+    st.divider()
+    
+    st.subheader("🧠 Transformer Settings")
+    epochs = st.number_input("Epochs", 10, 500, 100, step=10)
+    num_heads = st.selectbox("Attention Heads", [2, 4, 8], index=1)
+    num_layers = st.selectbox("Transformer Layers", [1, 2, 3, 4], index=1)
+    lookback = st.slider("Lookback Days", 20, 60, 30, step=5)
+    
+    st.divider()
+    
+    run_button = st.button("🚀 Execute Transformer Alpha", type="primary", use_container_width=True)
 
 # ------------------------------
-# 4. ANALYTICS & UI RESTORATION
+# 8. MAIN APPLICATION
 # ------------------------------
+st.title("🤖 P2-TRANSFORMER-ETF-PREDICTOR")
+st.caption("Pure Transformer Architecture with Multi-Source Macro Intelligence")
+
 if run_button:
+    # Load and prepare data
     df = get_data(start_yr)
-    if not df.empty:
-        target_etfs = [t for t in ['TLT_Ret', 'TBT_Ret', 'VNQ_Ret', 'SLV_Ret', 'GLD_Ret'] if t in df.columns]
-        # Include the new Macro Z-scores in the feature set
-        input_features = [c for c in df.columns if (c.endswith('_Z') or c.endswith('_Vol')) and c not in target_etfs]
-        
+    
+    if df.empty:
+        st.error("❌ No data available. Please check data sources.")
+        st.stop()
+    
+    # Identify target ETFs and input features
+    target_etfs = [col for col in df.columns if col.endswith('_Ret') and 
+                   any(etf in col for etf in ['TLT', 'TBT', 'VNQ', 'SLV', 'GLD'])]
+    
+    if not target_etfs:
+        st.error("❌ No target ETF returns found in dataset")
+        st.stop()
+    
+    # Input features: Z-scores and volatility
+    input_features = [col for col in df.columns 
+                     if (col.endswith('_Z') or col.endswith('_Vol')) 
+                     and col not in target_etfs]
+    
+    if not input_features:
+        st.error("❌ No input features found in dataset")
+        st.stop()
+    
+    st.info(f"🎯 **Targets:** {len(target_etfs)} ETFs | **Features:** {len(input_features)} signals")
+    
+    # Prepare data for model
+    with st.spinner("🔧 Preparing training data..."):
         scaler = MinMaxScaler()
         scaled_input = scaler.fit_transform(df[input_features])
-        lb = 30
         
-        with st.spinner("Training Transformer Alpha Engine..."):
-            X, y = [], []
-            for i in range(lb, len(scaled_input)):
-                X.append(scaled_input[i-lb:i])
-                y.append(df[target_etfs].iloc[i].values)
-            X, y = np.array(X), np.array(y)
-            split = int(len(X) * 0.8)
+        X, y = [], []
+        for i in range(lookback, len(scaled_input)):
+            X.append(scaled_input[i-lookback:i])
+            y.append(df[target_etfs].iloc[i].values)
+        
+        X = np.array(X)
+        y = np.array(y)
+        
+        # Train/Validation/Test split (60/20/20)
+        train_size = int(len(X) * 0.6)
+        val_size = int(len(X) * 0.2)
+        
+        X_train = X[:train_size]
+        y_train = y[:train_size]
+        X_val = X[train_size:train_size + val_size]
+        y_val = y[train_size:train_size + val_size]
+        X_test = X[train_size + val_size:]
+        y_test = y[train_size + val_size:]
+        
+        st.success(f"✅ Train: {len(X_train)} | Val: {len(X_val)} | Test: {len(X_test)}")
+    
+    # Build and train model
+    with st.spinner("🧠 Training Pure Transformer Model..."):
+        model = build_pure_transformer(
+            input_shape=(X.shape[1], X.shape[2]),
+            num_outputs=len(target_etfs),
+            num_heads=num_heads,
+            ff_dim=128,
+            num_layers=num_layers,
+            dropout_rate=0.1
+        )
+        
+        model.compile(
+            optimizer=tf.keras.optimizers.Adam(learning_rate=0.001),
+            loss='mse',
+            metrics=['mae']
+        )
+        
+        # Early stopping
+        early_stop = EarlyStopping(
+            monitor='val_loss',
+            patience=20,
+            restore_best_weights=True,
+            verbose=0
+        )
+        
+        # Train
+        history = model.fit(
+            X_train, y_train,
+            validation_data=(X_val, y_val),
+            epochs=int(epochs),
+            batch_size=32,
+            callbacks=[early_stop],
+            verbose=0
+        )
+        
+        st.success(f"✅ Training completed! Best epoch: {len(history.history['loss']) - 20}")
+    
+    # Make predictions on test set
+    with st.spinner("🔮 Generating predictions..."):
+        preds = model.predict(X_test, verbose=0)
+        
+        # Get test dates
+        test_dates = df.index[lookback + train_size + val_size:]
+        
+        # Get SOFR rate for Sharpe calculation
+        sofr = df['T10Y3M'].iloc[-1] / 100 if 'T10Y3M' in df.columns else 0.045
+        
+        # Strategy execution
+        strat_rets = []
+        audit_trail = []
+        
+        for i in range(len(preds)):
+            # Select best ETF based on predicted return
+            best_idx = np.argmax(preds[i])
+            signal_etf = target_etfs[best_idx].replace('_Ret', '')
             
-            # Restored Transformer Architecture
-            inputs = Input(shape=(X.shape[1], X.shape[2]))
-            attn_out = MultiHeadAttention(num_heads=4, key_dim=X.shape[2])(inputs, inputs)
-            attn_res = LayerNormalization()(attn_out + inputs)
-            pool = GlobalMaxPooling1D()(Conv1D(64, 3, activation='relu', padding='same')(attn_res))
-            lstm = Bidirectional(tf.keras.layers.LSTM(64))(inputs)
-            x = Dense(128, activation='relu')(Concatenate()([pool, lstm]))
-            model = Model(inputs, Dense(len(target_etfs))(x))
-            model.compile(optimizer='adam', loss='mse')
-            model.fit(X[:split], y[:split], epochs=int(epochs), batch_size=32, verbose=0)
+            # Realized return
+            realized_ret = y_test[i][best_idx]
             
-            preds = model.predict(X[split:])
-            oos_dates = df.index[lb + split:]
-            sofr = df['SOFR'].iloc[-1] if 'SOFR' in df.columns else 0.045
+            # Net return after fees
+            net_ret = realized_ret - (fee_bps / 10000)
             
-            strat_rets, audit_trail = [], []
-            for i in range(len(preds)):
-                idx = np.argmax(preds[i])
-                signal = target_etfs[idx].split('_')[0]
-                realized = y[split:][i][idx]
-                net_ret = realized - (fee_bps/10000)
-                strat_rets.append(net_ret)
-                audit_trail.append({'Date': oos_dates[i].strftime('%Y-%m-%d'), 'Signal': signal, 'Return': net_ret})
+            strat_rets.append(net_ret)
+            audit_trail.append({
+                'Date': test_dates[i].strftime('%Y-%m-%d'),
+                'Signal': signal_etf,
+                'Predicted': preds[i][best_idx],
+                'Realized': realized_ret,
+                'Net_Return': net_ret
+            })
+        
+        strat_rets = np.array(strat_rets)
+    
+    # ------------------------------
+    # 9. PERFORMANCE ANALYTICS
+    # ------------------------------
+    st.divider()
+    
+    # Next day signal
+    next_day = (df.index[-1] + timedelta(days=1)).strftime('%Y-%m-%d')
+    latest_signal = audit_trail[-1]['Signal']
+    
+    st.success(f"🎯 **Next Trading Day ({next_day}) Allocation:** **{latest_signal}**")
+    
+    st.divider()
+    
+    # Calculate metrics
+    cum_returns = np.cumprod(1 + strat_rets)
+    ann_return = (cum_returns[-1] ** (252 / len(strat_rets))) - 1
+    sharpe = (np.mean(strat_rets) - (sofr / 252)) / (np.std(strat_rets) + 1e-9) * np.sqrt(252)
+    
+    # Hit ratio (% of positive returns in last 15 days)
+    recent_rets = strat_rets[-15:]
+    hit_ratio = np.mean(recent_rets > 0)
+    
+    # Max drawdown
+    cum_max = np.maximum.accumulate(cum_returns)
+    drawdown = (cum_returns - cum_max) / cum_max
+    max_dd = np.min(drawdown)
+    
+    # Display metrics
+    col1, col2, col3, col4 = st.columns(4)
+    
+    col1.metric(
+        "📈 Annualized Return",
+        f"{ann_return * 100:.2f}%",
+        delta=f"vs SOFR: {(ann_return - sofr) * 100:.2f}%"
+    )
+    
+    col2.metric(
+        "📊 Sharpe Ratio",
+        f"{sharpe:.2f}",
+        delta="Risk-Adjusted" if sharpe > 1 else "Below Threshold"
+    )
+    
+    col3.metric(
+        "🎯 Hit Ratio (15d)",
+        f"{hit_ratio * 100:.0f}%",
+        delta="Strong" if hit_ratio > 0.6 else "Weak"
+    )
+    
+    col4.metric(
+        "📉 Max Drawdown",
+        f"{max_dd * 100:.2f}%",
+        delta="Acceptable" if max_dd > -0.15 else "High Risk"
+    )
+    
+    # Equity curve
+    st.subheader("📈 Out-of-Sample Equity Curve")
+    
+    fig_equity = go.Figure()
+    
+    fig_equity.add_trace(go.Scatter(
+        x=test_dates,
+        y=cum_returns,
+        mode='lines',
+        name='Strategy',
+        line=dict(color='#00d1b2', width=2),
+        fill='tozeroy',
+        fillcolor='rgba(0, 209, 178, 0.1)'
+    ))
+    
+    # Add drawdown shading
+    fig_equity.add_trace(go.Scatter(
+        x=test_dates,
+        y=cum_max,
+        mode='lines',
+        name='High Water Mark',
+        line=dict(color='rgba(255, 255, 255, 0.3)', width=1, dash='dash')
+    ))
+    
+    fig_equity.update_layout(
+        template="plotly_dark",
+        height=400,
+        hovermode='x unified',
+        showlegend=True,
+        xaxis_title="Date",
+        yaxis_title="Cumulative Return"
+    )
+    
+    st.plotly_chart(fig_equity, use_container_width=True)
+    
+    # Feature importance
+    st.subheader("🔍 Transformer Signal Contribution (%)")
+    
+    # Extract attention weights from last layer
+    try:
+        final_weights = model.layers[-1].get_weights()[0]
+        importance = np.mean(np.abs(final_weights), axis=1)
+        importance_pct = (importance / importance.sum()) * 100
+        
+        # Map to feature names
+        feat_importance = pd.Series(
+            importance_pct[:len(input_features)],
+            index=input_features
+        ).sort_values(ascending=False).head(15)
+        
+        fig_imp = go.Figure(go.Bar(
+            x=feat_importance.values,
+            y=feat_importance.index,
+            orientation='h',
+            marker_color='#3b82f6',
+            text=[f'{v:.1f}%' for v in feat_importance.values],
+            textposition='outside'
+        ))
+        
+        fig_imp.update_layout(
+            template="plotly_dark",
+            height=500,
+            xaxis_title="Contribution %",
+            yaxis_title="Feature",
+            showlegend=False
+        )
+        
+        st.plotly_chart(fig_imp, use_container_width=True)
+        
+    except Exception as e:
+        st.warning(f"⚠️ Could not extract feature importance: {e}")
+    
+    # Training history
+    st.subheader("📉 Training & Validation Loss")
+    
+    fig_loss = make_subplots(specs=[[{"secondary_y": False}]])
+    
+    fig_loss.add_trace(go.Scatter(
+        x=list(range(len(history.history['loss']))),
+        y=history.history['loss'],
+        mode='lines',
+        name='Training Loss',
+        line=dict(color='#00d1b2', width=2)
+    ))
+    
+    fig_loss.add_trace(go.Scatter(
+        x=list(range(len(history.history['val_loss']))),
+        y=history.history['val_loss'],
+        mode='lines',
+        name='Validation Loss',
+        line=dict(color='#ff4b4b', width=2)
+    ))
+    
+    fig_loss.update_layout(
+        template="plotly_dark",
+        height=300,
+        xaxis_title="Epoch",
+        yaxis_title="Loss (MSE)",
+        hovermode='x unified'
+    )
+    
+    st.plotly_chart(fig_loss, use_container_width=True)
+    
+    # Audit trail
+    st.subheader("📋 Last 15 Days Audit Trail")
+    
+    audit_df = pd.DataFrame(audit_trail).tail(15)
+    
+    def color_return(val):
+        return 'color: #00ff00' if val > 0 else 'color: #ff4b4b'
+    
+    styled_audit = audit_df.style.applymap(
+        color_return,
+        subset=['Net_Return', 'Realized']
+    ).format({
+        'Predicted': '{:.4f}',
+        'Realized': '{:.2%}',
+        'Net_Return': '{:.2%}'
+    })
+    
+    st.dataframe(styled_audit, use_container_width=True)
+    
+    # Model summary
+    with st.expander("🔧 Model Architecture Details"):
+        st.text("Pure Transformer Configuration:")
+        st.text(f"  - Input Shape: ({lookback}, {len(input_features)})")
+        st.text(f"  - Attention Heads: {num_heads}")
+        st.text(f"  - Transformer Layers: {num_layers}")
+        st.text(f"  - Feed-Forward Dim: 128")
+        st.text(f"  - Output Dimension: {len(target_etfs)}")
+        st.text(f"  - Total Parameters: {model.count_params():,}")
+        st.text(f"  - Training Samples: {len(X_train):,}")
+        st.text(f"  - Validation Samples: {len(X_val):,}")
+        st.text(f"  - Test Samples: {len(X_test):,}")
 
-            # --- RESTORED ANALYTICS UI ---
-            next_day = (df.index[-1] + timedelta(days=1)).strftime('%Y-%m-%d')
-            st.success(f"🎯 **Target Allocation for Next Session ({next_day}): {audit_trail[-1]['Signal']}**")
-
-            # Corrected Metrics
-            cum_strat = np.cumprod(1 + np.array(strat_rets))
-            ann_ret = (cum_strat[-1]**(252/len(strat_rets)) - 1)
-            sharpe = (np.mean(strat_rets) - (sofr/252)) / (np.std(strat_rets) + 1e-9) * np.sqrt(252)
-            # FIXED: Hit Ratio now correctly checks if Return > 0
-            hit_ratio = np.mean([1 for r in strat_rets[-15:] if r > 0])
-            max_dd = np.min(np.array(strat_rets))
-
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Ann. Return (OOS)", f"{ann_ret*100:.2f}%")
-            c2.metric("Sharpe (Live SOFR)", f"{sharpe:.2f}")
-            c3.metric("Hit Ratio (15d)", f"{hit_ratio*100:.0f}%")
-            c4.metric("Max Daily DD", f"{max_dd*100:.2f}%")
-
-            st.plotly_chart(go.Figure(go.Scatter(x=oos_dates, y=cum_strat, fill='tozeroy', line=dict(color='#00d1b2'))).update_layout(template="plotly_dark", title="Out-of-Sample Equity Curve"))
-
-            # Restored Feature Importance as a % Graph
-            st.subheader("Transformer Signal Strength (%)")
-            weights = np.mean(np.abs(model.layers[-1].get_weights()[0]), axis=1)
-            importance = (weights / weights.sum()) * 100
-            feat_imp = pd.Series(importance[:len(input_features)], index=input_features).sort_values(ascending=False).head(12)
-            
-            fig_imp = go.Figure(go.Bar(x=feat_imp.values, y=feat_imp.index, orientation='h', marker_color='#3b82f6'))
-            fig_imp.update_layout(template="plotly_dark", xaxis_title="Contribution %", height=400)
-            st.plotly_chart(fig_imp)
-
-            # Restored 15-Day Audit Trail
-            st.subheader("Last 15 Days Audit Trail")
-            audit_df = pd.DataFrame(audit_trail).tail(15)
-            def color_ret(val):
-                return 'color: #00ff00' if val > 0 else 'color: #ff4b4b'
-            st.table(audit_df.style.applymap(color_ret, subset=['Return']).format({'Return': '{:.2%}'}))
+else:
+    st.info("👈 Configure parameters in the sidebar and click '🚀 Execute Transformer Alpha' to begin")
+    
+    # Show sync window info
+    current_time = get_est_time()
+    st.write(f"🕒 Current EST Time: **{current_time.strftime('%H:%M:%S')}**")
+    
+    if is_sync_window():
+        st.success("✅ **Sync Window Active** - Data will be updated from sources")
+    else:
+        next_sync = "07:00-08:00" if current_time.hour < 7 else "19:00-20:00"
+        st.info(f"⏸️ Next sync window: **{next_sync} EST**")

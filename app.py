@@ -12,8 +12,7 @@ from tensorflow.keras.layers import (
     Conv1D, GlobalMaxPooling1D, Concatenate, MultiHeadAttention, LayerNormalization
 )
 from sklearn.preprocessing import MinMaxScaler
-from datasets import load_dataset, Dataset
-from huggingface_hub import login
+from datasets import load_dataset
 import plotly.graph_objects as go
 import plotly.express as px
 
@@ -33,11 +32,10 @@ st.set_page_config(page_title="P2-Transformer Pro", layout="wide")
 
 with st.sidebar:
     st.header("Model Configuration")
-    start_year = st.slider("Training Start Year", 2008, 2024, 2016)
+    start_year = st.slider("Training Start Year", 2008, 2025, 2016)
     fee_bps = st.slider("Transaction Cost (bps)", 0, 100, 15)
-    epochs = st.number_input("Training Epochs", 5, 200, 50)
+    epochs = st.number_input("Training Epoch_Count", 5, 200, 50)
     st.markdown("---")
-    update_hf = st.checkbox("Sync Updates to HF Hub?", value=True)
     run_button = st.button("Execute Transformer Alpha", type="primary")
 
 st.title("P2-TRANSFORMER-ETF-PREDICTOR")
@@ -45,31 +43,52 @@ st.title("P2-TRANSFORMER-ETF-PREDICTOR")
 # ------------------------------
 # 3. DATA ENGINE
 # ------------------------------
-HF_TOKEN = os.environ.get("HF_TOKEN")
 REPO_ID = "P2SAMAPA/my-etf-data"
 fee_pct = fee_bps / 10000
 
 def get_data():
-    ds = load_dataset(REPO_ID, split="train").to_pandas()
-    ds['Date'] = pd.to_datetime(ds['Date'])
-    ds = ds.set_index('Date').sort_index()
+    # 1. Load HF Dataset
+    try:
+        ds = load_dataset(REPO_ID, split="train").to_pandas()
+    except Exception as e:
+        st.error(f"HF Dataset Load Failed: {e}")
+        return pd.DataFrame()
+
+    # Standardize Date Index
+    date_col = 'Date' if 'Date' in ds.columns else 'date'
+    ds[date_col] = pd.to_datetime(ds[date_col]).dt.tz_localize(None)
+    ds = ds.set_index(date_col).sort_index()
+    
+    # Filter by Year
     df = ds[ds.index.year >= start_year].copy()
-    
+    if df.empty:
+        return df
+
+    # 2. Macro Fetch (VIX, TNX, DXY, GOLD, COPPER)
     tickers = {"^VIX": "VIX", "^TNX": "TNX", "DX-Y.NYB": "DXY", "GC=F": "GOLD", "HG=F": "COPPER"}
-    fetch_start = df.index.min() - timedelta(days=30)
-    macro = yf.download(list(tickers.keys()), start=fetch_start, progress=False)['Close']
-    macro = macro.rename(columns=tickers)
-    
-    cols_to_drop = [c for c in macro.columns if c in df.columns]
-    df = df.drop(columns=cols_to_drop).join(macro, how='left')
-    df = df.ffill().bfill()
+    fetch_start = df.index.min() - timedelta(days=60)
     
     try:
-        sofr = yf.download("^IRX", start=fetch_start, progress=False)['Close'] / 100
-        df['SOFR'] = sofr.reindex(df.index).ffill().bfill().fillna(0.04)
+        macro = yf.download(list(tickers.keys()), start=fetch_start, progress=False)['Close']
+        macro = macro.rename(columns=tickers)
+        macro.index = macro.index.tz_localize(None)
+        
+        # Robust Join: Drop existing macro columns in HF data if they exist to avoid suffix noise
+        cols_to_drop = [c for c in macro.columns if c in df.columns]
+        df = df.drop(columns=cols_to_drop).join(macro, how='left')
     except:
-        df['SOFR'] = 0.04
-    return df.dropna()
+        pass
+
+    # 3. SOFR Rate Fetch
+    try:
+        sofr = yf.download("^IRX", start=fetch_start, progress=False)['Close'] / 100
+        sofr.index = sofr.index.tz_localize(None)
+        df['SOFR'] = sofr.reindex(df.index).ffill().bfill()
+    except:
+        df['SOFR'] = 0.04 
+
+    # Robust Fill to ensure 'start_year' doesn't return empty due to one missing ticker value
+    return df.ffill().bfill().dropna()
 
 # ------------------------------
 # 4. OPTIMIZATION RUNTIME
@@ -78,20 +97,22 @@ if run_button:
     df = get_data()
     
     if df.empty:
-        st.error(f"Error: No data found starting from {start_year}.")
+        st.error(f"Error: Dataframe empty for {start_year}. Check if dataset covers this range.")
     else:
         target_etfs = ['TLT_Ret', 'TBT_Ret', 'VNQ_Ret', 'SLV_Ret', 'GLD_Ret']
+        target_etfs = [t for t in target_etfs if t in df.columns]
         input_features = [c for c in df.columns if c not in target_etfs and c != 'SOFR']
         
         scaler = MinMaxScaler()
         scaled_input = scaler.fit_transform(df[input_features])
         
-        lookbacks = [30, 45, 60]
+        # Dynamic lookback based on data size
+        lookbacks = [30, 45, 60] if len(df) > 200 else [10, 20]
         holdings = [1, 3, 5]
         best_conviction = -np.inf
         final_res = None
 
-        with st.spinner("Processing Signal Pattern Search..."):
+        with st.spinner(f"Training Transformer on {len(df)} days of data..."):
             split_idx = int(len(scaled_input) * 0.8)
             
             for lb in lookbacks:
@@ -105,8 +126,9 @@ if run_button:
                 train_X, test_X = X[:split_idx - lb], X[split_idx - lb:]
                 train_y, test_y = y[:split_idx - lb], y[split_idx - lb:]
 
-                if len(train_X) == 0 or len(test_X) == 0: continue
+                if len(train_X) < 10: continue
 
+                # Deep Learning Architecture
                 inputs = Input(shape=(X.shape[1], X.shape[2]))
                 attn_output, attn_weights = MultiHeadAttention(num_heads=4, key_dim=X.shape[2])(inputs, inputs, return_attention_scores=True)
                 attn_res = LayerNormalization()(attn_output + inputs)
@@ -115,7 +137,7 @@ if run_button:
                 lstm = Bidirectional(LSTM(64))(inputs)
                 merged = Concatenate()([pool, lstm])
                 x = Dense(128, activation='relu')(merged)
-                outputs = Dense(5)(x)
+                outputs = Dense(len(target_etfs))(x)
                 
                 model = Model(inputs, outputs)
                 weight_model = Model(inputs, attn_weights)
@@ -142,11 +164,12 @@ if run_button:
                             "test_y": test_y, "dates": df.index[split_idx:],
                             "model": model, "weight_model": weight_model,
                             "strat_rets": daily_strat_rets, "sofr": df['SOFR'].iloc[split_idx:].values,
-                            "last_x": X[-1:], "input_features": input_features
+                            "last_x": X[-1:], "input_features": input_features,
+                            "target_names": target_etfs
                         }
 
         # ------------------------------
-        # 5. UI: OUTPUT
+        # 5. UI: OUTPUT RENDER
         # ------------------------------
         if final_res:
             res = final_res
@@ -161,7 +184,7 @@ if run_button:
             
             p_now = res["model"].predict(res["last_x"])[0]
             best_idx = np.argmax(p_now)
-            final_asset = target_etfs[best_idx].split('_')[0] if p_now[best_idx] > ((df['SOFR'].iloc[-1]/252) + fee_pct) else "CASH (SOFR)"
+            final_asset = res["target_names"][best_idx].split('_')[0] if p_now[best_idx] > ((df['SOFR'].iloc[-1]/252) + fee_pct) else "CASH (SOFR)"
             
             k1.metric("Predicted Asset", final_asset, f"Next Open: {get_next_open_date()}")
             k2.metric("Annualized Return", f"{ann_ret*100:.2f}%", f"{oos_yrs:.2f} OOS Years")
@@ -175,19 +198,12 @@ if run_button:
             fig.update_layout(template="plotly_dark", height=400, margin=dict(l=0,r=0,b=0,t=20))
             st.plotly_chart(fig, use_container_width=True)
 
-            # Signal Contribution Analysis
             st.markdown("---")
             st.markdown("### Signal Contribution Analysis")
-            
-            # Extract weights: Shape (Batch, Heads, Query, Key)
             raw_weights = res["weight_model"].predict(res["last_x"]) 
-            
-            # RECTIFIED: Correct reduction to identify feature importance
-            # We average over Batch, Heads, and Query dimensions to get a 1D feature vector
             importance = np.mean(raw_weights, axis=(0, 1, 2))
             importance = np.atleast_1d(importance)
             
-            # Align length with input_features
             if len(importance) < len(res["input_features"]):
                  importance = np.pad(importance, (0, len(res["input_features"]) - len(importance)))
             else:
@@ -201,18 +217,19 @@ if run_button:
                 st.dataframe(feat_imp.style.background_gradient(cmap='Blues'))
             with col_b:
                 st.write("Temporal Attention Heatmap (Head 0)")
-                fig_heat = px.imshow(raw_weights[0, 0], labels=dict(x="Lookback Steps", y="Query Dimension", color="Weight"), color_continuous_scale="Viridis")
+                fig_heat = px.imshow(raw_weights[0, 0], labels=dict(x="Steps", y="Dimension", color="Weight"), color_continuous_scale="Viridis")
                 fig_heat.update_layout(height=350, template="plotly_dark", margin=dict(l=0,r=0,b=0,t=0))
                 st.plotly_chart(fig_heat, use_container_width=True)
 
             st.markdown("### 15-Day Performance Audit Trail")
             audit = []
-            for i in range(1, 16):
+            display_days = min(15, len(res["preds"]))
+            for i in range(1, display_days + 1):
                 idx = np.argmax(res["preds"][-i])
                 is_cash = res["preds"][-i][idx] <= ((res["sofr"][-i]/252) + fee_pct)
                 audit.append({
                     "Date": res["dates"][-i].strftime('%Y-%m-%d'),
-                    "Predicted": "CASH" if is_cash else target_etfs[idx].split('_')[0],
+                    "Predicted": "CASH" if is_cash else res["target_names"][idx].split('_')[0],
                     "SOFR (Ann)": f"{res['sofr'][-i]*100:.2f}%",
                     "Realized Daily Return": res["strat_rets"][-i]
                 })
@@ -220,4 +237,4 @@ if run_button:
                 lambda x: 'color: #00ff00' if x > 0 else 'color: #ff4b4b', subset=['Realized Daily Return']
             ))
         else:
-            st.error("Model Search Failed. Please adjust parameters.")
+            st.error("No valid strategy found. Try a different Training Start Year.")

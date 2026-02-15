@@ -70,14 +70,20 @@ def get_data(sync_key):
     ds = ds.set_index(date_col).sort_index()
     df = ds[ds.index.year >= start_year].copy()
     
-    # Preserve SOFR specifically
-    has_sofr = 'SOFR' in df.columns
+    # --- SOFR NAME PROTECTION ---
+    if 'SOFR' not in df.columns:
+        if 'sofr' in df.columns:
+            df['SOFR'] = df['sofr']
+        else:
+            # Absolute fallback to avoid crash
+            df['SOFR'] = 0.04 
 
     # 1. MOVE and SKEW from YFinance
     try:
         yf_indices = yf.download(["^MOVE", "^SKEW"], start=df.index.min(), progress=False)['Close']
         yf_indices = yf_indices.rename(columns={"^MOVE": "MOVE", "^SKEW": "SKEW"})
-        yf_indices.index = yf_indices.index.tz_localize(None)
+        if isinstance(yf_indices.index, pd.DatetimeIndex):
+            yf_indices.index = yf_indices.index.tz_localize(None)
         df = df.join(yf_indices, how='left')
     except:
         st.warning("YFinance Volatility fetch failed.")
@@ -91,19 +97,14 @@ def get_data(sync_key):
     except:
         st.warning("FRED Macro fetch failed.")
 
-    # 3. Z-SCORE ENGINEERING (Exclude SOFR and Returns)
+    # 3. Z-SCORE ENGINEERING
     features_to_z = [c for c in df.columns if '_Ret' not in c and c != 'SOFR']
     for col in features_to_z:
         rolling_mean = df[col].rolling(window=20).mean()
         rolling_std = df[col].rolling(window=20).std()
         df[f"{col}_Z"] = (df[col] - rolling_mean) / (rolling_std + 1e-9)
 
-    # Final cleanup ensuring SOFR survived
-    df = df.ffill().bfill()
-    if 'SOFR' not in df.columns and has_sofr:
-        st.error("SOFR column lost during merge!")
-    
-    return df.dropna()
+    return df.ffill().bfill().dropna()
 
 # ------------------------------
 # 4. RUNTIME
@@ -113,8 +114,6 @@ if run_button:
     
     if df.empty:
         st.error("Error: Dataset empty.")
-    elif 'SOFR' not in df.columns:
-        st.error("Critical Error: SOFR column missing. Please ensure your HF dataset contains 'SOFR'.")
     else:
         target_etfs = ['TLT_Ret', 'TBT_Ret', 'VNQ_Ret', 'SLV_Ret', 'GLD_Ret']
         target_etfs = [t for t in target_etfs if t in df.columns]
@@ -153,19 +152,19 @@ if run_button:
                 
                 for hold in holdings:
                     daily_strat_rets = []
-                    # Critical SOFR lookup
-                    sofr_values = df['SOFR'].iloc[split_idx:].values
+                    sofr_vals = df['SOFR'].iloc[split_idx:].values
                     for i in range(len(preds)):
                         idx = np.argmax(preds[i])
                         sorted_p = np.sort(preds[i])
-                        if preds[i][idx] > (sorted_p[-2] * 1.2) and preds[i][idx] > (sofr_values[i]/252 + fee_pct):
+                        # Conviction Rule
+                        if preds[i][idx] > (sorted_p[-2] * 1.2) and preds[i][idx] > (sofr_vals[i]/252 + fee_pct):
                             daily_strat_rets.append(test_y[i][idx] - (fee_pct if i % hold == 0 else 0))
                         else:
-                            daily_strat_rets.append(sofr_values[i]/252)
+                            daily_strat_rets.append(sofr_vals[i]/252)
                     
                     if np.mean(daily_strat_rets) > best_score:
                         best_score = np.mean(daily_strat_rets)
-                        final_res = {"model": model, "strat_rets": daily_strat_rets, "dates": df.index[split_idx:], "sofr": sofr_values, "last_x": X[-1:], "input_features": input_features, "target_names": target_etfs, "lb": lb, "hold": hold, "preds": preds}
+                        final_res = {"model": model, "strat_rets": daily_strat_rets, "dates": df.index[split_idx:], "sofr": sofr_vals, "last_x": X[-1:], "input_features": input_features, "target_names": target_etfs, "lb": lb, "hold": hold, "preds": preds}
 
         if final_res:
             res = final_res

@@ -2,11 +2,10 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import yfinance as yf
-# Safe import for pandas_datareader
 try:
     import pandas_datareader.data as web
 except ImportError:
-    st.error("Missing library: pandas_datareader. Please run 'pip install pandas-datareader'")
+    st.error("Missing library: pandas_datareader. Please add it to requirements.txt")
 import pandas_market_calendars as mcal
 from datetime import datetime, timedelta
 import pytz
@@ -71,6 +70,9 @@ def get_data(sync_key):
     ds = ds.set_index(date_col).sort_index()
     df = ds[ds.index.year >= start_year].copy()
     
+    # Preserve SOFR specifically
+    has_sofr = 'SOFR' in df.columns
+
     # 1. MOVE and SKEW from YFinance
     try:
         yf_indices = yf.download(["^MOVE", "^SKEW"], start=df.index.min(), progress=False)['Close']
@@ -80,24 +82,28 @@ def get_data(sync_key):
     except:
         st.warning("YFinance Volatility fetch failed.")
 
-    # 2. 10Y2Y, 10Y3M, HY_Spread from FRED
+    # 2. FRED Macro
     try:
         fred_symbols = ["T10Y2Y", "T10Y3M", "BAMLH0A0HYM2"]
-        # Use web.DataReader exclusively for FRED
         fred_data = web.DataReader(fred_symbols, "fred", df.index.min(), datetime.now())
         fred_data = fred_data.rename(columns={"BAMLH0A0HYM2": "HY_Spread"})
         df = df.join(fred_data, how='left')
-    except Exception as e:
-        st.warning(f"FRED Macro fetch failed: {e}")
+    except:
+        st.warning("FRED Macro fetch failed.")
 
-    # 3. Z-SCORE ENGINEERING
+    # 3. Z-SCORE ENGINEERING (Exclude SOFR and Returns)
     features_to_z = [c for c in df.columns if '_Ret' not in c and c != 'SOFR']
     for col in features_to_z:
         rolling_mean = df[col].rolling(window=20).mean()
         rolling_std = df[col].rolling(window=20).std()
         df[f"{col}_Z"] = (df[col] - rolling_mean) / (rolling_std + 1e-9)
 
-    return df.ffill().bfill().dropna()
+    # Final cleanup ensuring SOFR survived
+    df = df.ffill().bfill()
+    if 'SOFR' not in df.columns and has_sofr:
+        st.error("SOFR column lost during merge!")
+    
+    return df.dropna()
 
 # ------------------------------
 # 4. RUNTIME
@@ -107,6 +113,8 @@ if run_button:
     
     if df.empty:
         st.error("Error: Dataset empty.")
+    elif 'SOFR' not in df.columns:
+        st.error("Critical Error: SOFR column missing. Please ensure your HF dataset contains 'SOFR'.")
     else:
         target_etfs = ['TLT_Ret', 'TBT_Ret', 'VNQ_Ret', 'SLV_Ret', 'GLD_Ret']
         target_etfs = [t for t in target_etfs if t in df.columns]
@@ -145,19 +153,19 @@ if run_button:
                 
                 for hold in holdings:
                     daily_strat_rets = []
-                    sofr = df['SOFR'].iloc[split_idx:].values
+                    # Critical SOFR lookup
+                    sofr_values = df['SOFR'].iloc[split_idx:].values
                     for i in range(len(preds)):
                         idx = np.argmax(preds[i])
                         sorted_p = np.sort(preds[i])
-                        # Conviction Rule
-                        if preds[i][idx] > (sorted_p[-2] * 1.2) and preds[i][idx] > (sofr[i]/252 + fee_pct):
+                        if preds[i][idx] > (sorted_p[-2] * 1.2) and preds[i][idx] > (sofr_values[i]/252 + fee_pct):
                             daily_strat_rets.append(test_y[i][idx] - (fee_pct if i % hold == 0 else 0))
                         else:
-                            daily_strat_rets.append(sofr[i]/252)
+                            daily_strat_rets.append(sofr_values[i]/252)
                     
                     if np.mean(daily_strat_rets) > best_score:
                         best_score = np.mean(daily_strat_rets)
-                        final_res = {"model": model, "strat_rets": daily_strat_rets, "dates": df.index[split_idx:], "sofr": sofr, "last_x": X[-1:], "input_features": input_features, "target_names": target_etfs, "lb": lb, "hold": hold, "preds": preds}
+                        final_res = {"model": model, "strat_rets": daily_strat_rets, "dates": df.index[split_idx:], "sofr": sofr_values, "last_x": X[-1:], "input_features": input_features, "target_names": target_etfs, "lb": lb, "hold": hold, "preds": preds}
 
         if final_res:
             res = final_res
@@ -165,7 +173,7 @@ if run_button:
             cum_strat = np.cumprod(1 + strat_rets)
             oos_yrs = (res["dates"][-1] - res["dates"][0]).days / 365.25
             ann_ret = (cum_strat[-1] ** (1/oos_yrs)) - 1
-            sharpe = np.sqrt(252) * np.mean(strat_rets - (res["sofr"]/252)) / np.std(strat_rets)
+            sharpe = np.sqrt(252) * np.mean(strat_rets - (res["sofr"]/252)) / (np.std(strat_rets) + 1e-9)
             
             st.markdown("### Performance Scorecard")
             k1, k2, k3, k4, k5 = st.columns(5)

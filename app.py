@@ -2,7 +2,11 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import yfinance as yf
-import pandas_datareader.data as web
+# Safe import for pandas_datareader
+try:
+    import pandas_datareader.data as web
+except ImportError:
+    st.error("Missing library: pandas_datareader. Please run 'pip install pandas-datareader'")
 import pandas_market_calendars as mcal
 from datetime import datetime, timedelta
 import pytz
@@ -67,7 +71,6 @@ def get_data(sync_key):
     ds = ds.set_index(date_col).sort_index()
     df = ds[ds.index.year >= start_year].copy()
     
-    # --- SPLIT FETCH LOGIC ---
     # 1. MOVE and SKEW from YFinance
     try:
         yf_indices = yf.download(["^MOVE", "^SKEW"], start=df.index.min(), progress=False)['Close']
@@ -80,13 +83,14 @@ def get_data(sync_key):
     # 2. 10Y2Y, 10Y3M, HY_Spread from FRED
     try:
         fred_symbols = ["T10Y2Y", "T10Y3M", "BAMLH0A0HYM2"]
+        # Use web.DataReader exclusively for FRED
         fred_data = web.DataReader(fred_symbols, "fred", df.index.min(), datetime.now())
         fred_data = fred_data.rename(columns={"BAMLH0A0HYM2": "HY_Spread"})
         df = df.join(fred_data, how='left')
-    except:
-        st.warning("FRED Macro fetch failed.")
+    except Exception as e:
+        st.warning(f"FRED Macro fetch failed: {e}")
 
-    # 3. Z-SCORE ENGINEERING (Idea #1)
+    # 3. Z-SCORE ENGINEERING
     features_to_z = [c for c in df.columns if '_Ret' not in c and c != 'SOFR']
     for col in features_to_z:
         rolling_mean = df[col].rolling(window=20).mean()
@@ -127,7 +131,6 @@ if run_button:
                 train_X, test_X = X[:split_idx - lb], X[split_idx - lb:]
                 train_y, test_y = y[:split_idx - lb], y[split_idx - lb:]
 
-                # Architecture
                 inputs = Input(shape=(X.shape[1], X.shape[2]))
                 attn_out, _ = MultiHeadAttention(num_heads=4, key_dim=X.shape[2])(inputs, inputs, return_attention_scores=True)
                 attn_res = LayerNormalization()(attn_out + inputs)
@@ -146,7 +149,7 @@ if run_button:
                     for i in range(len(preds)):
                         idx = np.argmax(preds[i])
                         sorted_p = np.sort(preds[i])
-                        # 4. CONVICTION GATING (Idea #2)
+                        # Conviction Rule
                         if preds[i][idx] > (sorted_p[-2] * 1.2) and preds[i][idx] > (sofr[i]/252 + fee_pct):
                             daily_strat_rets.append(test_y[i][idx] - (fee_pct if i % hold == 0 else 0))
                         else:

@@ -29,33 +29,43 @@ def get_est_time():
     return datetime.now(pytz.timezone('US/Eastern'))
 
 def is_sync_window():
-    # Adjusted to match your 07:06 server time
     now_est = get_est_time()
-    return (now_est.hour >= 7 and now_est.hour <= 9) or (now_est.hour >= 18 and now_est.hour <= 20)
+    # Matches your server time 07:06
+    return (now_est.hour >= 7 and now_est.hour <= 9) or (now_est.hour >= 18 and now_est.hour <= 21)
 
 st.set_page_config(page_title="P2-Transformer Pro", layout="wide")
 
 # ------------------------------
-# 2. DATA ENGINE (RAW CSV FETCH)
+# 2. DATA ENGINE (CASE-INSENSITIVE)
 # ------------------------------
 def get_data(start_year):
-    # FORCE FETCH RAW CSV to bypass the old 'data/' folder
     raw_url = f"https://huggingface.co/datasets/{REPO_ID}/resolve/main/etf_data.csv"
     try:
         df = pd.read_csv(raw_url)
+        # CLEANING: Remove hidden spaces from column names
+        df.columns = df.columns.str.strip()
     except Exception as e:
-        st.error(f"Raw CSV fetch failed. Ensure etf_data.csv is in root. Error: {e}")
+        st.error(f"Fetch failed: {e}")
         return pd.DataFrame()
 
-    # Standardize Index
-    date_col = 'Date' if 'Date' in df.columns else 'date'
+    # FIX: Robust Date Column Detection
+    date_col = None
+    for potential_name in ['Date', 'date', 'DATE', 'Timestamp']:
+        if potential_name in df.columns:
+            date_col = potential_name
+            break
+    
+    if not date_col:
+        st.error(f"Could not find a Date column! Found: {list(df.columns)}")
+        return pd.DataFrame()
+
     df[date_col] = pd.to_datetime(df[date_col]).dt.tz_localize(None)
     df = df.set_index(date_col).sort_index()
     df = df[df.index.year >= start_year].copy()
 
-    # Sync Missing Signals if in window
+    # Macro Sync Logic
     if is_sync_window():
-        with st.status("🔄 Syncing Macro Signals...", expanded=False):
+        with st.status("🔄 Updating Macro Signals...", expanded=False):
             try:
                 yf_inc = yf.download(["^MOVE", "^SKEW"], start="2008-01-01", progress=False)['Close']
                 yf_inc = yf_inc.rename(columns={"^MOVE": "MOVE", "^SKEW": "SKEW"}).tz_localize(None)
@@ -69,11 +79,11 @@ def get_data(start_year):
                 if token:
                     df.to_csv("etf_data.csv")
                     HfApi().upload_file(path_or_fileobj="etf_data.csv", path_in_repo="etf_data.csv", repo_id=REPO_ID, repo_type="dataset", token=token)
-                    st.toast("✅ Hub Pushed Successfully!")
+                    st.toast("✅ Hub Updated!")
             except Exception as e:
-                st.warning(f"Sync Warning: {e}")
+                st.warning(f"Sync issue: {e}")
 
-    # Feature Engineering (Z-Scores)
+    # Feature Engineering
     for col in [c for c in df.columns if '_Ret' not in c and c != 'SOFR']:
         df[f"{col}_Z"] = (df[col] - df[col].rolling(20).mean()) / (df[col].rolling(20).std() + 1e-9)
 
@@ -94,7 +104,7 @@ with st.sidebar:
 st.title("P2-TRANSFORMER-ETF-PREDICTOR")
 
 # ------------------------------
-# 4. EXECUTION
+# 4. RUNTIME
 # ------------------------------
 if run_button:
     df = get_data(start_yr)
@@ -102,16 +112,16 @@ if run_button:
         target_etfs = [t for t in ['TLT_Ret', 'TBT_Ret', 'VNQ_Ret', 'SLV_Ret', 'GLD_Ret'] if t in df.columns]
         input_features = [c for c in df.columns if c not in target_etfs and c != 'SOFR']
         
-        # Validate critical signals
-        missing = [s for s in ['MOVE', 'SKEW', 'HY_Spread'] if s not in df.columns]
-        if missing:
-            st.error(f"Still missing: {missing}. Run again during Sync Window.")
+        # Verify Macro Data Presence
+        critical = ['MOVE', 'SKEW', 'HY_Spread']
+        if not all(x in df.columns for x in critical):
+            st.error(f"Missing: {[x for x in critical if x not in df.columns]}. Re-running Sync...")
         else:
             scaler = MinMaxScaler()
             scaled_input = scaler.fit_transform(df[input_features])
             lb = 30
             
-            with st.spinner("Training Transformer..."):
+            with st.spinner("Training Alpha Engine..."):
                 X, y = [], []
                 for i in range(lb, len(scaled_input)):
                     X.append(scaled_input[i-lb:i])
@@ -120,7 +130,7 @@ if run_button:
                 split = int(len(X) * 0.8)
                 
                 inputs = Input(shape=(X.shape[1], X.shape[2]))
-                # FIXED: Removed symbolic iteration (no underscore)
+                # FIXED: Modern Keras 3 Syntax
                 attn_out = MultiHeadAttention(num_heads=4, key_dim=X.shape[2])(inputs, inputs)
                 attn_res = LayerNormalization()(attn_out + inputs)
                 pool = GlobalMaxPooling1D()(Conv1D(64, 3, activation='relu', padding='same')(attn_res))
@@ -130,7 +140,6 @@ if run_button:
                 model.compile(optimizer='adam', loss='mse')
                 model.fit(X[:split], y[:split], epochs=int(epochs), batch_size=32, verbose=0)
                 
-                # Backtest Result
                 preds = model.predict(X[split:])
                 strat_rets = []
                 for i in range(len(preds)):

@@ -11,6 +11,11 @@ except ImportError:
     st.stop()
 from datetime import datetime, timedelta
 import pytz
+try:
+    import pandas_market_calendars as mcal
+    NYSE_CALENDAR_AVAILABLE = True
+except ImportError:
+    NYSE_CALENDAR_AVAILABLE = False
 import tensorflow as tf
 from tensorflow.keras.models import Model
 from tensorflow.keras.layers import Input, Dense, Dropout, LayerNormalization, MultiHeadAttention, GlobalAveragePooling1D
@@ -30,6 +35,33 @@ from plotly.subplots import make_subplots
 # 1. CORE CONFIG & SYNC WINDOW
 # ------------------------------
 REPO_ID = "P2SAMAPA/my-etf-data"
+
+def get_next_trading_day(current_date):
+    """Get next valid NYSE trading day (skip weekends and holidays)"""
+    if NYSE_CALENDAR_AVAILABLE:
+        try:
+            nyse = mcal.get_calendar('NYSE')
+            # Get next 10 days of trading schedule
+            schedule = nyse.schedule(
+                start_date=current_date,
+                end_date=current_date + timedelta(days=10)
+            )
+            if len(schedule) > 0:
+                # Return first trading day after current date
+                next_day = schedule.index[0].date()
+                if next_day == current_date.date():
+                    # If current date is a trading day, get next one
+                    if len(schedule) > 1:
+                        return schedule.index[1].date()
+                return next_day
+        except Exception as e:
+            pass  # Fall back to simple logic
+    
+    # Fallback: simple weekend skip (doesn't handle holidays)
+    next_day = current_date + timedelta(days=1)
+    while next_day.weekday() >= 5:  # 5=Saturday, 6=Sunday
+        next_day += timedelta(days=1)
+    return next_day.date()
 
 def get_est_time():
     """Get current time in US Eastern timezone"""
@@ -538,15 +570,16 @@ with st.sidebar:
     st.divider()
     
     st.subheader("⚙️ Training Settings")
-    epochs = st.number_input("Epochs", 10, 500, 100, step=10)
     
-    # Lookback only relevant for Transformer models
+    # Epochs only relevant for Transformer models
     if "Option A" in model_option:
+        epochs = st.number_input("Epochs", 10, 500, 100, step=10)
         lookback = st.slider("Lookback Days", 20, 60, 30, step=5)
         st.caption("ℹ️ Transformer: 2 heads, 1 layer, 64 FF dim")
     else:
-        lookback = 30  # Default value (not used)
-        st.info("ℹ️ Lookback N/A for tree-based models (uses current day features only)")
+        epochs = 100  # Not used for RF+XGBoost (hardcoded to 500 rounds)
+        lookback = 30  # Not used
+        st.info("ℹ️ RF+XGBoost uses optimized settings: 500 trees/rounds with early stopping")
     
     st.divider()
     
@@ -554,14 +587,13 @@ with st.sidebar:
     
     split_option = st.selectbox(
         "Train/Val/Test Split",
-        ["60/20/20", "70/15/15", "80/10/10"],
-        index=1,  # Default to 70/15/15
+        ["70/15/15", "80/10/10"],
+        index=0,  # Default to 70/15/15
         help="Choose data split ratio: Train/Validation/Out-of-Sample"
     )
     
     # Parse split ratios
     split_ratios = {
-        "60/20/20": (0.60, 0.20, 0.20),
         "70/15/15": (0.70, 0.15, 0.15),
         "80/10/10": (0.80, 0.10, 0.10)
     }
@@ -580,16 +612,6 @@ with st.sidebar:
     
     if use_walk_forward:
         st.info("📊 Walk-forward will create multiple test windows across different market regimes")
-    
-    # PRIORITY 2: 60/20/20 Diagnostic Mode
-    if split_option == "60/20/20":
-        show_diagnostics = st.checkbox(
-            "Show 60/20/20 Diagnostics",
-            value=True,
-            help="Display detailed analysis of why 60/20/20 may underperform"
-        )
-    else:
-        show_diagnostics = False
     
     st.divider()
     
@@ -762,6 +784,54 @@ if run_button:
         st.error("❌ No data available. Please check data sources.")
         st.stop()
     
+    # Calculate years of data
+    years_of_data = df.index[-1].year - df.index[0].year + 1
+    
+    # VALIDATION: Check minimum data requirements
+    st.write(f"📅 **Data Range:** {df.index[0].strftime('%Y-%m-%d')} to {df.index[-1].strftime('%Y-%m-%d')} ({years_of_data} years)")
+    
+    # Critical validation warnings
+    validation_errors = []
+    validation_warnings = []
+    
+    if split_option == "80/10/10" and years_of_data < 10:
+        validation_warnings.append(f"""
+        ⚠️ **80/10/10 with {years_of_data} years: UNSTABLE**
+        - Needs 12+ years for reliability (you have {years_of_data})
+        - Test set will be very small (< 6 months)
+        - May work but results will be high variance
+        """)
+    
+    # Calculate test set size
+    train_pct, val_pct, test_pct = split_ratios[split_option]
+    estimated_test_samples = int(len(df) * test_pct)
+    
+    if estimated_test_samples < 200:
+        validation_warnings.append(f"""
+        ⚠️ **Test Set Too Small: {estimated_test_samples} samples**
+        - Minimum recommended: 250 samples (1 year)
+        - Small test sets produce unreliable metrics
+        - Consider using earlier start year or different split
+        """)
+    
+    # Display validation results
+    if validation_errors:
+        for error in validation_errors:
+            st.error(error)
+        st.error("**❌ STOP: Configuration will likely fail. Please adjust settings above.**")
+        if st.button("⚠️ Run Anyway (Not Recommended)", type="secondary"):
+            st.warning("Proceeding despite warnings...")
+        else:
+            st.stop()
+    
+    if validation_warnings:
+        for warning in validation_warnings:
+            st.warning(warning)
+        st.info("💡 **Recommendation:** Use 70/15/15 split OR choose earlier start year (2008-2012)")
+    
+    if not validation_errors and not validation_warnings:
+        st.success(f"✅ Configuration validated: {years_of_data} years, {estimated_test_samples} test samples")
+    
     # Identify target ETFs and input features
     target_etfs = [col for col in df.columns if col.endswith('_Ret') and 
                    any(etf in col for etf in ['TLT', 'TBT', 'VNQ', 'SLV', 'GLD'])]
@@ -786,45 +856,6 @@ if run_button:
     
     st.info(f"🎯 **Targets:** {len(target_etfs)} ETFs | **Features:** {len(input_features)} signals | **Model:** {model_option}")
     
-    # PRIORITY 2: Show 60/20/20 diagnostics if enabled
-    if 'show_diagnostics' in locals() and show_diagnostics:
-        st.warning("⚠️ **60/20/20 Diagnostic Mode Active**")
-        
-        total_samples = len(df)
-        train_samples = int(total_samples * 0.60)
-        val_samples = int(total_samples * 0.20)
-        test_samples = total_samples - train_samples - val_samples
-        
-        st.write(f"""
-        **60/20/20 Split Analysis:**
-        - Total Samples: {total_samples}
-        - Training: {train_samples} ({train_samples/total_samples*100:.1f}%)
-        - Validation: {val_samples} ({val_samples/total_samples*100:.1f}%)
-        - Test: {test_samples} ({test_samples/total_samples*100:.1f}%)
-        - Start Year: {start_yr} → Data from {df.index[0].year} to {df.index[-1].year}
-        """)
-        
-        # Calculate data span
-        years_of_data = df.index[-1].year - df.index[0].year
-        train_years = years_of_data * 0.60
-        test_years = years_of_data * 0.20
-        
-        if years_of_data < 5:
-            st.error(f"""
-            🚨 **WARNING: Insufficient Training Data**
-            - You have only {years_of_data} years of data
-            - 60% training = {train_years:.1f} years ({train_samples} samples)
-            - Random Forest typically needs 5+ years of diverse market regimes
-            - **Recommendation:** Use start year ≤ 2016 for 60/20/20, or use 80/10/10 with current start year
-            """)
-        
-        if test_samples < 200:
-            st.warning(f"""
-            ⚠️ **Small Test Set Warning**
-            - Test set has only {test_samples} samples ({test_years:.1f} years)
-            - Small test sets = high variance in metrics
-            - Performance may not be representative
-            """)
     
     # Prepare data based on model type
     if "Option B" in model_option:
@@ -1003,6 +1034,8 @@ if run_button:
     st.divider()
     
     next_day = (df.index[-1] + timedelta(days=1)).strftime('%Y-%m-%d')
+    next_day_date = get_next_trading_day(df.index[-1])
+    next_day = next_day_date.strftime('%Y-%m-%d')
     latest_signal = audit_trail[-1]['Signal']
     
     # Make allocation VERY prominent
@@ -1265,7 +1298,8 @@ if run_button:
     st.dataframe(styled_audit, use_container_width=True, height=600)
     
     # PRIORITY 1: Walk-Forward Validation Results
-    if 'use_walk_forward' in locals() and use_walk_forward and "Option B" in model_option:
+    # Check if walk-forward is enabled (must check in global scope from sidebar)
+    if use_walk_forward and "Option B" in model_option:
         st.divider()
         st.subheader("🔬 Walk-Forward Validation Results")
         st.write("**Testing across multiple time periods to assess regime robustness:**")
@@ -1304,7 +1338,7 @@ if run_button:
             else:
                 st.success("✅ Consistent performance across different market regimes")
         else:
-            st.error("Not enough data for walk-forward validation")
+            st.error("❌ Not enough data for walk-forward validation. Need at least 5 windows worth of data.")
     
     # Model summary
     with st.expander("🔧 Model Architecture Details"):

@@ -453,8 +453,10 @@ def get_data(start_year, force_refresh=False):
     
     st.success(f"✅ Added {len([c for c in df.columns if 'Regime' in c or 'YC_' in c or 'Credit_' in c or 'Rates_' in c])} regime features")
     
-    # Filter by start year and clean
+    # CRITICAL: Filter by start year
     df = df[df.index.year >= start_year]
+    
+    st.success(f"✅ Data filtered: Using {len(df)} samples from {df.index[0].year} to {df.index[-1].year}")
     
     # Forward fill gaps (max 5 days)
     df = df.fillna(method='ffill', limit=5)
@@ -601,20 +603,6 @@ with st.sidebar:
     
     st.divider()
     
-    # PRIORITY 1: Walk-Forward Testing Option
-    st.subheader("🔬 Advanced Testing")
-    
-    use_walk_forward = st.checkbox(
-        "Enable Walk-Forward Validation",
-        value=False,
-        help="Test on multiple periods instead of just final period. Shows regime robustness."
-    )
-    
-    if use_walk_forward:
-        st.info("📊 Walk-forward will create multiple test windows across different market regimes")
-    
-    st.divider()
-    
     run_button = st.button("🚀 Execute Model", type="primary", use_container_width=True)
     
     st.divider()
@@ -622,123 +610,6 @@ with st.sidebar:
     refresh_only_button = st.button("🔄 Refresh Dataset Only", type="secondary", use_container_width=True, 
                                     help="Update HF dataset with latest data without training the model")
 
-# ------------------------------
-# 9. WALK-FORWARD VALIDATION (PRIORITY 1)
-# ------------------------------
-def walk_forward_validation(X, y, y_raw, dates, train_pct, val_pct, n_windows=5):
-    """
-    Perform walk-forward validation across multiple time windows
-    
-    Instead of testing only on final period (2024-2026), test on multiple periods
-    to assess regime robustness
-    
-    Args:
-        X: Feature array
-        y: Target classes
-        y_raw: Raw returns
-        dates: Date index
-        train_pct: Training percentage
-        val_pct: Validation percentage  
-        n_windows: Number of test windows
-    
-    Returns:
-        List of results for each window
-    """
-    results = []
-    
-    # Calculate window size
-    total_size = len(X)
-    window_size = total_size // (n_windows + 1)
-    
-    for i in range(n_windows):
-        # Calculate split points for this window
-        test_start = (i + 1) * window_size
-        test_end = min(test_start + window_size, total_size)
-        
-        # Use all data before test period for training
-        train_end = int(test_start * train_pct / (train_pct + val_pct))
-        val_start = train_end
-        val_end = test_start
-        
-        if train_end < window_size or (test_end - test_start) < 50:
-            continue  # Skip if not enough data
-        
-        X_train_wf = X[:train_end]
-        y_train_wf = y[:train_end]
-        
-        X_val_wf = X[val_start:val_end]
-        y_val_wf = y[val_start:val_end]
-        
-        X_test_wf = X[test_start:test_end]
-        y_test_wf = y[test_start:test_end]
-        y_raw_test_wf = y_raw[test_start:test_end]
-        
-        # Train models
-        rf_model = RandomForestClassifier(
-            n_estimators=500,
-            max_depth=15,
-            min_samples_split=10,
-            min_samples_leaf=3,
-            max_features='sqrt',
-            random_state=42,
-            n_jobs=-1
-        )
-        rf_model.fit(X_train_wf, y_train_wf)
-        
-        xgb_model = xgb.XGBClassifier(
-            n_estimators=500,
-            max_depth=8,
-            learning_rate=0.03,
-            subsample=0.8,
-            colsample_bytree=0.8,
-            min_child_weight=3,
-            gamma=0.1,
-            reg_alpha=0.1,
-            reg_lambda=1.0,
-            random_state=42,
-            n_jobs=-1,
-            early_stopping_rounds=50,
-            eval_metric='mlogloss'
-        )
-        xgb_model.fit(
-            X_train_wf, y_train_wf,
-            eval_set=[(X_val_wf, y_val_wf)],
-            verbose=False
-        )
-        
-        # Ensemble predictions
-        rf_probs = rf_model.predict_proba(X_test_wf)
-        xgb_probs = xgb_model.predict_proba(X_test_wf)
-        ensemble_probs = (rf_probs + xgb_probs) / 2
-        preds_wf = np.argmax(ensemble_probs, axis=1)
-        
-        # Calculate returns
-        strat_rets_wf = []
-        for j in range(len(preds_wf)):
-            realized_ret = y_raw_test_wf[j][preds_wf[j]]
-            net_ret = realized_ret - 0.0015  # 15 bps fee
-            strat_rets_wf.append(net_ret)
-        
-        strat_rets_wf = np.array(strat_rets_wf)
-        
-        # Calculate metrics
-        cum_returns = np.cumprod(1 + strat_rets_wf)
-        ann_return = (cum_returns[-1] ** (252 / len(strat_rets_wf))) - 1
-        sharpe = np.mean(strat_rets_wf) / (np.std(strat_rets_wf) + 1e-9) * np.sqrt(252)
-        
-        # Store results
-        results.append({
-            'window': i + 1,
-            'test_period': f"{dates[test_start]} to {dates[test_end-1]}",
-            'test_samples': len(X_test_wf),
-            'ann_return': ann_return,
-            'sharpe': sharpe,
-            'cum_return': cum_returns[-1]
-        })
-    
-    return results
-
-# ------------------------------
 # 10. MAIN APPLICATION
 # ------------------------------
 st.title("🤖 P2-ETF-PREDICTOR")
@@ -1296,49 +1167,6 @@ if run_button:
     ])
     
     st.dataframe(styled_audit, use_container_width=True, height=600)
-    
-    # PRIORITY 1: Walk-Forward Validation Results
-    # Check if walk-forward is enabled (must check in global scope from sidebar)
-    if use_walk_forward and "Option B" in model_option:
-        st.divider()
-        st.subheader("🔬 Walk-Forward Validation Results")
-        st.write("**Testing across multiple time periods to assess regime robustness:**")
-        
-        with st.spinner("Running walk-forward validation..."):
-            wf_results = walk_forward_validation(
-                X, y, y_raw, df.index, 
-                train_pct, val_pct, 
-                n_windows=5
-            )
-        
-        if wf_results:
-            wf_df = pd.DataFrame(wf_results)
-            
-            # Display summary table
-            st.dataframe(wf_df.style.format({
-                'ann_return': '{:.2%}',
-                'sharpe': '{:.2f}',
-                'cum_return': '{:.2f}'
-            }).set_properties(**{
-                'font-size': '16px'
-            }), use_container_width=True)
-            
-            # Calculate aggregate stats
-            avg_return = wf_df['ann_return'].mean()
-            avg_sharpe = wf_df['sharpe'].mean()
-            std_return = wf_df['ann_return'].std()
-            
-            col1, col2, col3 = st.columns(3)
-            col1.metric("Avg Return", f"{avg_return*100:.2f}%")
-            col2.metric("Avg Sharpe", f"{avg_sharpe:.2f}")
-            col3.metric("Return StdDev", f"{std_return*100:.2f}%")
-            
-            if std_return > 0.15:
-                st.warning("⚠️ High variance across periods suggests regime-dependent performance")
-            else:
-                st.success("✅ Consistent performance across different market regimes")
-        else:
-            st.error("❌ Not enough data for walk-forward validation. Need at least 5 windows worth of data.")
     
     # Model summary
     with st.expander("🔧 Model Architecture Details"):

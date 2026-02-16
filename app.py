@@ -421,6 +421,9 @@ def get_data(start_year, force_refresh=False):
     # PRIORITY 3: ADD REGIME DETECTION FEATURES
     st.write("🎯 **Adding Regime Detection Features...**")
     
+    # Show data range BEFORE feature engineering
+    st.info(f"📊 Raw data loaded: {len(df)} samples from {df.index[0].year} to {df.index[-1].year}")
+    
     # VIX Regime (volatility environment)
     if 'VIX' in df.columns:
         df['VIX_Regime_Low'] = (df['VIX'] < 15).astype(int)      # Risk-on
@@ -455,14 +458,22 @@ def get_data(start_year, force_refresh=False):
     
     # CRITICAL: Filter by start year
     df = df[df.index.year >= start_year]
-    
-    st.success(f"✅ Data filtered: Using {len(df)} samples from {df.index[0].year} to {df.index[-1].year}")
+    st.info(f"📅 After year filter ({start_year}+): {len(df)} samples from {df.index[0].year if len(df) > 0 else 'N/A'} to {df.index[-1].year if len(df) > 0 else 'N/A'}")
     
     # Forward fill gaps (max 5 days)
     df = df.fillna(method='ffill', limit=5)
     
+    # Count NaNs before dropping
+    nan_count_before = df.isna().sum().sum()
+    
     # Drop remaining NaNs
     df = df.dropna()
+    
+    # Show final data range AFTER cleaning
+    if len(df) > 0:
+        st.success(f"✅ Final dataset: {len(df)} samples from {df.index[0].strftime('%Y-%m-%d')} to {df.index[-1].strftime('%Y-%m-%d')} (dropped {nan_count_before} NaN cells)")
+    else:
+        st.error("❌ No data remaining after cleaning!")
     
     return df
 

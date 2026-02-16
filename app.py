@@ -17,6 +17,12 @@ from tensorflow.keras.layers import Input, Dense, Dropout, LayerNormalization, M
 from tensorflow.keras.regularizers import l2
 from tensorflow.keras.callbacks import EarlyStopping
 from sklearn.preprocessing import MinMaxScaler
+from sklearn.ensemble import RandomForestClassifier
+try:
+    import xgboost as xgb
+except ImportError:
+    st.error("Missing xgboost. Please install: pip install xgboost")
+    st.stop()
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
@@ -34,7 +40,7 @@ def is_sync_window():
     now_est = get_est_time()
     return (7 <= now_est.hour < 8) or (19 <= now_est.hour < 20)
 
-st.set_page_config(page_title="P2-Transformer Pro", layout="wide")
+st.set_page_config(page_title="P2-ETF-Predictor", layout="wide")
 
 # ------------------------------
 # 2. POSITIONAL ENCODING LAYER
@@ -95,7 +101,7 @@ class PositionalEncoding(tf.keras.layers.Layer):
         return config
 
 # ------------------------------
-# 3. ROBUST DATA FETCHING ENGINE
+# 3. DATA FETCHING FUNCTIONS
 # ------------------------------
 def fetch_macro_data_robust(start_date="2008-01-01"):
     """
@@ -106,7 +112,6 @@ def fetch_macro_data_robust(start_date="2008-01-01"):
     data_sources = {}
     
     # 1. FRED Data (Most Reliable)
-    st.write("📊 Fetching FRED data...")
     try:
         fred_symbols = {
             "T10Y2Y": "T10Y2Y",      # 10Y-2Y Treasury Spread
@@ -130,23 +135,11 @@ def fetch_macro_data_robust(start_date="2008-01-01"):
         
         all_data.append(fred_data)
         data_sources['FRED'] = list(fred_data.columns)
-        st.success(f"✅ FRED: {len(fred_data.columns)} signals fetched")
         
     except Exception as e:
         st.warning(f"⚠️ FRED partial failure: {e}")
-        # Try individual symbols
-        for symbol, name in fred_symbols.items():
-            try:
-                temp = web.DataReader(symbol, "fred", start_date, datetime.now())
-                temp.columns = [name]
-                if temp.index.tz is not None:
-                    temp.index = temp.index.tz_localize(None)
-                all_data.append(temp)
-            except:
-                pass
     
     # 2. Yahoo Finance Data
-    st.write("📊 Fetching Yahoo Finance data...")
     try:
         yf_symbols = {
             "GC=F": "GOLD",      # Gold Futures
@@ -172,13 +165,11 @@ def fetch_macro_data_robust(start_date="2008-01-01"):
         
         all_data.append(yf_data)
         data_sources['Yahoo'] = list(yf_data.columns)
-        st.success(f"✅ Yahoo: {len(yf_data.columns)} signals fetched")
         
     except Exception as e:
         st.warning(f"⚠️ Yahoo Finance failed: {e}")
     
     # 3. VIX Term Structure (Standard Macro Signal)
-    st.write("📊 Fetching VIX term structure...")
     try:
         vix_term = yf.download(
             ["^VIX", "^VIX3M"],  # VIX and 3-month VIX
@@ -202,7 +193,6 @@ def fetch_macro_data_robust(start_date="2008-01-01"):
             
             all_data.append(vix_term)
             data_sources['VIX_Term'] = list(vix_term.columns)
-            st.success(f"✅ VIX Term Structure: {len(vix_term.columns)} signals")
     
     except Exception as e:
         st.warning(f"⚠️ VIX Term Structure failed: {e}")
@@ -217,18 +207,13 @@ def fetch_macro_data_robust(start_date="2008-01-01"):
         # Forward fill missing values (max 5 days)
         combined = combined.fillna(method='ffill', limit=5)
         
-        st.info(f"📈 Total macro signals: {len(combined.columns)} from {len(data_sources)} sources")
-        
         return combined
     else:
         st.error("❌ Failed to fetch any macro data!")
         return pd.DataFrame()
 
 def fetch_etf_data(etfs, start_date="2008-01-01"):
-    """
-    Fetch ETF price data and calculate returns
-    """
-    st.write(f"📊 Fetching ETF data for: {', '.join(etfs)}...")
+    """Fetch ETF price data and calculate returns"""
     
     try:
         etf_data = yf.download(
@@ -256,8 +241,6 @@ def fetch_etf_data(etfs, start_date="2008-01-01"):
         # Combine
         result = pd.concat([etf_returns, etf_vol], axis=1)
         
-        st.success(f"✅ ETF data: {len(etf_data.columns)} ETFs, {len(result.columns)} features")
-        
         return result
         
     except Exception as e:
@@ -268,9 +251,7 @@ def fetch_etf_data(etfs, start_date="2008-01-01"):
 # 4. HF DATASET SMART UPDATE
 # ------------------------------
 def smart_update_hf_dataset(new_data, token):
-    """
-    Smart update: Only uploads if new data exists or gaps are filled
-    """
+    """Smart update: Only uploads if new data exists or gaps are filled"""
     if not token:
         st.warning("⚠️ No HF_TOKEN found. Skipping dataset update.")
         return new_data
@@ -292,8 +273,6 @@ def smart_update_hf_dataset(new_data, token):
         # Remove timezone if present
         if existing_df.index.tz is not None:
             existing_df.index = existing_df.index.tz_localize(None)
-        
-        st.info(f"📥 Existing dataset: {len(existing_df)} rows, {len(existing_df.columns)} columns")
         
         # Merge: New data takes priority for overlapping dates
         combined = new_data.combine_first(existing_df)
@@ -337,19 +316,12 @@ def smart_update_hf_dataset(new_data, token):
 # 5. MAIN DATA ENGINE
 # ------------------------------
 def get_data(start_year, force_refresh=False):
-    """
-    Main data fetching and processing pipeline
-    
-    Args:
-        start_year: Filter data from this year onwards
-        force_refresh: If True, fetch fresh data regardless of sync window
-    """
+    """Main data fetching and processing pipeline"""
     # Always try to load from HF first
     raw_url = f"https://huggingface.co/datasets/{REPO_ID}/resolve/main/etf_data.csv"
     df = pd.DataFrame()
     
     try:
-        st.info("📥 Loading dataset from HuggingFace...")
         df = pd.read_csv(raw_url)
         df.columns = df.columns.str.strip()
         
@@ -362,8 +334,6 @@ def get_data(start_year, force_refresh=False):
         if df.index.tz is not None:
             df.index = df.index.tz_localize(None)
         
-        st.success(f"✅ Loaded {len(df)} rows from HuggingFace")
-        
     except Exception as e:
         st.warning(f"⚠️ Could not load from HuggingFace: {e}")
     
@@ -373,11 +343,7 @@ def get_data(start_year, force_refresh=False):
     if should_sync:
         sync_reason = "🔄 Manual Refresh Requested" if force_refresh else "🔄 Sync Window Active"
         
-        with st.status(f"{sync_reason} - Updating Dataset...", expanded=True):
-            st.write(f"🕒 Current time (EST): {get_est_time().strftime('%H:%M:%S')}")
-            
-            if force_refresh:
-                st.info("📡 Force refresh enabled - fetching data outside sync window")
+        with st.status(f"{sync_reason} - Updating Dataset...", expanded=False):
             
             # Fetch fresh data
             etf_list = ["TLT", "TBT", "VNQ", "SLV", "GLD"]
@@ -395,9 +361,6 @@ def get_data(start_year, force_refresh=False):
                 # Update HF dataset
                 token = os.getenv("HF_TOKEN")
                 df = smart_update_hf_dataset(new_df, token)
-                
-                if force_refresh:
-                    st.success("✅ Manual refresh completed successfully!")
             else:
                 st.error("❌ Data fetch failed during sync")
     
@@ -412,8 +375,6 @@ def get_data(start_year, force_refresh=False):
             df = pd.concat([etf_data, macro_data], axis=1)
     
     # Feature Engineering: Z-Scores for macro signals
-    st.write("🔧 Engineering features...")
-    
     macro_cols = ['VIX', 'DXY', 'COPPER', 'GOLD', 'HY_Spread', 'T10Y2Y', 'T10Y3M', 
                   'VIX_Spot', 'VIX_3M', 'VIX_Term_Slope']
     
@@ -432,14 +393,7 @@ def get_data(start_year, force_refresh=False):
     df = df.fillna(method='ffill', limit=5)
     
     # Drop remaining NaNs
-    initial_len = len(df)
     df = df.dropna()
-    dropped = initial_len - len(df)
-    
-    if dropped > 0:
-        st.info(f"🧹 Dropped {dropped} rows with remaining NaNs")
-    
-    st.success(f"✅ Final dataset: {len(df)} rows, {len(df.columns)} columns")
     
     return df
 
@@ -447,10 +401,7 @@ def get_data(start_year, force_refresh=False):
 # 6. CUSTOM LOSS FUNCTION
 # ------------------------------
 def directional_loss(y_true, y_pred):
-    """
-    Custom loss that penalizes incorrect direction predictions more heavily
-    This helps the model focus on getting the sign right (up vs down)
-    """
+    """Custom loss that penalizes incorrect direction predictions more heavily"""
     # Calculate absolute error
     abs_error = tf.abs(y_true - y_pred)
     
@@ -467,20 +418,10 @@ def directional_loss(y_true, y_pred):
     return tf.reduce_mean(penalty)
 
 # ------------------------------
-# 7. PURE TRANSFORMER MODEL
+# 7. MODEL BUILDERS
 # ------------------------------
-def build_pure_transformer(input_shape, num_outputs, num_heads=4, ff_dim=128, num_layers=2, dropout_rate=0.1):
-    """
-    Build a pure Transformer architecture for time series prediction
-    
-    Args:
-        input_shape: (sequence_length, num_features)
-        num_outputs: Number of output predictions
-        num_heads: Number of attention heads
-        ff_dim: Feed-forward network dimension
-        num_layers: Number of Transformer blocks
-        dropout_rate: Dropout rate
-    """
+def build_pure_transformer(input_shape, num_outputs, num_heads=2, ff_dim=64, num_layers=1, dropout_rate=0.2):
+    """Build a pure Transformer architecture"""
     inputs = Input(shape=input_shape)
     
     # Add positional encoding
@@ -517,8 +458,38 @@ def build_pure_transformer(input_shape, num_outputs, num_heads=4, ff_dim=128, nu
     
     return model
 
+def build_transformer_embedder(input_shape, num_heads=2, ff_dim=64, num_layers=1, dropout_rate=0.2):
+    """Build Transformer for feature extraction (embeddings only)"""
+    inputs = Input(shape=input_shape)
+    
+    # Add positional encoding
+    x = PositionalEncoding()(inputs)
+    
+    # Stack Transformer blocks
+    for _ in range(num_layers):
+        attn_output = MultiHeadAttention(
+            num_heads=num_heads,
+            key_dim=input_shape[1] // num_heads,
+            dropout=dropout_rate
+        )(x, x)
+        
+        x = LayerNormalization(epsilon=1e-6)(x + attn_output)
+        
+        ff_output = Dense(ff_dim, activation='relu')(x)
+        ff_output = Dropout(dropout_rate)(ff_output)
+        ff_output = Dense(input_shape[1])(ff_output)
+        
+        x = LayerNormalization(epsilon=1e-6)(x + ff_output)
+    
+    # Global pooling to get embeddings
+    embeddings = GlobalAveragePooling1D()(x)
+    
+    model = Model(inputs=inputs, outputs=embeddings)
+    
+    return model
+
 # ------------------------------
-# 7. SIDEBAR CONFIGURATION
+# 8. SIDEBAR CONFIGURATION
 # ------------------------------
 with st.sidebar:
     st.header("⚙️ Model Configuration")
@@ -541,9 +512,6 @@ with st.sidebar:
         help="Manually fetch fresh data and update HF dataset (ignores sync window)"
     )
     
-    if force_refresh:
-        st.warning("⚠️ Will fetch fresh data on next run")
-    
     st.divider()
     
     start_yr = st.slider("📅 Start Year", 2008, 2025, 2016)
@@ -552,11 +520,25 @@ with st.sidebar:
     
     st.divider()
     
-    st.subheader("🧠 Transformer Settings")
+    st.subheader("🧠 Model Selection")
+    model_option = st.selectbox(
+        "Choose Model",
+        [
+            "Option A: Pure Transformer",
+            "Option B: Random Forest + XGBoost",
+            "Option C: Transformer + XGBoost Hybrid"
+        ],
+        index=0
+    )
+    
+    st.divider()
+    
+    st.subheader("⚙️ Training Settings")
     epochs = st.number_input("Epochs", 10, 500, 100, step=10)
     lookback = st.slider("Lookback Days", 20, 60, 30, step=5)
     
-    st.caption("ℹ️ Model uses optimized architecture: 2 heads, 1 layer, 64 FF dim")
+    if "Transformer" in model_option:
+        st.caption("ℹ️ Transformer: 2 heads, 1 layer, 64 FF dim")
     
     st.divider()
     
@@ -578,7 +560,7 @@ with st.sidebar:
     
     st.divider()
     
-    run_button = st.button("🚀 Execute Transformer Alpha", type="primary", use_container_width=True)
+    run_button = st.button("🚀 Execute Model", type="primary", use_container_width=True)
     
     st.divider()
     
@@ -586,30 +568,24 @@ with st.sidebar:
                                     help="Update HF dataset with latest data without training the model")
 
 # ------------------------------
-# 8. MAIN APPLICATION
+# 9. MAIN APPLICATION
 # ------------------------------
-st.title("🤖 P2-TRANSFORMER-ETF-PREDICTOR")
-st.caption("Pure Transformer Architecture with Multi-Source Macro Intelligence")
+st.title("🤖 P2-ETF-PREDICTOR")
+st.caption("Multi-Model Ensemble: Transformer, Random Forest, XGBoost")
 
-# Handle dataset refresh only (no model training)
+# Handle dataset refresh only
 if refresh_only_button:
     st.info("🔄 Refreshing dataset without model training...")
     
     with st.status("📡 Fetching fresh data from all sources...", expanded=True):
-        # Fetch fresh data
         etf_list = ["TLT", "TBT", "VNQ", "SLV", "GLD"]
         
-        st.write("📊 Fetching ETF data...")
         etf_data = fetch_etf_data(etf_list, start_date="2008-01-01")
-        
-        st.write("📊 Fetching macro signals...")
         macro_data = fetch_macro_data_robust(start_date="2008-01-01")
         
         if not etf_data.empty and not macro_data.empty:
-            # Combine all
             new_df = pd.concat([etf_data, macro_data], axis=1)
             
-            st.write("💾 Updating HuggingFace dataset...")
             token = os.getenv("HF_TOKEN")
             
             if token:
@@ -617,33 +593,17 @@ if refresh_only_button:
                 
                 st.success("✅ Dataset refresh completed!")
                 
-                # Show dataset summary
-                st.subheader("📊 Dataset Summary")
                 col1, col2, col3 = st.columns(3)
                 col1.metric("Total Rows", len(updated_df))
                 col2.metric("Total Columns", len(updated_df.columns))
                 col3.metric("Date Range", f"{updated_df.index[0].strftime('%Y-%m-%d')} to {updated_df.index[-1].strftime('%Y-%m-%d')}")
-                
-                # Show column breakdown
-                st.write("**Columns in Dataset:**")
-                etf_cols = [c for c in updated_df.columns if '_Ret' in c or '_Vol' in c]
-                macro_cols = [c for c in updated_df.columns if c not in etf_cols]
-                
-                col1, col2 = st.columns(2)
-                with col1:
-                    st.write(f"📈 **ETF Signals:** {len(etf_cols)}")
-                    st.code("\n".join(sorted(etf_cols)[:10]))
-                
-                with col2:
-                    st.write(f"🌍 **Macro Signals:** {len(macro_cols)}")
-                    st.code("\n".join(sorted(macro_cols)[:10]))
                 
             else:
                 st.error("❌ HF_TOKEN not found. Cannot update dataset.")
         else:
             st.error("❌ Failed to fetch data from sources")
     
-    st.stop()  # Stop execution here, don't run model
+    st.stop()
 
 if run_button:
     # Load and prepare data
@@ -670,84 +630,71 @@ if run_button:
         st.error("❌ No input features found in dataset")
         st.stop()
     
-    st.info(f"🎯 **Targets:** {len(target_etfs)} ETFs | **Features:** {len(input_features)} signals")
+    st.info(f"🎯 **Targets:** {len(target_etfs)} ETFs | **Features:** {len(input_features)} signals | **Model:** {model_option}")
     
-    # ==========================================
-    # DATA QUALITY DIAGNOSTICS
-    # ==========================================
-    st.subheader("🔍 Data Quality Diagnostics")
-    
-    diag_col1, diag_col2, diag_col3 = st.columns(3)
-    
-    with diag_col1:
-        # Check for NaN values
-        nan_counts = df[input_features].isna().sum()
-        total_nans = nan_counts.sum()
-        if total_nans > 0:
-            st.warning(f"⚠️ **NaN Values Found:** {total_nans}")
-            with st.expander("View NaN Details"):
-                nan_features = nan_counts[nan_counts > 0].sort_values(ascending=False)
-                st.dataframe(nan_features.to_frame(name='NaN Count'))
-        else:
-            st.success("✅ **No NaN Values**")
-    
-    with diag_col2:
-        # Check for constant/near-constant features
-        constant_features = []
-        for col in input_features:
-            if df[col].std() < 0.01:
-                constant_features.append(col)
+    # Prepare data based on model type
+    if "Option B" in model_option:
+        # Random Forest + XGBoost: Use flat features (no sequences)
+        X = df[input_features].values
+        y_raw = df[target_etfs].values
         
-        if constant_features:
-            st.error(f"❌ **Constant Features:** {len(constant_features)}")
-            with st.expander("View Constant Features"):
-                st.code("\n".join(constant_features))
-        else:
-            st.success("✅ **No Constant Features**")
-    
-    with diag_col3:
-        # Check for highly correlated features
-        corr_matrix = df[input_features].corr()
-        high_corr_pairs = []
-        for i in range(len(corr_matrix.columns)):
-            for j in range(i+1, len(corr_matrix.columns)):
-                if abs(corr_matrix.iloc[i, j]) > 0.95:
-                    high_corr_pairs.append((corr_matrix.columns[i], corr_matrix.columns[j], corr_matrix.iloc[i, j]))
+        # Convert to classification: which ETF has best return
+        y = np.argmax(y_raw, axis=1)
         
-        if high_corr_pairs:
-            st.warning(f"⚠️ **High Correlation:** {len(high_corr_pairs)} pairs")
-            with st.expander("View Correlated Pairs"):
-                for feat1, feat2, corr_val in high_corr_pairs[:5]:
-                    st.text(f"{feat1} ↔ {feat2}: {corr_val:.3f}")
-        else:
-            st.success("✅ **No High Correlation**")
-    
-    # Target distribution analysis
-    st.write("**📊 Target ETF Distribution (Historical Best Performers):**")
-    target_best = df[target_etfs].idxmax(axis=1).value_counts()
-    target_best.index = target_best.index.str.replace('_Ret', '')
-    
-    fig_target_dist = go.Figure(go.Bar(
-        x=target_best.values,
-        y=target_best.index,
-        orientation='h',
-        marker_color='#3b82f6',
-        text=target_best.values,
-        textposition='outside'
-    ))
-    fig_target_dist.update_layout(
-        template="plotly_dark",
-        height=250,
-        xaxis_title="Days as Top Performer",
-        yaxis_title="ETF",
-        showlegend=False
-    )
-    st.plotly_chart(fig_target_dist, use_container_width=True)
-    
-    st.divider()
-    
-    # Prepare data for model
-    with st.spinner("🔧 Preparing training data..."):
+        # Train/val/test split
+        train_size = int(len(X) * train_pct)
+        val_size = int(len(X) * val_pct)
+        
+        X_train = X[:train_size]
+        y_train = y[:train_size]
+        y_raw_train = y_raw[:train_size]
+        
+        X_val = X[train_size:train_size + val_size]
+        y_val = y[train_size:train_size + val_size]
+        y_raw_val = y_raw[train_size:train_size + val_size]
+        
+        X_test = X[train_size + val_size:]
+        y_test = y[train_size + val_size:]
+        y_raw_test = y_raw[train_size + val_size:]
+        
+        st.success(f"✅ Split ({split_option}): Train={len(X_train)} | Val={len(X_val)} | Test={len(X_test)}")
+        
+        # Train Random Forest + XGBoost
+        with st.spinner("🌲 Training Random Forest + XGBoost Ensemble..."):
+            # Random Forest
+            rf_model = RandomForestClassifier(
+                n_estimators=200,
+                max_depth=10,
+                min_samples_split=10,
+                min_samples_leaf=5,
+                random_state=42,
+                n_jobs=-1
+            )
+            rf_model.fit(X_train, y_train)
+            
+            # XGBoost
+            xgb_model = xgb.XGBClassifier(
+                n_estimators=200,
+                max_depth=6,
+                learning_rate=0.05,
+                subsample=0.8,
+                colsample_bytree=0.8,
+                random_state=42,
+                n_jobs=-1
+            )
+            xgb_model.fit(X_train, y_train)
+            
+            st.success("✅ Ensemble training completed!")
+        
+        # Make predictions (ensemble: average probabilities)
+        rf_probs = rf_model.predict_proba(X_test)
+        xgb_probs = xgb_model.predict_proba(X_test)
+        
+        ensemble_probs = (rf_probs + xgb_probs) / 2
+        preds = np.argmax(ensemble_probs, axis=1)
+        
+    else:
+        # Transformer-based models: Use sequences
         scaler = MinMaxScaler()
         scaled_input = scaler.fit_transform(df[input_features])
         
@@ -759,7 +706,7 @@ if run_button:
         X = np.array(X)
         y = np.array(y)
         
-        # Train/Validation/Test split based on user selection
+        # Train/val/test split
         train_size = int(len(X) * train_pct)
         val_size = int(len(X) * val_pct)
         
@@ -771,129 +718,138 @@ if run_button:
         y_test = y[train_size + val_size:]
         
         st.success(f"✅ Split ({split_option}): Train={len(X_train)} | Val={len(X_val)} | Test={len(X_test)}")
+        
+        if "Option A" in model_option:
+            # Pure Transformer
+            with st.spinner("🧠 Training Pure Transformer Model..."):
+                model = build_pure_transformer(
+                    input_shape=(X.shape[1], X.shape[2]),
+                    num_outputs=len(target_etfs),
+                    num_heads=2,
+                    ff_dim=64,
+                    num_layers=1,
+                    dropout_rate=0.2
+                )
+                
+                model.compile(
+                    optimizer=tf.keras.optimizers.Adam(learning_rate=0.001),
+                    loss=directional_loss,
+                    metrics=['mae']
+                )
+                
+                early_stop = EarlyStopping(
+                    monitor='val_loss',
+                    patience=20,
+                    restore_best_weights=True,
+                    verbose=0
+                )
+                
+                history = model.fit(
+                    X_train, y_train,
+                    validation_data=(X_val, y_val),
+                    epochs=int(epochs),
+                    batch_size=32,
+                    callbacks=[early_stop],
+                    verbose=0
+                )
+                
+                st.success(f"✅ Training completed! Best epoch: {len(history.history['loss']) - 20}")
+            
+            preds = model.predict(X_test, verbose=0)
+            
+        else:  # Option C: Transformer + XGBoost
+            with st.spinner("🔗 Training Transformer Embedder + XGBoost..."):
+                # Build Transformer embedder
+                embedder = build_transformer_embedder(
+                    input_shape=(X.shape[1], X.shape[2]),
+                    num_heads=2,
+                    ff_dim=64,
+                    num_layers=1,
+                    dropout_rate=0.2
+                )
+                
+                embedder.compile(optimizer='adam', loss='mse')
+                
+                # Train embedder on reconstruction task
+                embedder.fit(
+                    X_train, 
+                    X_train.reshape(len(X_train), -1)[:, :embedder.output_shape[1]],
+                    epochs=50,
+                    batch_size=32,
+                    verbose=0
+                )
+                
+                # Extract embeddings
+                train_embeddings = embedder.predict(X_train, verbose=0)
+                val_embeddings = embedder.predict(X_val, verbose=0)
+                test_embeddings = embedder.predict(X_test, verbose=0)
+                
+                # Train XGBoost on embeddings
+                y_train_class = np.argmax(y_train, axis=1)
+                
+                xgb_model = xgb.XGBClassifier(
+                    n_estimators=200,
+                    max_depth=6,
+                    learning_rate=0.05,
+                    subsample=0.8,
+                    random_state=42,
+                    n_jobs=-1
+                )
+                xgb_model.fit(train_embeddings, y_train_class)
+                
+                st.success("✅ Hybrid training completed!")
+            
+            # Predict
+            preds_class = xgb_model.predict(test_embeddings)
+            
+            # Convert back to one-hot style for consistency
+            preds = np.zeros((len(preds_class), len(target_etfs)))
+            preds[np.arange(len(preds_class)), preds_class] = 1.0
     
-    # Build and train model
-    with st.spinner("🧠 Training Pure Transformer Model..."):
-        model = build_pure_transformer(
-            input_shape=(X.shape[1], X.shape[2]),
-            num_outputs=len(target_etfs),
-            num_heads=2,              # Reduced from 4 for smaller dataset
-            ff_dim=64,                # Reduced from 128
-            num_layers=1,             # Reduced from 2 to prevent overfitting
-            dropout_rate=0.2          # Increased from 0.1 for better regularization
-        )
-        
-        model.compile(
-            optimizer=tf.keras.optimizers.Adam(learning_rate=0.001),
-            loss=directional_loss,  # Custom loss for better directional prediction
-            metrics=['mae']
-        )
-        
-        # Early stopping
-        early_stop = EarlyStopping(
-            monitor='val_loss',
-            patience=20,
-            restore_best_weights=True,
-            verbose=0
-        )
-        
-        # Train
-        history = model.fit(
-            X_train, y_train,
-            validation_data=(X_val, y_val),
-            epochs=int(epochs),
-            batch_size=32,
-            callbacks=[early_stop],
-            verbose=0
-        )
-        
-        st.success(f"✅ Training completed! Best epoch: {len(history.history['loss']) - 20}")
-    
-    # Make predictions on test set
-    with st.spinner("🔮 Generating predictions..."):
-        preds = model.predict(X_test, verbose=0)
-        
-        # Analyze prediction confidence distribution
-        all_confidences = []
-        for i in range(len(preds)):
-            pred_values = preds[i]
-            sorted_indices = np.argsort(pred_values)
-            best_idx = sorted_indices[-1]
-            second_best_idx = sorted_indices[-2] if len(sorted_indices) > 1 else sorted_indices[-1]
-            confidence = pred_values[best_idx] - pred_values[second_best_idx]
-            all_confidences.append(confidence)
-        
-        all_confidences = np.array(all_confidences)
-        
-        # Show confidence distribution
-        st.write("**📊 Prediction Confidence Distribution:**")
-        conf_col1, conf_col2, conf_col3, conf_col4 = st.columns(4)
-        conf_col1.metric("Min", f"{all_confidences.min():.6f}")
-        conf_col2.metric("Mean", f"{all_confidences.mean():.6f}")
-        conf_col3.metric("Median", f"{np.median(all_confidences):.6f}")
-        conf_col4.metric("Max", f"{all_confidences.max():.6f}")
-        
-        # Get test dates
+    # Get test dates
+    if "Option B" in model_option:
+        test_dates = df.index[train_size + val_size:]
+    else:
         test_dates = df.index[lookback + train_size + val_size:]
-        
-        # Get SOFR rate for Sharpe calculation
-        sofr = df['T10Y3M'].iloc[-1] / 100 if 'T10Y3M' in df.columns else 0.045
-        
-        # Use adaptive threshold: 25th percentile of confidence values
-        confidence_threshold = np.percentile(all_confidences, 25)
-        st.info(f"🎯 **Adaptive Confidence Threshold:** {confidence_threshold:.6f} (25th percentile)")
-        
-        # Strategy execution with confidence threshold
-        strat_rets = []
-        audit_trail = []
-        
-        skipped_trades = 0
-        
-        for i in range(len(preds)):
-            pred_values = preds[i]
-            
-            # Find best and second-best predictions
-            sorted_indices = np.argsort(pred_values)
-            best_idx = sorted_indices[-1]
-            second_best_idx = sorted_indices[-2] if len(sorted_indices) > 1 else sorted_indices[-1]
-            
-            # Calculate prediction confidence (difference between top 2)
-            confidence = pred_values[best_idx] - pred_values[second_best_idx]
-            
-            # Only take trade if confidence exceeds threshold
-            if confidence < confidence_threshold:
-                # Skip trade - use cash (0% return after fees)
-                signal_etf = "CASH"
-                realized_ret = 0.0
-                net_ret = -(fee_bps / 10000)  # Only pay transaction cost
-                skipped_trades += 1
-            else:
-                # Take the trade
-                signal_etf = target_etfs[best_idx].replace('_Ret', '')
-                realized_ret = y_test[i][best_idx]
-                net_ret = realized_ret - (fee_bps / 10000)
-            
-            strat_rets.append(net_ret)
-            audit_trail.append({
-                'Date': test_dates[i].strftime('%Y-%m-%d'),
-                'Signal': signal_etf,
-                'Confidence': confidence,
-                'Predicted': pred_values[best_idx],
-                'Realized': realized_ret,
-                'Net_Return': net_ret
-            })
-        
-        strat_rets = np.array(strat_rets)
-        
-        # Show confidence metrics
-        st.info(f"📊 **Confidence Filter:** Skipped {skipped_trades}/{len(preds)} trades ({skipped_trades/len(preds)*100:.1f}%) due to low confidence")
     
-    # ------------------------------
-    # 9. PERFORMANCE ANALYTICS
-    # ------------------------------
+    # Get SOFR rate
+    sofr = df['T10Y3M'].iloc[-1] / 100 if 'T10Y3M' in df.columns else 0.045
+    
+    # Strategy execution
+    strat_rets = []
+    audit_trail = []
+    
+    for i in range(len(preds)):
+        if "Option B" in model_option or "Option C" in model_option:
+            # Classification models
+            if "Option B" in model_option:
+                best_idx = preds[i]
+            else:
+                best_idx = np.argmax(preds[i])
+            
+            signal_etf = target_etfs[best_idx].replace('_Ret', '')
+            realized_ret = y_raw_test[i][best_idx] if "Option B" in model_option else y_test[i][best_idx]
+        else:
+            # Pure Transformer
+            best_idx = np.argmax(preds[i])
+            signal_etf = target_etfs[best_idx].replace('_Ret', '')
+            realized_ret = y_test[i][best_idx]
+        
+        net_ret = realized_ret - (fee_bps / 10000)
+        
+        strat_rets.append(net_ret)
+        audit_trail.append({
+            'Date': test_dates[i].strftime('%Y-%m-%d'),
+            'Signal': signal_etf,
+            'Realized': realized_ret,
+            'Net_Return': net_ret
+        })
+    
+    strat_rets = np.array(strat_rets)
+    
+    # Performance Analytics
     st.divider()
     
-    # Next day signal
     next_day = (df.index[-1] + timedelta(days=1)).strftime('%Y-%m-%d')
     latest_signal = audit_trail[-1]['Signal']
     
@@ -906,11 +862,9 @@ if run_button:
     ann_return = (cum_returns[-1] ** (252 / len(strat_rets))) - 1
     sharpe = (np.mean(strat_rets) - (sofr / 252)) / (np.std(strat_rets) + 1e-9) * np.sqrt(252)
     
-    # Hit ratio (% of positive returns in last 15 days)
     recent_rets = strat_rets[-15:]
     hit_ratio = np.mean(recent_rets > 0)
     
-    # Max drawdown
     cum_max = np.maximum.accumulate(cum_returns)
     drawdown = (cum_returns - cum_max) / cum_max
     max_dd = np.min(drawdown)
@@ -957,7 +911,6 @@ if run_button:
         fillcolor='rgba(0, 209, 178, 0.1)'
     ))
     
-    # Add drawdown shading
     fig_equity.add_trace(go.Scatter(
         x=test_dates,
         y=cum_max,
@@ -977,73 +930,67 @@ if run_button:
     
     st.plotly_chart(fig_equity, use_container_width=True)
     
-    # Feature importance
-    st.subheader("🔍 Transformer Signal Contribution (%)")
-    
-    # Extract attention weights from last layer
-    try:
-        final_weights = model.layers[-1].get_weights()[0]
-        importance = np.mean(np.abs(final_weights), axis=1)
-        importance_pct = (importance / importance.sum()) * 100
+    # Feature importance (for tree models)
+    if "Option B" in model_option:
+        st.subheader("🔍 Feature Importance (Random Forest + XGBoost)")
         
-        # Map to feature names
-        feat_importance = pd.Series(
-            importance_pct[:len(input_features)],
-            index=input_features
-        ).sort_values(ascending=False).head(15)
+        rf_importance = rf_model.feature_importances_
+        xgb_importance = xgb_model.feature_importances_
+        
+        avg_importance = (rf_importance + xgb_importance) / 2
+        
+        feat_imp = pd.Series(avg_importance, index=input_features).sort_values(ascending=False).head(15)
         
         fig_imp = go.Figure(go.Bar(
-            x=feat_importance.values,
-            y=feat_importance.index,
+            x=feat_imp.values * 100,
+            y=feat_imp.index,
             orientation='h',
             marker_color='#3b82f6',
-            text=[f'{v:.1f}%' for v in feat_importance.values],
+            text=[f'{v:.1f}%' for v in feat_imp.values * 100],
             textposition='outside'
         ))
         
         fig_imp.update_layout(
             template="plotly_dark",
             height=500,
-            xaxis_title="Contribution %",
+            xaxis_title="Importance %",
             yaxis_title="Feature",
             showlegend=False
         )
         
         st.plotly_chart(fig_imp, use_container_width=True)
+    
+    # Training history (for Transformer models)
+    if "Option A" in model_option:
+        st.subheader("📉 Training & Validation Loss")
         
-    except Exception as e:
-        st.warning(f"⚠️ Could not extract feature importance: {e}")
-    
-    # Training history
-    st.subheader("📉 Training & Validation Loss")
-    
-    fig_loss = make_subplots(specs=[[{"secondary_y": False}]])
-    
-    fig_loss.add_trace(go.Scatter(
-        x=list(range(len(history.history['loss']))),
-        y=history.history['loss'],
-        mode='lines',
-        name='Training Loss',
-        line=dict(color='#00d1b2', width=2)
-    ))
-    
-    fig_loss.add_trace(go.Scatter(
-        x=list(range(len(history.history['val_loss']))),
-        y=history.history['val_loss'],
-        mode='lines',
-        name='Validation Loss',
-        line=dict(color='#ff4b4b', width=2)
-    ))
-    
-    fig_loss.update_layout(
-        template="plotly_dark",
-        height=300,
-        xaxis_title="Epoch",
-        yaxis_title="Loss (MSE)",
-        hovermode='x unified'
-    )
-    
-    st.plotly_chart(fig_loss, use_container_width=True)
+        fig_loss = make_subplots(specs=[[{"secondary_y": False}]])
+        
+        fig_loss.add_trace(go.Scatter(
+            x=list(range(len(history.history['loss']))),
+            y=history.history['loss'],
+            mode='lines',
+            name='Training Loss',
+            line=dict(color='#00d1b2', width=2)
+        ))
+        
+        fig_loss.add_trace(go.Scatter(
+            x=list(range(len(history.history['val_loss']))),
+            y=history.history['val_loss'],
+            mode='lines',
+            name='Validation Loss',
+            line=dict(color='#ff4b4b', width=2)
+        ))
+        
+        fig_loss.update_layout(
+            template="plotly_dark",
+            height=300,
+            xaxis_title="Epoch",
+            yaxis_title="Loss",
+            hovermode='x unified'
+        )
+        
+        st.plotly_chart(fig_loss, use_container_width=True)
     
     # Audit trail
     st.subheader("📋 Last 15 Days Audit Trail")
@@ -1053,23 +1000,10 @@ if run_button:
     def color_return(val):
         return 'color: #00ff00' if val > 0 else 'color: #ff4b4b'
     
-    def color_confidence(val):
-        if val < 0.00005:
-            return 'color: #ff4b4b'  # Red for low confidence
-        elif val < 0.0002:
-            return 'color: #ffa500'  # Orange for medium
-        else:
-            return 'color: #00ff00'  # Green for high confidence
-    
     styled_audit = audit_df.style.applymap(
         color_return,
         subset=['Net_Return', 'Realized']
-    ).applymap(
-        color_confidence,
-        subset=['Confidence']
     ).format({
-        'Confidence': '{:.4f}',
-        'Predicted': '{:.4f}',
         'Realized': '{:.2%}',
         'Net_Return': '{:.2%}'
     })
@@ -1078,25 +1012,41 @@ if run_button:
     
     # Model summary
     with st.expander("🔧 Model Architecture Details"):
-        st.text("Pure Transformer Configuration:")
-        st.text(f"  - Input Shape: ({lookback}, {len(input_features)})")
-        st.text(f"  - Attention Heads: 2 (optimized)")
-        st.text(f"  - Transformer Layers: 1 (optimized)")
-        st.text(f"  - Feed-Forward Dim: 64 (optimized)")
-        st.text(f"  - Dropout Rate: 0.2 (increased regularization)")
-        st.text(f"  - L2 Regularization: 0.01")
-        st.text(f"  - Loss Function: Directional Loss (2x penalty for wrong sign)")
-        st.text(f"  - Confidence Threshold: Adaptive (25th percentile)")
-        st.text(f"  - Output Dimension: {len(target_etfs)}")
-        st.text(f"  - Total Parameters: {model.count_params():,}")
-        st.text(f"  - Training Samples: {len(X_train):,}")
-        st.text(f"  - Validation Samples: {len(X_val):,}")
-        st.text(f"  - Test Samples: {len(X_test):,}")
+        st.text(f"Selected Model: {model_option}")
+        
+        if "Option A" in model_option:
+            st.text("Pure Transformer Configuration:")
+            st.text(f"  - Input Shape: ({lookback}, {len(input_features)})")
+            st.text(f"  - Attention Heads: 2")
+            st.text(f"  - Transformer Layers: 1")
+            st.text(f"  - Feed-Forward Dim: 64")
+            st.text(f"  - Dropout Rate: 0.2")
+            st.text(f"  - L2 Regularization: 0.01")
+            st.text(f"  - Loss Function: Directional Loss")
+            st.text(f"  - Total Parameters: {model.count_params():,}")
+        
+        elif "Option B" in model_option:
+            st.text("Random Forest + XGBoost Ensemble:")
+            st.text(f"  - Random Forest: 200 trees, max_depth=10")
+            st.text(f"  - XGBoost: 200 rounds, max_depth=6, lr=0.05")
+            st.text(f"  - Input Features: {len(input_features)}")
+            st.text(f"  - Ensemble: Average probabilities")
+        
+        else:  # Option C
+            st.text("Transformer + XGBoost Hybrid:")
+            st.text(f"  - Transformer Embedder: ({lookback}, {len(input_features)}) → embeddings")
+            st.text(f"  - Embedding Dimension: {embedder.output_shape[1]}")
+            st.text(f"  - XGBoost: 200 rounds on embeddings")
+            st.text(f"  - Total Parameters: {embedder.count_params():,}")
+        
+        st.text(f"\nData Split: {split_option}")
+        st.text(f"  - Training Samples: {len(X_train) if 'X_train' in locals() else 'N/A'}")
+        st.text(f"  - Validation Samples: {len(X_val) if 'X_val' in locals() else 'N/A'}")
+        st.text(f"  - Test Samples: {len(X_test) if 'X_test' in locals() else 'N/A'}")
 
 else:
-    st.info("👈 Configure parameters in the sidebar and click '🚀 Execute Transformer Alpha' to begin")
+    st.info("👈 Configure parameters in the sidebar and click '🚀 Execute Model' to begin")
     
-    # Show sync window info
     current_time = get_est_time()
     st.write(f"🕒 Current EST Time: **{current_time.strftime('%H:%M:%S')}**")
     

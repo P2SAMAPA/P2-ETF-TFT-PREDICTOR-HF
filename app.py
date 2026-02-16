@@ -460,18 +460,26 @@ def get_data(start_year, force_refresh=False):
     df = df[df.index.year >= start_year]
     st.info(f"📅 After year filter ({start_year}+): {len(df)} samples from {df.index[0].year if len(df) > 0 else 'N/A'} to {df.index[-1].year if len(df) > 0 else 'N/A'}")
     
-    # Forward fill gaps (max 5 days)
+    # AGGRESSIVE CLEANING STRATEGY to preserve early years
+    # Step 1: Forward fill gaps (max 5 days) - handles short gaps
     df = df.fillna(method='ffill', limit=5)
     
-    # Count NaNs before dropping
+    # Step 2: Backfill early NaNs (first 100 rows) - preserves 2008-2015 data
+    # This fills NaNs at start of dataset from first valid values
+    df = df.fillna(method='bfill', limit=100)
+    
+    # Step 3: Forward fill any remaining NaNs
+    df = df.fillna(method='ffill')
+    
+    # Count remaining NaNs before dropping
     nan_count_before = df.isna().sum().sum()
     
-    # Drop remaining NaNs
+    # Step 4: Only drop rows with NaNs that couldn't be filled
     df = df.dropna()
     
     # Show final data range AFTER cleaning
     if len(df) > 0:
-        st.success(f"✅ Final dataset: {len(df)} samples from {df.index[0].strftime('%Y-%m-%d')} to {df.index[-1].strftime('%Y-%m-%d')} (dropped {nan_count_before} NaN cells)")
+        st.success(f"✅ Final dataset: {len(df)} samples from {df.index[0].strftime('%Y-%m-%d')} to {df.index[-1].strftime('%Y-%m-%d')} (dropped {nan_count_before} remaining NaN cells)")
     else:
         st.error("❌ No data remaining after cleaning!")
     

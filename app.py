@@ -386,6 +386,41 @@ def get_data(start_year, force_refresh=False):
             rolling_std = df[col].rolling(60, min_periods=20).std()
             df[f"{col}_Z"] = (df[col] - rolling_mean) / (rolling_std + 1e-9)
     
+    # PRIORITY 3: ADD REGIME DETECTION FEATURES
+    st.write("🎯 **Adding Regime Detection Features...**")
+    
+    # VIX Regime (volatility environment)
+    if 'VIX' in df.columns:
+        df['VIX_Regime_Low'] = (df['VIX'] < 15).astype(int)      # Risk-on
+        df['VIX_Regime_Med'] = ((df['VIX'] >= 15) & (df['VIX'] < 25)).astype(int)  # Normal
+        df['VIX_Regime_High'] = (df['VIX'] >= 25).astype(int)    # Risk-off
+    
+    # Yield Curve Regime
+    if 'T10Y2Y' in df.columns:
+        df['YC_Inverted'] = (df['T10Y2Y'] < 0).astype(int)       # Recession signal
+        df['YC_Flat'] = ((df['T10Y2Y'] >= 0) & (df['T10Y2Y'] < 0.5)).astype(int)
+        df['YC_Steep'] = (df['T10Y2Y'] >= 0.5).astype(int)       # Growth
+    
+    # Credit Stress Regime
+    if 'HY_Spread' in df.columns:
+        df['Credit_Stress_Low'] = (df['HY_Spread'] < 400).astype(int)   # Healthy
+        df['Credit_Stress_Med'] = ((df['HY_Spread'] >= 400) & (df['HY_Spread'] < 600)).astype(int)
+        df['Credit_Stress_High'] = (df['HY_Spread'] >= 600).astype(int) # Crisis
+    
+    # VIX Term Structure Regime
+    if 'VIX_Term_Slope' in df.columns:
+        df['VIX_Term_Contango'] = (df['VIX_Term_Slope'] > 2).astype(int)   # Calm
+        df['VIX_Term_Backwardation'] = (df['VIX_Term_Slope'] < -2).astype(int)  # Fear
+    
+    # Rate Environment (using 10Y3M as proxy)
+    if 'T10Y3M' in df.columns:
+        df['Rates_VeryLow'] = (df['T10Y3M'] < 1.0).astype(int)
+        df['Rates_Low'] = ((df['T10Y3M'] >= 1.0) & (df['T10Y3M'] < 2.0)).astype(int)
+        df['Rates_Normal'] = ((df['T10Y3M'] >= 2.0) & (df['T10Y3M'] < 3.0)).astype(int)
+        df['Rates_High'] = (df['T10Y3M'] >= 3.0).astype(int)
+    
+    st.success(f"✅ Added {len([c for c in df.columns if 'Regime' in c or 'YC_' in c or 'Credit_' in c or 'Rates_' in c])} regime features")
+    
     # Filter by start year and clean
     df = df[df.index.year >= start_year]
     
@@ -516,10 +551,11 @@ with st.sidebar:
     st.divider()
     
     st.subheader("📊 Data Split Strategy")
+    
     split_option = st.selectbox(
         "Train/Val/Test Split",
         ["60/20/20", "70/15/15", "80/10/10"],
-        index=0,
+        index=1,  # Default to 70/15/15
         help="Choose data split ratio: Train/Validation/Out-of-Sample"
     )
     
@@ -533,6 +569,30 @@ with st.sidebar:
     
     st.divider()
     
+    # PRIORITY 1: Walk-Forward Testing Option
+    st.subheader("🔬 Advanced Testing")
+    
+    use_walk_forward = st.checkbox(
+        "Enable Walk-Forward Validation",
+        value=False,
+        help="Test on multiple periods instead of just final period. Shows regime robustness."
+    )
+    
+    if use_walk_forward:
+        st.info("📊 Walk-forward will create multiple test windows across different market regimes")
+    
+    # PRIORITY 2: 60/20/20 Diagnostic Mode
+    if split_option == "60/20/20":
+        show_diagnostics = st.checkbox(
+            "Show 60/20/20 Diagnostics",
+            value=True,
+            help="Display detailed analysis of why 60/20/20 may underperform"
+        )
+    else:
+        show_diagnostics = False
+    
+    st.divider()
+    
     run_button = st.button("🚀 Execute Model", type="primary", use_container_width=True)
     
     st.divider()
@@ -541,7 +601,123 @@ with st.sidebar:
                                     help="Update HF dataset with latest data without training the model")
 
 # ------------------------------
-# 9. MAIN APPLICATION
+# 9. WALK-FORWARD VALIDATION (PRIORITY 1)
+# ------------------------------
+def walk_forward_validation(X, y, y_raw, dates, train_pct, val_pct, n_windows=5):
+    """
+    Perform walk-forward validation across multiple time windows
+    
+    Instead of testing only on final period (2024-2026), test on multiple periods
+    to assess regime robustness
+    
+    Args:
+        X: Feature array
+        y: Target classes
+        y_raw: Raw returns
+        dates: Date index
+        train_pct: Training percentage
+        val_pct: Validation percentage  
+        n_windows: Number of test windows
+    
+    Returns:
+        List of results for each window
+    """
+    results = []
+    
+    # Calculate window size
+    total_size = len(X)
+    window_size = total_size // (n_windows + 1)
+    
+    for i in range(n_windows):
+        # Calculate split points for this window
+        test_start = (i + 1) * window_size
+        test_end = min(test_start + window_size, total_size)
+        
+        # Use all data before test period for training
+        train_end = int(test_start * train_pct / (train_pct + val_pct))
+        val_start = train_end
+        val_end = test_start
+        
+        if train_end < window_size or (test_end - test_start) < 50:
+            continue  # Skip if not enough data
+        
+        X_train_wf = X[:train_end]
+        y_train_wf = y[:train_end]
+        
+        X_val_wf = X[val_start:val_end]
+        y_val_wf = y[val_start:val_end]
+        
+        X_test_wf = X[test_start:test_end]
+        y_test_wf = y[test_start:test_end]
+        y_raw_test_wf = y_raw[test_start:test_end]
+        
+        # Train models
+        rf_model = RandomForestClassifier(
+            n_estimators=500,
+            max_depth=15,
+            min_samples_split=10,
+            min_samples_leaf=3,
+            max_features='sqrt',
+            random_state=42,
+            n_jobs=-1
+        )
+        rf_model.fit(X_train_wf, y_train_wf)
+        
+        xgb_model = xgb.XGBClassifier(
+            n_estimators=500,
+            max_depth=8,
+            learning_rate=0.03,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            min_child_weight=3,
+            gamma=0.1,
+            reg_alpha=0.1,
+            reg_lambda=1.0,
+            random_state=42,
+            n_jobs=-1,
+            early_stopping_rounds=50,
+            eval_metric='mlogloss'
+        )
+        xgb_model.fit(
+            X_train_wf, y_train_wf,
+            eval_set=[(X_val_wf, y_val_wf)],
+            verbose=False
+        )
+        
+        # Ensemble predictions
+        rf_probs = rf_model.predict_proba(X_test_wf)
+        xgb_probs = xgb_model.predict_proba(X_test_wf)
+        ensemble_probs = (rf_probs + xgb_probs) / 2
+        preds_wf = np.argmax(ensemble_probs, axis=1)
+        
+        # Calculate returns
+        strat_rets_wf = []
+        for j in range(len(preds_wf)):
+            realized_ret = y_raw_test_wf[j][preds_wf[j]]
+            net_ret = realized_ret - 0.0015  # 15 bps fee
+            strat_rets_wf.append(net_ret)
+        
+        strat_rets_wf = np.array(strat_rets_wf)
+        
+        # Calculate metrics
+        cum_returns = np.cumprod(1 + strat_rets_wf)
+        ann_return = (cum_returns[-1] ** (252 / len(strat_rets_wf))) - 1
+        sharpe = np.mean(strat_rets_wf) / (np.std(strat_rets_wf) + 1e-9) * np.sqrt(252)
+        
+        # Store results
+        results.append({
+            'window': i + 1,
+            'test_period': f"{dates[test_start]} to {dates[test_end-1]}",
+            'test_samples': len(X_test_wf),
+            'ann_return': ann_return,
+            'sharpe': sharpe,
+            'cum_return': cum_returns[-1]
+        })
+    
+    return results
+
+# ------------------------------
+# 10. MAIN APPLICATION
 # ------------------------------
 st.title("🤖 P2-ETF-PREDICTOR")
 st.caption("Multi-Model Ensemble: Transformer, Random Forest, XGBoost")
@@ -597,9 +773,11 @@ if run_button:
         st.error("❌ No target ETF returns found in dataset")
         st.stop()
     
-    # Input features: Z-scores and volatility
+    # Input features: Z-scores, volatility, and regime indicators
     input_features = [col for col in df.columns 
-                     if (col.endswith('_Z') or col.endswith('_Vol')) 
+                     if (col.endswith('_Z') or col.endswith('_Vol') or 
+                         'Regime' in col or 'YC_' in col or 'Credit_' in col or 
+                         'Rates_' in col or 'VIX_Term_' in col)
                      and col not in target_etfs]
     
     if not input_features:
@@ -607,6 +785,46 @@ if run_button:
         st.stop()
     
     st.info(f"🎯 **Targets:** {len(target_etfs)} ETFs | **Features:** {len(input_features)} signals | **Model:** {model_option}")
+    
+    # PRIORITY 2: Show 60/20/20 diagnostics if enabled
+    if 'show_diagnostics' in locals() and show_diagnostics:
+        st.warning("⚠️ **60/20/20 Diagnostic Mode Active**")
+        
+        total_samples = len(df)
+        train_samples = int(total_samples * 0.60)
+        val_samples = int(total_samples * 0.20)
+        test_samples = total_samples - train_samples - val_samples
+        
+        st.write(f"""
+        **60/20/20 Split Analysis:**
+        - Total Samples: {total_samples}
+        - Training: {train_samples} ({train_samples/total_samples*100:.1f}%)
+        - Validation: {val_samples} ({val_samples/total_samples*100:.1f}%)
+        - Test: {test_samples} ({test_samples/total_samples*100:.1f}%)
+        - Start Year: {start_yr} → Data from {df.index[0].year} to {df.index[-1].year}
+        """)
+        
+        # Calculate data span
+        years_of_data = df.index[-1].year - df.index[0].year
+        train_years = years_of_data * 0.60
+        test_years = years_of_data * 0.20
+        
+        if years_of_data < 5:
+            st.error(f"""
+            🚨 **WARNING: Insufficient Training Data**
+            - You have only {years_of_data} years of data
+            - 60% training = {train_years:.1f} years ({train_samples} samples)
+            - Random Forest typically needs 5+ years of diverse market regimes
+            - **Recommendation:** Use start year ≤ 2016 for 60/20/20, or use 80/10/10 with current start year
+            """)
+        
+        if test_samples < 200:
+            st.warning(f"""
+            ⚠️ **Small Test Set Warning**
+            - Test set has only {test_samples} samples ({test_years:.1f} years)
+            - Small test sets = high variance in metrics
+            - Performance may not be representative
+            """)
     
     # Prepare data based on model type
     if "Option B" in model_option:
@@ -787,7 +1005,29 @@ if run_button:
     next_day = (df.index[-1] + timedelta(days=1)).strftime('%Y-%m-%d')
     latest_signal = audit_trail[-1]['Signal']
     
-    st.success(f"🎯 **Next Trading Day ({next_day}) Allocation:** **{latest_signal}**")
+    # Make allocation VERY prominent
+    st.markdown(f"""
+    <div style="background: linear-gradient(135deg, #00d1b2 0%, #00a896 100%); 
+                padding: 25px; 
+                border-radius: 15px; 
+                text-align: center;
+                box-shadow: 0 8px 16px rgba(0,0,0,0.3);
+                margin: 20px 0;">
+        <h1 style="color: white; 
+                   font-size: 48px; 
+                   margin: 0 0 10px 0;
+                   font-weight: bold;
+                   text-shadow: 2px 2px 4px rgba(0,0,0,0.3);">
+            🎯 NEXT TRADING DAY
+        </h1>
+        <h2 style="color: white; 
+                   font-size: 36px; 
+                   margin: 0;
+                   font-weight: bold;">
+            {next_day} → {latest_signal}
+        </h2>
+    </div>
+    """, unsafe_allow_html=True)
     
     st.divider()
     
@@ -1001,23 +1241,70 @@ if run_button:
         
         st.plotly_chart(fig_loss, use_container_width=True)
     
-    # Audit trail
+    # Audit trail - simplified with larger font
     st.subheader("📋 Last 15 Days Audit Trail")
     
-    audit_df = pd.DataFrame(audit_trail).tail(15)
+    audit_df = pd.DataFrame(audit_trail).tail(15)[['Date', 'Signal', 'Net_Return']]
     
     def color_return(val):
-        return 'color: #00ff00' if val > 0 else 'color: #ff4b4b'
+        return 'color: #00ff00; font-weight: bold' if val > 0 else 'color: #ff4b4b; font-weight: bold'
     
     styled_audit = audit_df.style.applymap(
         color_return,
-        subset=['Net_Return', 'Realized']
+        subset=['Net_Return']
     ).format({
-        'Realized': '{:.2%}',
         'Net_Return': '{:.2%}'
-    })
+    }).set_properties(**{
+        'font-size': '18px',
+        'text-align': 'center'
+    }).set_table_styles([
+        {'selector': 'th', 'props': [('font-size', '20px'), ('font-weight', 'bold'), ('text-align', 'center')]},
+        {'selector': 'td', 'props': [('padding', '12px')]}
+    ])
     
-    st.dataframe(styled_audit, use_container_width=True)
+    st.dataframe(styled_audit, use_container_width=True, height=600)
+    
+    # PRIORITY 1: Walk-Forward Validation Results
+    if 'use_walk_forward' in locals() and use_walk_forward and "Option B" in model_option:
+        st.divider()
+        st.subheader("🔬 Walk-Forward Validation Results")
+        st.write("**Testing across multiple time periods to assess regime robustness:**")
+        
+        with st.spinner("Running walk-forward validation..."):
+            wf_results = walk_forward_validation(
+                X, y, y_raw, df.index, 
+                train_pct, val_pct, 
+                n_windows=5
+            )
+        
+        if wf_results:
+            wf_df = pd.DataFrame(wf_results)
+            
+            # Display summary table
+            st.dataframe(wf_df.style.format({
+                'ann_return': '{:.2%}',
+                'sharpe': '{:.2f}',
+                'cum_return': '{:.2f}'
+            }).set_properties(**{
+                'font-size': '16px'
+            }), use_container_width=True)
+            
+            # Calculate aggregate stats
+            avg_return = wf_df['ann_return'].mean()
+            avg_sharpe = wf_df['sharpe'].mean()
+            std_return = wf_df['ann_return'].std()
+            
+            col1, col2, col3 = st.columns(3)
+            col1.metric("Avg Return", f"{avg_return*100:.2f}%")
+            col2.metric("Avg Sharpe", f"{avg_sharpe:.2f}")
+            col3.metric("Return StdDev", f"{std_return*100:.2f}%")
+            
+            if std_return > 0.15:
+                st.warning("⚠️ High variance across periods suggests regime-dependent performance")
+            else:
+                st.success("✅ Consistent performance across different market regimes")
+        else:
+            st.error("Not enough data for walk-forward validation")
     
     # Model summary
     with st.expander("🔧 Model Architecture Details"):

@@ -346,7 +346,7 @@ def get_data(start_year, force_refresh=False):
         with st.status(f"{sync_reason} - Updating Dataset...", expanded=False):
             
             # Fetch fresh data
-            etf_list = ["TLT", "TBT", "VNQ", "SLV", "GLD"]
+            etf_list = ["TLT", "TBT", "VNQ", "SLV", "GLD", "AGG", "SPY"]
             
             # Fetch ETF data
             etf_data = fetch_etf_data(etf_list, start_date="2008-01-01")
@@ -367,7 +367,7 @@ def get_data(start_year, force_refresh=False):
     # If still empty, fetch fresh data anyway
     if df.empty:
         st.warning("📊 Fetching fresh data (no cached dataset available)...")
-        etf_list = ["TLT", "TBT", "VNQ", "SLV", "GLD"]
+        etf_list = ["TLT", "TBT", "VNQ", "SLV", "GLD", "AGG", "SPY"]
         etf_data = fetch_etf_data(etf_list, start_date="2008-01-01")
         macro_data = fetch_macro_data_robust(start_date="2008-01-01")
         
@@ -551,7 +551,7 @@ if refresh_only_button:
     st.info("🔄 Refreshing dataset without model training...")
     
     with st.status("📡 Fetching fresh data from all sources...", expanded=True):
-        etf_list = ["TLT", "TBT", "VNQ", "SLV", "GLD"]
+        etf_list = ["TLT", "TBT", "VNQ", "SLV", "GLD", "AGG", "SPY"]
         
         etf_data = fetch_etf_data(etf_list, start_date="2008-01-01")
         macro_data = fetch_macro_data_robust(start_date="2008-01-01")
@@ -589,6 +589,9 @@ if run_button:
     # Identify target ETFs and input features
     target_etfs = [col for col in df.columns if col.endswith('_Ret') and 
                    any(etf in col for etf in ['TLT', 'TBT', 'VNQ', 'SLV', 'GLD'])]
+    
+    # Benchmark ETFs (not traded, only for comparison)
+    benchmark_etfs = ['AGG_Ret', 'SPY_Ret']
     
     if not target_etfs:
         st.error("❌ No target ETF returns found in dataset")
@@ -796,12 +799,34 @@ if run_button:
     recent_rets = strat_rets[-15:]
     hit_ratio = np.mean(recent_rets > 0)
     
+    # Max Drawdown (peak to trough)
     cum_max = np.maximum.accumulate(cum_returns)
     drawdown = (cum_returns - cum_max) / cum_max
     max_dd = np.min(drawdown)
     
+    # Max Daily Drawdown (worst single day loss)
+    max_daily_dd = np.min(strat_rets)
+    
+    # Calculate benchmark returns
+    agg_returns = None
+    spy_returns = None
+    
+    if 'AGG_Ret' in df.columns:
+        if "Option B" in model_option:
+            agg_returns = df['AGG_Ret'].iloc[train_size + val_size:].values[:len(strat_rets)]
+        else:
+            agg_returns = df['AGG_Ret'].iloc[lookback + train_size + val_size:].values[:len(strat_rets)]
+        agg_cum_returns = np.cumprod(1 + agg_returns)
+    
+    if 'SPY_Ret' in df.columns:
+        if "Option B" in model_option:
+            spy_returns = df['SPY_Ret'].iloc[train_size + val_size:].values[:len(strat_rets)]
+        else:
+            spy_returns = df['SPY_Ret'].iloc[lookback + train_size + val_size:].values[:len(strat_rets)]
+        spy_cum_returns = np.cumprod(1 + spy_returns)
+    
     # Display metrics
-    col1, col2, col3, col4 = st.columns(4)
+    col1, col2, col3, col4, col5 = st.columns(5)
     
     col1.metric(
         "📈 Annualized Return",
@@ -824,24 +849,34 @@ if run_button:
     col4.metric(
         "📉 Max Drawdown",
         f"{max_dd * 100:.2f}%",
-        delta="Acceptable" if max_dd > -0.15 else "High Risk"
+        delta="Peak to Trough",
+        help="Maximum decline from peak to trough during OOS period"
+    )
+    
+    col5.metric(
+        "⚠️ Max Daily DD",
+        f"{max_daily_dd * 100:.2f}%",
+        delta="Worst Day",
+        help="Largest single-day loss during OOS period"
     )
     
     # Equity curve
-    st.subheader("📈 Out-of-Sample Equity Curve")
+    st.subheader("📈 Out-of-Sample Equity Curve (with Benchmarks)")
     
     fig_equity = go.Figure()
     
+    # Strategy
     fig_equity.add_trace(go.Scatter(
         x=test_dates,
         y=cum_returns,
         mode='lines',
         name='Strategy',
-        line=dict(color='#00d1b2', width=2),
+        line=dict(color='#00d1b2', width=3),
         fill='tozeroy',
         fillcolor='rgba(0, 209, 178, 0.1)'
     ))
     
+    # High Water Mark
     fig_equity.add_trace(go.Scatter(
         x=test_dates,
         y=cum_max,
@@ -850,16 +885,89 @@ if run_button:
         line=dict(color='rgba(255, 255, 255, 0.3)', width=1, dash='dash')
     ))
     
+    # AGG Benchmark (if available)
+    if agg_returns is not None:
+        fig_equity.add_trace(go.Scatter(
+            x=test_dates,
+            y=agg_cum_returns,
+            mode='lines',
+            name='AGG (Bond Benchmark)',
+            line=dict(color='#ffa500', width=2, dash='dot')
+        ))
+    
+    # SPY Benchmark (if available)
+    if spy_returns is not None:
+        fig_equity.add_trace(go.Scatter(
+            x=test_dates,
+            y=spy_cum_returns,
+            mode='lines',
+            name='SPY (Equity Benchmark)',
+            line=dict(color='#ff4b4b', width=2, dash='dot')
+        ))
+    
     fig_equity.update_layout(
         template="plotly_dark",
-        height=400,
+        height=450,
         hovermode='x unified',
         showlegend=True,
+        legend=dict(
+            yanchor="top",
+            y=0.99,
+            xanchor="left",
+            x=0.01
+        ),
         xaxis_title="Date",
         yaxis_title="Cumulative Return"
     )
     
     st.plotly_chart(fig_equity, use_container_width=True)
+    
+    # Benchmark comparison table
+    if agg_returns is not None or spy_returns is not None:
+        st.subheader("📊 Benchmark Comparison")
+        
+        comparison_data = {
+            'Metric': ['Annualized Return', 'Sharpe Ratio', 'Max Drawdown', 'Max Daily DD'],
+            'Strategy': [
+                f"{ann_return * 100:.2f}%",
+                f"{sharpe:.2f}",
+                f"{max_dd * 100:.2f}%",
+                f"{max_daily_dd * 100:.2f}%"
+            ]
+        }
+        
+        if agg_returns is not None:
+            agg_ann_return = (agg_cum_returns[-1] ** (252 / len(agg_returns))) - 1
+            agg_sharpe = (np.mean(agg_returns) - (sofr / 252)) / (np.std(agg_returns) + 1e-9) * np.sqrt(252)
+            agg_cum_max = np.maximum.accumulate(agg_cum_returns)
+            agg_dd = (agg_cum_returns - agg_cum_max) / agg_cum_max
+            agg_max_dd = np.min(agg_dd)
+            agg_max_daily_dd = np.min(agg_returns)
+            
+            comparison_data['AGG (Bonds)'] = [
+                f"{agg_ann_return * 100:.2f}%",
+                f"{agg_sharpe:.2f}",
+                f"{agg_max_dd * 100:.2f}%",
+                f"{agg_max_daily_dd * 100:.2f}%"
+            ]
+        
+        if spy_returns is not None:
+            spy_ann_return = (spy_cum_returns[-1] ** (252 / len(spy_returns))) - 1
+            spy_sharpe = (np.mean(spy_returns) - (sofr / 252)) / (np.std(spy_returns) + 1e-9) * np.sqrt(252)
+            spy_cum_max = np.maximum.accumulate(spy_cum_returns)
+            spy_dd = (spy_cum_returns - spy_cum_max) / spy_cum_max
+            spy_max_dd = np.min(spy_dd)
+            spy_max_daily_dd = np.min(spy_returns)
+            
+            comparison_data['SPY (Equity)'] = [
+                f"{spy_ann_return * 100:.2f}%",
+                f"{spy_sharpe:.2f}",
+                f"{spy_max_dd * 100:.2f}%",
+                f"{spy_max_daily_dd * 100:.2f}%"
+            ]
+        
+        comparison_df = pd.DataFrame(comparison_data)
+        st.table(comparison_df)
     
     # Training history (for Transformer models)
     if "Option A" in model_option:

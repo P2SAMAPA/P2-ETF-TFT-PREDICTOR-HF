@@ -458,36 +458,6 @@ def build_pure_transformer(input_shape, num_outputs, num_heads=2, ff_dim=64, num
     
     return model
 
-def build_transformer_embedder(input_shape, num_heads=2, ff_dim=64, num_layers=1, dropout_rate=0.2):
-    """Build Transformer for feature extraction (embeddings only)"""
-    inputs = Input(shape=input_shape)
-    
-    # Add positional encoding
-    x = PositionalEncoding()(inputs)
-    
-    # Stack Transformer blocks
-    for _ in range(num_layers):
-        attn_output = MultiHeadAttention(
-            num_heads=num_heads,
-            key_dim=input_shape[1] // num_heads,
-            dropout=dropout_rate
-        )(x, x)
-        
-        x = LayerNormalization(epsilon=1e-6)(x + attn_output)
-        
-        ff_output = Dense(ff_dim, activation='relu')(x)
-        ff_output = Dropout(dropout_rate)(ff_output)
-        ff_output = Dense(input_shape[1])(ff_output)
-        
-        x = LayerNormalization(epsilon=1e-6)(x + ff_output)
-    
-    # Global pooling to get embeddings
-    embeddings = GlobalAveragePooling1D()(x)
-    
-    model = Model(inputs=inputs, outputs=embeddings)
-    
-    return model
-
 # ------------------------------
 # 8. SIDEBAR CONFIGURATION
 # ------------------------------
@@ -525,20 +495,23 @@ with st.sidebar:
         "Choose Model",
         [
             "Option A: Pure Transformer",
-            "Option B: Random Forest + XGBoost",
-            "Option C: Transformer + XGBoost Hybrid"
+            "Option B: Random Forest + XGBoost"
         ],
-        index=0
+        index=1  # Default to Option B (best performer)
     )
     
     st.divider()
     
     st.subheader("⚙️ Training Settings")
     epochs = st.number_input("Epochs", 10, 500, 100, step=10)
-    lookback = st.slider("Lookback Days", 20, 60, 30, step=5)
     
-    if "Transformer" in model_option:
+    # Lookback only relevant for Transformer models
+    if "Option A" in model_option:
+        lookback = st.slider("Lookback Days", 20, 60, 30, step=5)
         st.caption("ℹ️ Transformer: 2 heads, 1 layer, 64 FF dim")
+    else:
+        lookback = 30  # Default value (not used)
+        st.info("ℹ️ Lookback N/A for tree-based models (uses current day features only)")
     
     st.divider()
     
@@ -661,28 +634,39 @@ if run_button:
         
         # Train Random Forest + XGBoost
         with st.spinner("🌲 Training Random Forest + XGBoost Ensemble..."):
-            # Random Forest
+            # Random Forest - Enhanced hyperparameters
             rf_model = RandomForestClassifier(
-                n_estimators=200,
-                max_depth=10,
+                n_estimators=500,        # Increased from 200
+                max_depth=15,            # Increased from 10
                 min_samples_split=10,
-                min_samples_leaf=5,
+                min_samples_leaf=3,      # Decreased from 5 for more flexibility
+                max_features='sqrt',     # Added for better generalization
                 random_state=42,
                 n_jobs=-1
             )
             rf_model.fit(X_train, y_train)
             
-            # XGBoost
+            # XGBoost - Enhanced hyperparameters
             xgb_model = xgb.XGBClassifier(
-                n_estimators=200,
-                max_depth=6,
-                learning_rate=0.05,
+                n_estimators=500,        # Increased from 200
+                max_depth=8,             # Increased from 6
+                learning_rate=0.03,      # Decreased from 0.05 for more careful learning
                 subsample=0.8,
                 colsample_bytree=0.8,
+                min_child_weight=3,      # Added for regularization
+                gamma=0.1,               # Added for regularization
+                reg_alpha=0.1,           # L1 regularization
+                reg_lambda=1.0,          # L2 regularization
                 random_state=42,
-                n_jobs=-1
+                n_jobs=-1,
+                early_stopping_rounds=50,
+                eval_metric='mlogloss'
             )
-            xgb_model.fit(X_train, y_train)
+            xgb_model.fit(
+                X_train, y_train,
+                eval_set=[(X_val, y_val)],
+                verbose=False
+            )
             
             st.success("✅ Ensemble training completed!")
         
@@ -756,55 +740,6 @@ if run_button:
                 st.success(f"✅ Training completed! Best epoch: {len(history.history['loss']) - 20}")
             
             preds = model.predict(X_test, verbose=0)
-            
-        else:  # Option C: Transformer + XGBoost
-            with st.spinner("🔗 Training Transformer Embedder + XGBoost..."):
-                # Build Transformer embedder
-                embedder = build_transformer_embedder(
-                    input_shape=(X.shape[1], X.shape[2]),
-                    num_heads=2,
-                    ff_dim=64,
-                    num_layers=1,
-                    dropout_rate=0.2
-                )
-                
-                embedder.compile(optimizer='adam', loss='mse')
-                
-                # Train embedder on reconstruction task
-                embedder.fit(
-                    X_train, 
-                    X_train.reshape(len(X_train), -1)[:, :embedder.output_shape[1]],
-                    epochs=50,
-                    batch_size=32,
-                    verbose=0
-                )
-                
-                # Extract embeddings
-                train_embeddings = embedder.predict(X_train, verbose=0)
-                val_embeddings = embedder.predict(X_val, verbose=0)
-                test_embeddings = embedder.predict(X_test, verbose=0)
-                
-                # Train XGBoost on embeddings
-                y_train_class = np.argmax(y_train, axis=1)
-                
-                xgb_model = xgb.XGBClassifier(
-                    n_estimators=200,
-                    max_depth=6,
-                    learning_rate=0.05,
-                    subsample=0.8,
-                    random_state=42,
-                    n_jobs=-1
-                )
-                xgb_model.fit(train_embeddings, y_train_class)
-                
-                st.success("✅ Hybrid training completed!")
-            
-            # Predict
-            preds_class = xgb_model.predict(test_embeddings)
-            
-            # Convert back to one-hot style for consistency
-            preds = np.zeros((len(preds_class), len(target_etfs)))
-            preds[np.arange(len(preds_class)), preds_class] = 1.0
     
     # Get test dates
     if "Option B" in model_option:
@@ -820,17 +755,13 @@ if run_button:
     audit_trail = []
     
     for i in range(len(preds)):
-        if "Option B" in model_option or "Option C" in model_option:
-            # Classification models
-            if "Option B" in model_option:
-                best_idx = preds[i]
-            else:
-                best_idx = np.argmax(preds[i])
-            
+        if "Option B" in model_option:
+            # Classification model - direct index
+            best_idx = preds[i]
             signal_etf = target_etfs[best_idx].replace('_Ret', '')
-            realized_ret = y_raw_test[i][best_idx] if "Option B" in model_option else y_test[i][best_idx]
+            realized_ret = y_raw_test[i][best_idx]
         else:
-            # Pure Transformer
+            # Pure Transformer - regression outputs
             best_idx = np.argmax(preds[i])
             signal_etf = target_etfs[best_idx].replace('_Ret', '')
             realized_ret = y_test[i][best_idx]
@@ -930,36 +861,6 @@ if run_button:
     
     st.plotly_chart(fig_equity, use_container_width=True)
     
-    # Feature importance (for tree models)
-    if "Option B" in model_option:
-        st.subheader("🔍 Feature Importance (Random Forest + XGBoost)")
-        
-        rf_importance = rf_model.feature_importances_
-        xgb_importance = xgb_model.feature_importances_
-        
-        avg_importance = (rf_importance + xgb_importance) / 2
-        
-        feat_imp = pd.Series(avg_importance, index=input_features).sort_values(ascending=False).head(15)
-        
-        fig_imp = go.Figure(go.Bar(
-            x=feat_imp.values * 100,
-            y=feat_imp.index,
-            orientation='h',
-            marker_color='#3b82f6',
-            text=[f'{v:.1f}%' for v in feat_imp.values * 100],
-            textposition='outside'
-        ))
-        
-        fig_imp.update_layout(
-            template="plotly_dark",
-            height=500,
-            xaxis_title="Importance %",
-            yaxis_title="Feature",
-            showlegend=False
-        )
-        
-        st.plotly_chart(fig_imp, use_container_width=True)
-    
     # Training history (for Transformer models)
     if "Option A" in model_option:
         st.subheader("📉 Training & Validation Loss")
@@ -1026,18 +927,13 @@ if run_button:
             st.text(f"  - Total Parameters: {model.count_params():,}")
         
         elif "Option B" in model_option:
-            st.text("Random Forest + XGBoost Ensemble:")
-            st.text(f"  - Random Forest: 200 trees, max_depth=10")
-            st.text(f"  - XGBoost: 200 rounds, max_depth=6, lr=0.05")
+            st.text("Random Forest + XGBoost Ensemble (Enhanced):")
+            st.text(f"  - Random Forest: 500 trees, max_depth=15, min_leaf=3")
+            st.text(f"  - XGBoost: 500 rounds, max_depth=8, lr=0.03")
+            st.text(f"  - XGBoost Regularization: L1=0.1, L2=1.0, gamma=0.1")
+            st.text(f"  - Early Stopping: 50 rounds")
             st.text(f"  - Input Features: {len(input_features)}")
             st.text(f"  - Ensemble: Average probabilities")
-        
-        else:  # Option C
-            st.text("Transformer + XGBoost Hybrid:")
-            st.text(f"  - Transformer Embedder: ({lookback}, {len(input_features)}) → embeddings")
-            st.text(f"  - Embedding Dimension: {embedder.output_shape[1]}")
-            st.text(f"  - XGBoost: 200 rounds on embeddings")
-            st.text(f"  - Total Parameters: {embedder.count_params():,}")
         
         st.text(f"\nData Split: {split_option}")
         st.text(f"  - Training Samples: {len(X_train) if 'X_train' in locals() else 'N/A'}")

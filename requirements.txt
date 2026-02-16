@@ -13,3 +13,4 @@ pandas_market_calendars
 datasets
 tensorflow
 pandas-datareader
+xgboost

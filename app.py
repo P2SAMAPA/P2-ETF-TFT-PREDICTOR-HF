@@ -347,7 +347,7 @@ def smart_update_hf_dataset(new_data, token):
 # ------------------------------
 # 5. MAIN DATA ENGINE
 # ------------------------------
-def get_data(start_year, force_refresh=False):
+def get_data(start_year, force_refresh=False, clean_hf_dataset=False):
     """Main data fetching and processing pipeline"""
     # Always try to load from HF first
     raw_url = f"https://huggingface.co/datasets/{REPO_ID}/resolve/main/etf_data.csv"
@@ -365,6 +365,46 @@ def get_data(start_year, force_refresh=False):
         # Remove timezone
         if df.index.tz is not None:
             df.index = df.index.tz_localize(None)
+        
+        # CLEAN HF DATASET: Remove columns with excessive NaNs
+        if clean_hf_dataset:
+            st.warning("🧹 **Cleaning HF Dataset Mode Active**")
+            original_cols = len(df.columns)
+            
+            # Calculate NaN percentage per column
+            nan_pct = (df.isna().sum() / len(df)) * 100
+            bad_cols = nan_pct[nan_pct > 30].index.tolist()
+            
+            if bad_cols:
+                st.write(f"📋 Found {len(bad_cols)} columns with >30% NaNs:")
+                for col in bad_cols[:10]:  # Show first 10
+                    st.write(f"  - {col}: {nan_pct[col]:.1f}% NaNs")
+                
+                # Drop bad columns
+                df = df.drop(columns=bad_cols)
+                st.success(f"✅ Dropped {len(bad_cols)} columns ({original_cols} → {len(df.columns)})")
+                
+                # Re-upload cleaned dataset to HF
+                token = os.getenv("HF_TOKEN")
+                if token:
+                    st.info("📤 Uploading cleaned dataset to HuggingFace...")
+                    df.index.name = "Date"
+                    df.reset_index().to_csv("etf_data.csv", index=False)
+                    
+                    api = HfApi()
+                    api.upload_file(
+                        path_or_fileobj="etf_data.csv",
+                        path_in_repo="etf_data.csv",
+                        repo_id=REPO_ID,
+                        repo_type="dataset",
+                        token=token,
+                        commit_message=f"Cleaned dataset: Removed {len(bad_cols)} columns with >30% NaNs"
+                    )
+                    st.success("✅ HF dataset updated!")
+                else:
+                    st.error("❌ HF_TOKEN not found. Cannot update dataset.")
+            else:
+                st.info("ℹ️ No columns found with >30% NaNs. Dataset is already clean.")
         
     except Exception as e:
         st.warning(f"⚠️ Could not load from HuggingFace: {e}")
@@ -410,13 +450,29 @@ def get_data(start_year, force_refresh=False):
     macro_cols = ['VIX', 'DXY', 'COPPER', 'GOLD', 'HY_Spread', 'T10Y2Y', 'T10Y3M', 
                   'VIX_Spot', 'VIX_3M', 'VIX_Term_Slope']
     
+    # Track NaN counts per feature
+    nan_tracking = {}
+    
     for col in df.columns:
         # Create Z-scores for macro signals and volatility
         if any(m in col for m in macro_cols) or '_Vol' in col:
-            # Use expanding window to avoid NaNs
-            rolling_mean = df[col].rolling(60, min_periods=20).mean()
-            rolling_std = df[col].rolling(60, min_periods=20).std()
-            df[f"{col}_Z"] = (df[col] - rolling_mean) / (rolling_std + 1e-9)
+            # REDUCED: Use 20-day rolling window instead of 60 (preserves more early data)
+            rolling_mean = df[col].rolling(20, min_periods=5).mean()
+            rolling_std = df[col].rolling(20, min_periods=5).std()
+            z_col = f"{col}_Z"
+            df[z_col] = (df[col] - rolling_mean) / (rolling_std + 1e-9)
+            
+            # Track NaN count
+            nan_count = df[z_col].isna().sum()
+            if nan_count > 0:
+                nan_tracking[z_col] = nan_count
+    
+    # Report features with excessive NaNs
+    if nan_tracking:
+        st.warning(f"⚠️ Features with NaNs: {len(nan_tracking)} features")
+        worst_features = sorted(nan_tracking.items(), key=lambda x: x[1], reverse=True)[:5]
+        for feat, count in worst_features:
+            st.write(f"  - {feat}: {count} NaNs ({count/len(df)*100:.1f}%)")
     
     # PRIORITY 3: ADD REGIME DETECTION FEATURES
     st.write("🎯 **Adding Regime Detection Features...**")
@@ -461,7 +517,15 @@ def get_data(start_year, force_refresh=False):
     st.info(f"📅 After year filter ({start_year}+): {len(df)} samples from {df.index[0].year if len(df) > 0 else 'N/A'} to {df.index[-1].year if len(df) > 0 else 'N/A'}")
     
     # AGGRESSIVE CLEANING STRATEGY to preserve early years
-    # Step 1: Forward fill gaps (max 5 days) - handles short gaps
+    # Step 1: Identify and DROP features with >50% NaNs (they're useless anyway)
+    nan_percentages = df.isna().sum() / len(df)
+    bad_features = nan_percentages[nan_percentages > 0.5].index.tolist()
+    
+    if bad_features:
+        st.warning(f"🗑️ Dropping {len(bad_features)} features with >50% NaNs: {bad_features[:5]}...")
+        df = df.drop(columns=bad_features)
+    
+    # Step 2: Forward fill gaps (max 5 days) - handles short gaps
     df = df.fillna(method='ffill', limit=5)
     
     # Step 2: Backfill early NaNs (first 100 rows) - preserves 2008-2015 data
@@ -570,6 +634,12 @@ with st.sidebar:
         help="Manually fetch fresh data and update HF dataset (ignores sync window)"
     )
     
+    clean_dataset = st.checkbox(
+        "Clean HF Dataset (Remove NaN-heavy columns)",
+        value=False,
+        help="Remove columns with >30% missing data from HF dataset permanently"
+    )
+    
     st.divider()
     
     start_yr = st.slider("📅 Start Year", 2008, 2025, 2016)
@@ -668,7 +738,7 @@ if refresh_only_button:
 
 if run_button:
     # Load and prepare data
-    df = get_data(start_yr, force_refresh=force_refresh)
+    df = get_data(start_yr, force_refresh=force_refresh, clean_hf_dataset=clean_dataset)
     
     if df.empty:
         st.error("❌ No data available. Please check data sources.")

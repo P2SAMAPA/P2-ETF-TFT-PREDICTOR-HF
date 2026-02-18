@@ -873,14 +873,19 @@ if run_button:
             if valid_trading_days.tz is not None:
                 valid_trading_days = valid_trading_days.tz_localize(None)
             
-            # Get boolean mask for which dates are trading days
+          # Get boolean mask for which dates are trading days
             trading_day_mask = test_dates_all.isin(valid_trading_days)
             
             # Apply mask to both dates AND data
             test_dates = test_dates_all[trading_day_mask]
             
-            # ✅ FIX: trading_day_mask is already a numpy array from pandas, no .values needed
-            mask_array = trading_day_mask.to_numpy()
+            # ✅ FIX: Convert mask properly - it's a pandas Series
+            if isinstance(trading_day_mask, pd.Series):
+                mask_array = trading_day_mask.values
+            elif hasattr(trading_day_mask, 'to_numpy'):
+                mask_array = trading_day_mask.to_numpy()
+            else:
+                mask_array = np.array(trading_day_mask)
             
             # Also filter predictions and returns to match
             if "Option B" in model_option:

@@ -851,37 +851,7 @@ if run_button:
             
             preds = model.predict(X_test, verbose=0)
     
-    # ============================================================
-    # CORRECTED: Get test dates and filter to NYSE trading days
-    # ============================================================
-    if "Option B" in model_option:
-        test_dates_all = df.index[train_size + val_size:]
-    else:
-        test_dates_all = df.index[lookback + train_size + val_size:]
-    
-    # ✅ CRITICAL: Filter to only NYSE trading days
-    if NYSE_CALENDAR_AVAILABLE:
-        try:
-            nyse = mcal.get_calendar('NYSE')
-            trading_schedule = nyse.schedule(
-                start_date=test_dates_all[0].strftime('%Y-%m-%d'),
-                end_date=test_dates_all[-1].strftime('%Y-%m-%d')
-            )
-            valid_trading_days = trading_schedule.index.normalize()
-            
-            if valid_trading_days.tz is not None:
-                valid_trading_days = valid_trading_days.tz_localize(None)
-            
-            test_dates = test_dates_all[test_dates_all.isin(valid_trading_days)]
-            st.success(f"✅ Filtered to {len(test_dates)} NYSE trading days (removed {len(test_dates_all) - len(test_dates)} weekend/holiday days)")
-        except Exception as e:
-            st.warning(f"⚠️ NYSE calendar filter failed: {e}. Using all dates.")
-            test_dates = test_dates_all
-    else:
-        test_dates = test_dates_all
-    
-    sofr = df['T10Y3M'].iloc[-1] / 100 if 'T10Y3M' in df.columns else 0.045
-    
+     
   # ============================================================
     # CORRECTED: Align predictions, returns, and dates
     # ============================================================
@@ -909,13 +879,16 @@ if run_button:
             # Apply mask to both dates AND data
             test_dates = test_dates_all[trading_day_mask]
             
+            # ✅ FIX: trading_day_mask is already a numpy array from pandas, no .values needed
+            mask_array = trading_day_mask.to_numpy()
+            
             # Also filter predictions and returns to match
             if "Option B" in model_option:
-                preds = preds[trading_day_mask.values]
-                y_raw_test = y_raw_test[trading_day_mask.values]
+                preds = preds[mask_array]
+                y_raw_test = y_raw_test[mask_array]
             else:
-                preds = preds[trading_day_mask.values]
-                y_test = y_test[trading_day_mask.values]
+                preds = preds[mask_array]
+                y_test = y_test[mask_array]
             
             st.success(f"✅ Filtered to {len(test_dates)} NYSE trading days (removed {len(test_dates_all) - len(test_dates)} weekend/holiday days)")
         except Exception as e:
@@ -955,6 +928,28 @@ if run_button:
         })
     
     strat_rets = np.array(strat_rets)
+    
+    # ✅ FIX: Get next trading day BEFORE using it in markdown
+    if len(test_dates) > 0:
+        last_date = test_dates[-1]
+        next_trading = get_next_trading_day(last_date)
+        
+        if "Option B" in model_option:
+            if len(preds) > 0:
+                next_best_idx = preds[-1]
+                next_signal = target_etfs[next_best_idx].replace('_Ret', '')
+            else:
+                next_signal = "CASH"
+        else:
+            if len(preds) > 0:
+                next_best_idx = np.argmax(preds[-1])
+                next_signal = target_etfs[next_best_idx].replace('_Ret', '')
+            else:
+                next_signal = "CASH"
+    else:
+        next_trading = datetime.now().date()
+        next_signal = "CASH"
+    
     # Performance Analytics
     st.divider()
     

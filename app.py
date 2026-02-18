@@ -962,30 +962,59 @@ if run_button:
     # Get SOFR rate
     sofr = df['T10Y3M'].iloc[-1] / 100 if 'T10Y3M' in df.columns else 0.045
     
-    # Strategy execution
+    # ============================================================
+    # CRITICAL FIX: T+1 STRATEGY EXECUTION WITH PROPER DATE ALIGNMENT
+    # ============================================================
     strat_rets = []
     audit_trail = []
     
-    for i in range(len(preds)):
+    for i in range(len(preds) - 1):  # ✅ Stop at len(preds) - 1 to ensure T+1 exists
         if "Option B" in model_option:
             # Classification model - direct index
             best_idx = preds[i]
             signal_etf = target_etfs[best_idx].replace('_Ret', '')
-            realized_ret = y_raw_test[i][best_idx]
+            
+            # ✅ T+1 execution: Use NEXT day's return
+            realized_ret = y_raw_test[i + 1][best_idx]
+            execution_date = test_dates[i + 1]
+            
         else:
             # Pure Transformer - regression outputs
             best_idx = np.argmax(preds[i])
             signal_etf = target_etfs[best_idx].replace('_Ret', '')
-            realized_ret = y_test[i][best_idx]
+            
+            # ✅ T+1 execution: Use NEXT day's return
+            realized_ret = y_test[i + 1][best_idx]
+            execution_date = test_dates[i + 1]
         
         net_ret = realized_ret - (fee_bps / 10000)
         
         strat_rets.append(net_ret)
         audit_trail.append({
-            'Date': test_dates[i].strftime('%Y-%m-%d'),
+            'Date': execution_date.strftime('%Y-%m-%d'),  # ✅ T+1 execution date
             'Signal': signal_etf,
             'Realized': realized_ret,
             'Net_Return': net_ret
+        })
+    
+    # Handle LAST prediction (no T+1 return available yet)
+    if len(preds) > 0:
+        if "Option B" in model_option:
+            last_best_idx = preds[-1]
+            last_signal = target_etfs[last_best_idx].replace('_Ret', '')
+        else:
+            last_best_idx = np.argmax(preds[-1])
+            last_signal = target_etfs[last_best_idx].replace('_Ret', '')
+        
+        # Next trading day for last prediction
+        last_date = test_dates[-1]
+        next_trading = get_next_trading_day(last_date)
+        
+        audit_trail.append({
+            'Date': next_trading.strftime('%Y-%m-%d'),
+            'Signal': last_signal,
+            'Realized': 0.0,  # Not yet realized
+            'Net_Return': 0.0  # Not yet realized
         })
     
     strat_rets = np.array(strat_rets)
@@ -993,9 +1022,8 @@ if run_button:
     # Performance Analytics
     st.divider()
     
-    next_day = (df.index[-1] + timedelta(days=1)).strftime('%Y-%m-%d')
-    next_day_date = get_next_trading_day(df.index[-1])
-    next_day = next_day_date.strftime('%Y-%m-%d')
+    # Next day allocation - use the LAST entry in audit trail
+    next_day = audit_trail[-1]['Date']
     latest_signal = audit_trail[-1]['Signal']
     
     # Make allocation VERY prominent
@@ -1100,7 +1128,7 @@ if run_button:
     
     # Strategy
     fig_equity.add_trace(go.Scatter(
-        x=test_dates,
+        x=test_dates[1:len(cum_returns)+1],  # ✅ Align with T+1 execution dates
         y=cum_returns,
         mode='lines',
         name='Strategy',
@@ -1111,7 +1139,7 @@ if run_button:
     
     # High Water Mark
     fig_equity.add_trace(go.Scatter(
-        x=test_dates,
+        x=test_dates[1:len(cum_max)+1],
         y=cum_max,
         mode='lines',
         name='High Water Mark',
@@ -1121,7 +1149,7 @@ if run_button:
     # AGG Benchmark (if available)
     if agg_returns is not None:
         fig_equity.add_trace(go.Scatter(
-            x=test_dates,
+            x=test_dates[1:len(agg_cum_returns)+1],
             y=agg_cum_returns,
             mode='lines',
             name='AGG (Bond Benchmark)',
@@ -1131,7 +1159,7 @@ if run_button:
     # SPY Benchmark (if available)
     if spy_returns is not None:
         fig_equity.add_trace(go.Scatter(
-            x=test_dates,
+            x=test_dates[1:len(spy_cum_returns)+1],
             y=spy_cum_returns,
             mode='lines',
             name='SPY (Equity Benchmark)',
@@ -1240,13 +1268,15 @@ if run_button:
     audit_df = pd.DataFrame(audit_trail).tail(15)[['Date', 'Signal', 'Net_Return']]
     
     def color_return(val):
+        if val == 0.0:
+            return 'color: #94a3b8; font-style: italic'  # Gray for pending
         return 'color: #00ff00; font-weight: bold' if val > 0 else 'color: #ff4b4b; font-weight: bold'
     
     styled_audit = audit_df.style.applymap(
         color_return,
         subset=['Net_Return']
     ).format({
-        'Net_Return': '{:.2%}'
+        'Net_Return': lambda x: 'Pending' if x == 0.0 else f'{x:.2%}'
     }).set_properties(**{
         'font-size': '18px',
         'text-align': 'center'
@@ -1285,6 +1315,10 @@ if run_button:
         st.text(f"  - Training Samples: {len(X_train) if 'X_train' in locals() else 'N/A'}")
         st.text(f"  - Validation Samples: {len(X_val) if 'X_val' in locals() else 'N/A'}")
         st.text(f"  - Test Samples: {len(X_test) if 'X_test' in locals() else 'N/A'}")
+        st.text(f"\nT+1 Execution:")
+        st.text(f"  - Strategy uses T+1 execution (predict on day N, trade on day N+1)")
+        st.text(f"  - Audit trail shows execution date (T+1) and realized returns")
+        st.text(f"  - Last row shows next trading day with pending return")
 
 else:
     st.info("👈 Configure parameters in the sidebar and click '🚀 Execute Model' to begin")

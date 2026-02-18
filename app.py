@@ -99,18 +99,13 @@ class PositionalEncoding(tf.keras.layers.Layer):
         # Calculate positional encodings
         pos_encoding = np.zeros((seq_len, d_model), dtype=np.float32)
         
-        # For even dimensions: d_model = 10 → indices 0,2,4,6,8 (5 values each)
-        # For odd dimensions: d_model = 11 → indices 0,2,4,6,8,10 (sin gets 6, cos gets 5)
         pos_encoding[:, 0::2] = np.sin(position * div_term)[:, :len(range(0, d_model, 2))]
         
-        # Cosine for odd indices - handle case where we might have fewer odd indices
         if d_model > 1:
             cos_values = np.cos(position * div_term)
-            # Determine how many odd positions we have
             odd_positions = range(1, d_model, 2)
             pos_encoding[:, 1::2] = cos_values[:, :len(odd_positions)]
         
-        # Store as a non-trainable weight
         self.pos_encoding = self.add_weight(
             name='positional_encoding',
             shape=(1, seq_len, d_model),
@@ -121,7 +116,6 @@ class PositionalEncoding(tf.keras.layers.Layer):
         super(PositionalEncoding, self).build(input_shape)
     
     def call(self, inputs):
-        """Add positional encoding to inputs"""
         return inputs + self.pos_encoding
     
     def compute_output_shape(self, input_shape):
@@ -136,21 +130,18 @@ class PositionalEncoding(tf.keras.layers.Layer):
 # 3. DATA FETCHING FUNCTIONS
 # ------------------------------
 def fetch_macro_data_robust(start_date="2008-01-01"):
-    """
-    Fetch macro signals from multiple sources with proper error handling
-    Returns: Combined DataFrame with all available macro signals
-    """
+    """Fetch macro signals from multiple sources with proper error handling"""
     all_data = []
     data_sources = {}
     
-    # 1. FRED Data (Most Reliable)
+    # 1. FRED Data
     try:
         fred_symbols = {
-            "T10Y2Y": "T10Y2Y",      # 10Y-2Y Treasury Spread
-            "T10Y3M": "T10Y3M",      # 10Y-3M Treasury Spread  
-            "BAMLH0A0HYM2": "HY_Spread",  # High Yield Credit Spread
-            "VIXCLS": "VIX",         # VIX from FRED
-            "DTWEXBGS": "DXY"        # Dollar Index from FRED
+            "T10Y2Y": "T10Y2Y",
+            "T10Y3M": "T10Y3M",
+            "BAMLH0A0HYM2": "HY_Spread",
+            "VIXCLS": "VIX",
+            "DTWEXBGS": "DXY"
         }
         
         fred_data = web.DataReader(
@@ -161,7 +152,6 @@ def fetch_macro_data_robust(start_date="2008-01-01"):
         )
         fred_data.columns = [fred_symbols[col] for col in fred_data.columns]
         
-        # Remove timezone if present
         if fred_data.index.tz is not None:
             fred_data.index = fred_data.index.tz_localize(None)
         
@@ -174,9 +164,9 @@ def fetch_macro_data_robust(start_date="2008-01-01"):
     # 2. Yahoo Finance Data
     try:
         yf_symbols = {
-            "GC=F": "GOLD",      # Gold Futures
-            "HG=F": "COPPER",    # Copper Futures
-            "^VIX": "VIX_YF",    # VIX (backup if FRED fails)
+            "GC=F": "GOLD",
+            "HG=F": "COPPER",
+            "^VIX": "VIX_YF",
         }
         
         yf_data = yf.download(
@@ -191,7 +181,6 @@ def fetch_macro_data_robust(start_date="2008-01-01"):
         
         yf_data.columns = [yf_symbols.get(col, col) for col in yf_data.columns]
         
-        # Remove timezone if present
         if yf_data.index.tz is not None:
             yf_data.index = yf_data.index.tz_localize(None)
         
@@ -201,10 +190,10 @@ def fetch_macro_data_robust(start_date="2008-01-01"):
     except Exception as e:
         st.warning(f"⚠️ Yahoo Finance failed: {e}")
     
-    # 3. VIX Term Structure (Standard Macro Signal)
+    # 3. VIX Term Structure
     try:
         vix_term = yf.download(
-            ["^VIX", "^VIX3M"],  # VIX and 3-month VIX
+            ["^VIX", "^VIX3M"],
             start=start_date,
             progress=False,
             auto_adjust=True
@@ -215,11 +204,8 @@ def fetch_macro_data_robust(start_date="2008-01-01"):
                 vix_term = vix_term.to_frame()
             
             vix_term.columns = ["VIX_Spot", "VIX_3M"]
-            
-            # Calculate VIX term structure slope (measures volatility curve steepness)
             vix_term['VIX_Term_Slope'] = vix_term['VIX_3M'] - vix_term['VIX_Spot']
             
-            # Remove timezone
             if vix_term.index.tz is not None:
                 vix_term.index = vix_term.index.tz_localize(None)
             
@@ -232,13 +218,8 @@ def fetch_macro_data_robust(start_date="2008-01-01"):
     # Combine all data sources
     if all_data:
         combined = pd.concat(all_data, axis=1, join='outer')
-        
-        # Remove duplicate columns (keep first occurrence)
         combined = combined.loc[:, ~combined.columns.duplicated()]
-        
-        # Forward fill missing values (max 5 days)
         combined = combined.fillna(method='ffill', limit=5)
-        
         return combined
     else:
         st.error("❌ Failed to fetch any macro data!")
@@ -258,7 +239,6 @@ def fetch_etf_data(etfs, start_date="2008-01-01"):
         if isinstance(etf_data, pd.Series):
             etf_data = etf_data.to_frame()
         
-        # Remove timezone
         if etf_data.index.tz is not None:
             etf_data.index = etf_data.index.tz_localize(None)
         
@@ -270,7 +250,6 @@ def fetch_etf_data(etfs, start_date="2008-01-01"):
         etf_vol = etf_data.pct_change().rolling(20).std() * np.sqrt(252)
         etf_vol.columns = [f"{col}_Vol" for col in etf_vol.columns]
         
-        # Combine
         result = pd.concat([etf_returns, etf_vol], axis=1)
         
         return result
@@ -291,35 +270,28 @@ def smart_update_hf_dataset(new_data, token):
     raw_url = f"https://huggingface.co/datasets/{REPO_ID}/resolve/main/etf_data.csv"
     
     try:
-        # Download existing dataset
         existing_df = pd.read_csv(raw_url)
         existing_df.columns = existing_df.columns.str.strip()
         
-        # Find date column
         date_col = next((c for c in existing_df.columns 
                         if c.lower() in ['date', 'unnamed: 0']), existing_df.columns[0])
         
         existing_df[date_col] = pd.to_datetime(existing_df[date_col])
         existing_df = existing_df.set_index(date_col).sort_index()
         
-        # Remove timezone if present
         if existing_df.index.tz is not None:
             existing_df.index = existing_df.index.tz_localize(None)
         
-        # Merge: New data takes priority for overlapping dates
         combined = new_data.combine_first(existing_df)
         
-        # Calculate improvements
         new_rows = len(combined) - len(existing_df)
         old_nulls = existing_df.isna().sum().sum()
         new_nulls = combined.isna().sum().sum()
         filled_gaps = old_nulls - new_nulls
         
-        # Decide if upload is needed
         needs_update = new_rows > 0 or filled_gaps > 0
         
         if needs_update:
-            # Prepare and upload
             combined.index.name = "Date"
             combined.reset_index().to_csv("etf_data.csv", index=False)
             
@@ -349,7 +321,6 @@ def smart_update_hf_dataset(new_data, token):
 # ------------------------------
 def get_data(start_year, force_refresh=False, clean_hf_dataset=False):
     """Main data fetching and processing pipeline"""
-    # Always try to load from HF first
     raw_url = f"https://huggingface.co/datasets/{REPO_ID}/resolve/main/etf_data.csv"
     df = pd.DataFrame()
     
@@ -357,34 +328,28 @@ def get_data(start_year, force_refresh=False, clean_hf_dataset=False):
         df = pd.read_csv(raw_url)
         df.columns = df.columns.str.strip()
         
-        # Fix date column
         date_col = next((c for c in df.columns if c.lower() in ['date', 'unnamed: 0']), df.columns[0])
         df[date_col] = pd.to_datetime(df[date_col])
         df = df.set_index(date_col).sort_index()
         
-        # Remove timezone
         if df.index.tz is not None:
             df.index = df.index.tz_localize(None)
         
-        # CLEAN HF DATASET: Remove columns with excessive NaNs
         if clean_hf_dataset:
             st.warning("🧹 **Cleaning HF Dataset Mode Active**")
             original_cols = len(df.columns)
             
-            # Calculate NaN percentage per column
             nan_pct = (df.isna().sum() / len(df)) * 100
             bad_cols = nan_pct[nan_pct > 30].index.tolist()
             
             if bad_cols:
                 st.write(f"📋 Found {len(bad_cols)} columns with >30% NaNs:")
-                for col in bad_cols[:10]:  # Show first 10
+                for col in bad_cols[:10]:
                     st.write(f"  - {col}: {nan_pct[col]:.1f}% NaNs")
                 
-                # Drop bad columns
                 df = df.drop(columns=bad_cols)
                 st.success(f"✅ Dropped {len(bad_cols)} columns ({original_cols} → {len(df.columns)})")
                 
-                # Re-upload cleaned dataset to HF
                 token = os.getenv("HF_TOKEN")
                 if token:
                     st.info("📤 Uploading cleaned dataset to HuggingFace...")
@@ -409,7 +374,6 @@ def get_data(start_year, force_refresh=False, clean_hf_dataset=False):
     except Exception as e:
         st.warning(f"⚠️ Could not load from HuggingFace: {e}")
     
-    # Check if we should sync (during sync windows OR force refresh)
     should_sync = is_sync_window() or force_refresh
     
     if should_sync:
@@ -417,26 +381,19 @@ def get_data(start_year, force_refresh=False, clean_hf_dataset=False):
         
         with st.status(f"{sync_reason} - Updating Dataset...", expanded=False):
             
-            # Fetch fresh data
             etf_list = ["TLT", "TBT", "VNQ", "SLV", "GLD", "AGG", "SPY"]
             
-            # Fetch ETF data
             etf_data = fetch_etf_data(etf_list, start_date="2008-01-01")
-            
-            # Fetch macro data
             macro_data = fetch_macro_data_robust(start_date="2008-01-01")
             
-            # Combine all
             if not etf_data.empty and not macro_data.empty:
                 new_df = pd.concat([etf_data, macro_data], axis=1)
                 
-                # Update HF dataset
                 token = os.getenv("HF_TOKEN")
                 df = smart_update_hf_dataset(new_df, token)
             else:
                 st.error("❌ Data fetch failed during sync")
     
-    # If still empty, fetch fresh data anyway
     if df.empty:
         st.warning("📊 Fetching fresh data (no cached dataset available)...")
         etf_list = ["TLT", "TBT", "VNQ", "SLV", "GLD", "AGG", "SPY"]
@@ -446,64 +403,57 @@ def get_data(start_year, force_refresh=False, clean_hf_dataset=False):
         if not etf_data.empty and not macro_data.empty:
             df = pd.concat([etf_data, macro_data], axis=1)
     
-    # Feature Engineering: Z-Scores for macro signals
+    # Feature Engineering
     macro_cols = ['VIX', 'DXY', 'COPPER', 'GOLD', 'HY_Spread', 'T10Y2Y', 'T10Y3M', 
                   'VIX_Spot', 'VIX_3M', 'VIX_Term_Slope']
     
-    # Track NaN counts per feature
     nan_tracking = {}
     
     for col in df.columns:
-        # Create Z-scores for macro signals and volatility
         if any(m in col for m in macro_cols) or '_Vol' in col:
-            # REDUCED: Use 20-day rolling window instead of 60 (preserves more early data)
             rolling_mean = df[col].rolling(20, min_periods=5).mean()
             rolling_std = df[col].rolling(20, min_periods=5).std()
             z_col = f"{col}_Z"
             df[z_col] = (df[col] - rolling_mean) / (rolling_std + 1e-9)
             
-            # Track NaN count
             nan_count = df[z_col].isna().sum()
             if nan_count > 0:
                 nan_tracking[z_col] = nan_count
     
-    # Report features with excessive NaNs
     if nan_tracking:
         st.warning(f"⚠️ Features with NaNs: {len(nan_tracking)} features")
         worst_features = sorted(nan_tracking.items(), key=lambda x: x[1], reverse=True)[:5]
         for feat, count in worst_features:
             st.write(f"  - {feat}: {count} NaNs ({count/len(df)*100:.1f}%)")
     
-    # PRIORITY 3: ADD REGIME DETECTION FEATURES
     st.write("🎯 **Adding Regime Detection Features...**")
     
-    # Show data range BEFORE feature engineering
     st.info(f"📊 Raw data loaded: {len(df)} samples from {df.index[0].year} to {df.index[-1].year}")
     
-    # VIX Regime (volatility environment)
+    # VIX Regime
     if 'VIX' in df.columns:
-        df['VIX_Regime_Low'] = (df['VIX'] < 15).astype(int)      # Risk-on
-        df['VIX_Regime_Med'] = ((df['VIX'] >= 15) & (df['VIX'] < 25)).astype(int)  # Normal
-        df['VIX_Regime_High'] = (df['VIX'] >= 25).astype(int)    # Risk-off
+        df['VIX_Regime_Low'] = (df['VIX'] < 15).astype(int)
+        df['VIX_Regime_Med'] = ((df['VIX'] >= 15) & (df['VIX'] < 25)).astype(int)
+        df['VIX_Regime_High'] = (df['VIX'] >= 25).astype(int)
     
     # Yield Curve Regime
     if 'T10Y2Y' in df.columns:
-        df['YC_Inverted'] = (df['T10Y2Y'] < 0).astype(int)       # Recession signal
+        df['YC_Inverted'] = (df['T10Y2Y'] < 0).astype(int)
         df['YC_Flat'] = ((df['T10Y2Y'] >= 0) & (df['T10Y2Y'] < 0.5)).astype(int)
-        df['YC_Steep'] = (df['T10Y2Y'] >= 0.5).astype(int)       # Growth
+        df['YC_Steep'] = (df['T10Y2Y'] >= 0.5).astype(int)
     
     # Credit Stress Regime
     if 'HY_Spread' in df.columns:
-        df['Credit_Stress_Low'] = (df['HY_Spread'] < 400).astype(int)   # Healthy
+        df['Credit_Stress_Low'] = (df['HY_Spread'] < 400).astype(int)
         df['Credit_Stress_Med'] = ((df['HY_Spread'] >= 400) & (df['HY_Spread'] < 600)).astype(int)
-        df['Credit_Stress_High'] = (df['HY_Spread'] >= 600).astype(int) # Crisis
+        df['Credit_Stress_High'] = (df['HY_Spread'] >= 600).astype(int)
     
     # VIX Term Structure Regime
     if 'VIX_Term_Slope' in df.columns:
-        df['VIX_Term_Contango'] = (df['VIX_Term_Slope'] > 2).astype(int)   # Calm
-        df['VIX_Term_Backwardation'] = (df['VIX_Term_Slope'] < -2).astype(int)  # Fear
+        df['VIX_Term_Contango'] = (df['VIX_Term_Slope'] > 2).astype(int)
+        df['VIX_Term_Backwardation'] = (df['VIX_Term_Slope'] < -2).astype(int)
     
-    # Rate Environment (using 10Y3M as proxy)
+    # Rate Environment
     if 'T10Y3M' in df.columns:
         df['Rates_VeryLow'] = (df['T10Y3M'] < 1.0).astype(int)
         df['Rates_Low'] = ((df['T10Y3M'] >= 1.0) & (df['T10Y3M'] < 2.0)).astype(int)
@@ -512,12 +462,10 @@ def get_data(start_year, force_refresh=False, clean_hf_dataset=False):
     
     st.success(f"✅ Added {len([c for c in df.columns if 'Regime' in c or 'YC_' in c or 'Credit_' in c or 'Rates_' in c])} regime features")
     
-    # CRITICAL: Filter by start year
     df = df[df.index.year >= start_year]
     st.info(f"📅 After year filter ({start_year}+): {len(df)} samples from {df.index[0].year if len(df) > 0 else 'N/A'} to {df.index[-1].year if len(df) > 0 else 'N/A'}")
     
-    # AGGRESSIVE CLEANING STRATEGY to preserve early years
-    # Step 1: Identify and DROP features with >50% NaNs (they're useless anyway)
+    # Cleaning
     nan_percentages = df.isna().sum() / len(df)
     bad_features = nan_percentages[nan_percentages > 0.5].index.tolist()
     
@@ -525,23 +473,13 @@ def get_data(start_year, force_refresh=False, clean_hf_dataset=False):
         st.warning(f"🗑️ Dropping {len(bad_features)} features with >50% NaNs: {bad_features[:5]}...")
         df = df.drop(columns=bad_features)
     
-    # Step 2: Forward fill gaps (max 5 days) - handles short gaps
     df = df.fillna(method='ffill', limit=5)
-    
-    # Step 2: Backfill early NaNs (first 100 rows) - preserves 2008-2015 data
-    # This fills NaNs at start of dataset from first valid values
     df = df.fillna(method='bfill', limit=100)
-    
-    # Step 3: Forward fill any remaining NaNs
     df = df.fillna(method='ffill')
     
-    # Count remaining NaNs before dropping
     nan_count_before = df.isna().sum().sum()
-    
-    # Step 4: Only drop rows with NaNs that couldn't be filled
     df = df.dropna()
     
-    # Show final data range AFTER cleaning
     if len(df) > 0:
         st.success(f"✅ Final dataset: {len(df)} samples from {df.index[0].strftime('%Y-%m-%d')} to {df.index[-1].strftime('%Y-%m-%d')} (dropped {nan_count_before} remaining NaN cells)")
     else:
@@ -554,19 +492,9 @@ def get_data(start_year, force_refresh=False, clean_hf_dataset=False):
 # ------------------------------
 def directional_loss(y_true, y_pred):
     """Custom loss that penalizes incorrect direction predictions more heavily"""
-    # Calculate absolute error
     abs_error = tf.abs(y_true - y_pred)
-    
-    # Check if signs match
     signs_match = tf.cast(tf.math.sign(y_true) == tf.math.sign(y_pred), tf.float32)
-    
-    # Penalize wrong direction 2x more
-    penalty = tf.where(
-        signs_match > 0.5,
-        abs_error,           # Correct direction: normal penalty
-        abs_error * 2.0      # Wrong direction: double penalty
-    )
-    
+    penalty = tf.where(signs_match > 0.5, abs_error, abs_error * 2.0)
     return tf.reduce_mean(penalty)
 
 # ------------------------------
@@ -575,31 +503,23 @@ def directional_loss(y_true, y_pred):
 def build_pure_transformer(input_shape, num_outputs, num_heads=2, ff_dim=64, num_layers=1, dropout_rate=0.2):
     """Build a pure Transformer architecture"""
     inputs = Input(shape=input_shape)
-    
-    # Add positional encoding
     x = PositionalEncoding()(inputs)
     
-    # Stack Transformer blocks
     for _ in range(num_layers):
-        # Multi-head self-attention
         attn_output = MultiHeadAttention(
             num_heads=num_heads,
             key_dim=input_shape[1] // num_heads,
             dropout=dropout_rate
         )(x, x)
         
-        # Residual connection and layer normalization
         x = LayerNormalization(epsilon=1e-6)(x + attn_output)
         
-        # Feed-forward network with L2 regularization
         ff_output = Dense(ff_dim, activation='relu', kernel_regularizer=l2(0.01))(x)
         ff_output = Dropout(dropout_rate)(ff_output)
         ff_output = Dense(input_shape[1], kernel_regularizer=l2(0.01))(ff_output)
         
-        # Residual connection and layer normalization
         x = LayerNormalization(epsilon=1e-6)(x + ff_output)
     
-    # Global pooling and output with L2 regularization
     x = GlobalAveragePooling1D()(x)
     x = Dropout(dropout_rate)(x)
     x = Dense(ff_dim, activation='relu', kernel_regularizer=l2(0.01))(x)
@@ -626,7 +546,6 @@ with st.sidebar:
     
     st.divider()
     
-    # Manual Dataset Refresh Option
     st.subheader("📥 Dataset Management")
     force_refresh = st.checkbox(
         "Force Dataset Refresh",
@@ -655,21 +574,20 @@ with st.sidebar:
             "Option A: Pure Transformer",
             "Option B: Random Forest + XGBoost"
         ],
-        index=1  # Default to Option B (best performer)
+        index=1
     )
     
     st.divider()
     
     st.subheader("⚙️ Training Settings")
     
-    # Epochs only relevant for Transformer models
     if "Option A" in model_option:
         epochs = st.number_input("Epochs", 10, 500, 100, step=10)
         lookback = st.slider("Lookback Days", 20, 60, 30, step=5)
         st.caption("ℹ️ Transformer: 2 heads, 1 layer, 64 FF dim")
     else:
-        epochs = 100  # Not used for RF+XGBoost (hardcoded to 500 rounds)
-        lookback = 30  # Not used
+        epochs = 100
+        lookback = 30
         st.info("ℹ️ RF+XGBoost uses optimized settings: 500 trees/rounds with early stopping")
     
     st.divider()
@@ -679,11 +597,10 @@ with st.sidebar:
     split_option = st.selectbox(
         "Train/Val/Test Split",
         ["70/15/15", "80/10/10"],
-        index=0,  # Default to 70/15/15
+        index=0,
         help="Choose data split ratio: Train/Validation/Out-of-Sample"
     )
     
-    # Parse split ratios
     split_ratios = {
         "70/15/15": (0.70, 0.15, 0.15),
         "80/10/10": (0.80, 0.10, 0.10)
@@ -699,12 +616,12 @@ with st.sidebar:
     refresh_only_button = st.button("🔄 Refresh Dataset Only", type="secondary", use_container_width=True, 
                                     help="Update HF dataset with latest data without training the model")
 
-# 10. MAIN APPLICATION
+# ------------------------------
+# 9. MAIN APPLICATION
 # ------------------------------
 st.title("🤖 P2-ETF-PREDICTOR")
 st.caption("Multi-Model Ensemble: Transformer, Random Forest, XGBoost")
 
-# Handle dataset refresh only
 if refresh_only_button:
     st.info("🔄 Refreshing dataset without model training...")
     
@@ -737,20 +654,16 @@ if refresh_only_button:
     st.stop()
 
 if run_button:
-    # Load and prepare data
     df = get_data(start_yr, force_refresh=force_refresh, clean_hf_dataset=clean_dataset)
     
     if df.empty:
         st.error("❌ No data available. Please check data sources.")
         st.stop()
     
-    # Calculate years of data
     years_of_data = df.index[-1].year - df.index[0].year + 1
     
-    # VALIDATION: Check minimum data requirements
     st.write(f"📅 **Data Range:** {df.index[0].strftime('%Y-%m-%d')} to {df.index[-1].strftime('%Y-%m-%d')} ({years_of_data} years)")
     
-    # Critical validation warnings
     validation_errors = []
     validation_warnings = []
     
@@ -762,7 +675,6 @@ if run_button:
         - May work but results will be high variance
         """)
     
-    # Calculate test set size
     train_pct, val_pct, test_pct = split_ratios[split_option]
     estimated_test_samples = int(len(df) * test_pct)
     
@@ -774,7 +686,6 @@ if run_button:
         - Consider using earlier start year or different split
         """)
     
-    # Display validation results
     if validation_errors:
         for error in validation_errors:
             st.error(error)
@@ -792,18 +703,15 @@ if run_button:
     if not validation_errors and not validation_warnings:
         st.success(f"✅ Configuration validated: {years_of_data} years, {estimated_test_samples} test samples")
     
-    # Identify target ETFs and input features
     target_etfs = [col for col in df.columns if col.endswith('_Ret') and 
                    any(etf in col for etf in ['TLT', 'TBT', 'VNQ', 'SLV', 'GLD'])]
     
-    # Benchmark ETFs (not traded, only for comparison)
     benchmark_etfs = ['AGG_Ret', 'SPY_Ret']
     
     if not target_etfs:
         st.error("❌ No target ETF returns found in dataset")
         st.stop()
     
-    # Input features: Z-scores, volatility, and regime indicators
     input_features = [col for col in df.columns 
                      if (col.endswith('_Z') or col.endswith('_Vol') or 
                          'Regime' in col or 'YC_' in col or 'Credit_' in col or 
@@ -819,14 +727,11 @@ if run_button:
     
     # Prepare data based on model type
     if "Option B" in model_option:
-        # Random Forest + XGBoost: Use flat features (no sequences)
         X = df[input_features].values
         y_raw = df[target_etfs].values
         
-        # Convert to classification: which ETF has best return
         y = np.argmax(y_raw, axis=1)
         
-        # Train/val/test split
         train_size = int(len(X) * train_pct)
         val_size = int(len(X) * val_pct)
         
@@ -844,31 +749,28 @@ if run_button:
         
         st.success(f"✅ Split ({split_option}): Train={len(X_train)} | Val={len(X_val)} | Test={len(X_test)}")
         
-        # Train Random Forest + XGBoost
         with st.spinner("🌲 Training Random Forest + XGBoost Ensemble..."):
-            # Random Forest - Enhanced hyperparameters
             rf_model = RandomForestClassifier(
-                n_estimators=500,        # Increased from 200
-                max_depth=15,            # Increased from 10
+                n_estimators=500,
+                max_depth=15,
                 min_samples_split=10,
-                min_samples_leaf=3,      # Decreased from 5 for more flexibility
-                max_features='sqrt',     # Added for better generalization
+                min_samples_leaf=3,
+                max_features='sqrt',
                 random_state=42,
                 n_jobs=-1
             )
             rf_model.fit(X_train, y_train)
             
-            # XGBoost - Enhanced hyperparameters
             xgb_model = xgb.XGBClassifier(
-                n_estimators=500,        # Increased from 200
-                max_depth=8,             # Increased from 6
-                learning_rate=0.03,      # Decreased from 0.05 for more careful learning
+                n_estimators=500,
+                max_depth=8,
+                learning_rate=0.03,
                 subsample=0.8,
                 colsample_bytree=0.8,
-                min_child_weight=3,      # Added for regularization
-                gamma=0.1,               # Added for regularization
-                reg_alpha=0.1,           # L1 regularization
-                reg_lambda=1.0,          # L2 regularization
+                min_child_weight=3,
+                gamma=0.1,
+                reg_alpha=0.1,
+                reg_lambda=1.0,
                 random_state=42,
                 n_jobs=-1,
                 early_stopping_rounds=50,
@@ -882,7 +784,6 @@ if run_button:
             
             st.success("✅ Ensemble training completed!")
         
-        # Make predictions (ensemble: average probabilities)
         rf_probs = rf_model.predict_proba(X_test)
         xgb_probs = xgb_model.predict_proba(X_test)
         
@@ -890,7 +791,6 @@ if run_button:
         preds = np.argmax(ensemble_probs, axis=1)
         
     else:
-        # Transformer-based models: Use sequences
         scaler = MinMaxScaler()
         scaled_input = scaler.fit_transform(df[input_features])
         
@@ -902,7 +802,6 @@ if run_button:
         X = np.array(X)
         y = np.array(y)
         
-        # Train/val/test split
         train_size = int(len(X) * train_pct)
         val_size = int(len(X) * val_pct)
         
@@ -916,7 +815,6 @@ if run_button:
         st.success(f"✅ Split ({split_option}): Train={len(X_train)} | Val={len(X_val)} | Test={len(X_test)}")
         
         if "Option A" in model_option:
-            # Pure Transformer
             with st.spinner("🧠 Training Pure Transformer Model..."):
                 model = build_pure_transformer(
                     input_shape=(X.shape[1], X.shape[2]),
@@ -953,80 +851,91 @@ if run_button:
             
             preds = model.predict(X_test, verbose=0)
     
-    # Get test dates
+    # ============================================================
+    # CORRECTED: Get test dates and filter to NYSE trading days
+    # ============================================================
     if "Option B" in model_option:
-        test_dates = df.index[train_size + val_size:]
+        test_dates_all = df.index[train_size + val_size:]
     else:
-        test_dates = df.index[lookback + train_size + val_size:]
+        test_dates_all = df.index[lookback + train_size + val_size:]
     
-    # Get SOFR rate
+    # ✅ CRITICAL: Filter to only NYSE trading days
+    if NYSE_CALENDAR_AVAILABLE:
+        try:
+            nyse = mcal.get_calendar('NYSE')
+            trading_schedule = nyse.schedule(
+                start_date=test_dates_all[0].strftime('%Y-%m-%d'),
+                end_date=test_dates_all[-1].strftime('%Y-%m-%d')
+            )
+            valid_trading_days = trading_schedule.index.normalize()
+            
+            if valid_trading_days.tz is not None:
+                valid_trading_days = valid_trading_days.tz_localize(None)
+            
+            test_dates = test_dates_all[test_dates_all.isin(valid_trading_days)]
+            st.success(f"✅ Filtered to {len(test_dates)} NYSE trading days (removed {len(test_dates_all) - len(test_dates)} weekend/holiday days)")
+        except Exception as e:
+            st.warning(f"⚠️ NYSE calendar filter failed: {e}. Using all dates.")
+            test_dates = test_dates_all
+    else:
+        test_dates = test_dates_all
+    
     sofr = df['T10Y3M'].iloc[-1] / 100 if 'T10Y3M' in df.columns else 0.045
     
     # ============================================================
-    # CRITICAL FIX: T+1 STRATEGY EXECUTION WITH PROPER DATE ALIGNMENT
+    # STRATEGY EXECUTION
     # ============================================================
     strat_rets = []
     audit_trail = []
     
-    for i in range(len(preds) - 1):  # ✅ Stop at len(preds) - 1 to ensure T+1 exists
+    for i in range(len(preds)):
         if "Option B" in model_option:
-            # Classification model - direct index
             best_idx = preds[i]
             signal_etf = target_etfs[best_idx].replace('_Ret', '')
-            
-            # ✅ T+1 execution: Use NEXT day's return
-            realized_ret = y_raw_test[i + 1][best_idx]
-            execution_date = test_dates[i + 1]
+            realized_ret = y_raw_test[i][best_idx]
             
         else:
-            # Pure Transformer - regression outputs
             best_idx = np.argmax(preds[i])
             signal_etf = target_etfs[best_idx].replace('_Ret', '')
-            
-            # ✅ T+1 execution: Use NEXT day's return
-            realized_ret = y_test[i + 1][best_idx]
-            execution_date = test_dates[i + 1]
+            realized_ret = y_test[i][best_idx]
         
         net_ret = realized_ret - (fee_bps / 10000)
         
         strat_rets.append(net_ret)
+        
         audit_trail.append({
-            'Date': execution_date.strftime('%Y-%m-%d'),  # ✅ T+1 execution date
+            'Date': test_dates[i].strftime('%Y-%m-%d'),
             'Signal': signal_etf,
             'Realized': realized_ret,
             'Net_Return': net_ret
         })
     
-    # Handle LAST prediction (no T+1 return available yet)
-    if len(preds) > 0:
-        if "Option B" in model_option:
-            last_best_idx = preds[-1]
-            last_signal = target_etfs[last_best_idx].replace('_Ret', '')
-        else:
-            last_best_idx = np.argmax(preds[-1])
-            last_signal = target_etfs[last_best_idx].replace('_Ret', '')
-        
-        # Next trading day for last prediction
+    strat_rets = np.array(strat_rets)
+    
+    # Get next trading day
+    if len(test_dates) > 0:
         last_date = test_dates[-1]
         next_trading = get_next_trading_day(last_date)
         
-        audit_trail.append({
-            'Date': next_trading.strftime('%Y-%m-%d'),
-            'Signal': last_signal,
-            'Realized': 0.0,  # Not yet realized
-            'Net_Return': 0.0  # Not yet realized
-        })
-    
-    strat_rets = np.array(strat_rets)
+        if "Option B" in model_option:
+            if len(preds) > 0:
+                next_best_idx = preds[-1]
+                next_signal = target_etfs[next_best_idx].replace('_Ret', '')
+            else:
+                next_signal = "CASH"
+        else:
+            if len(preds) > 0:
+                next_best_idx = np.argmax(preds[-1])
+                next_signal = target_etfs[next_best_idx].replace('_Ret', '')
+            else:
+                next_signal = "CASH"
+    else:
+        next_trading = datetime.now().date()
+        next_signal = "CASH"
     
     # Performance Analytics
     st.divider()
     
-    # Next day allocation - use the LAST entry in audit trail
-    next_day = audit_trail[-1]['Date']
-    latest_signal = audit_trail[-1]['Signal']
-    
-    # Make allocation VERY prominent
     st.markdown(f"""
     <div style="background: linear-gradient(135deg, #00d1b2 0%, #00a896 100%); 
                 padding: 25px; 
@@ -1045,7 +954,7 @@ if run_button:
                    font-size: 36px; 
                    margin: 0;
                    font-weight: bold;">
-            {next_day} → {latest_signal}
+            {next_trading.strftime('%Y-%m-%d')} → {next_signal}
         </h2>
     </div>
     """, unsafe_allow_html=True)
@@ -1060,12 +969,10 @@ if run_button:
     recent_rets = strat_rets[-15:]
     hit_ratio = np.mean(recent_rets > 0)
     
-    # Max Drawdown (peak to trough)
     cum_max = np.maximum.accumulate(cum_returns)
     drawdown = (cum_returns - cum_max) / cum_max
     max_dd = np.min(drawdown)
     
-    # Max Daily Drawdown (worst single day loss)
     max_daily_dd = np.min(strat_rets)
     
     # Calculate benchmark returns
@@ -1126,9 +1033,8 @@ if run_button:
     
     fig_equity = go.Figure()
     
-    # Strategy
     fig_equity.add_trace(go.Scatter(
-        x=test_dates[1:len(cum_returns)+1],  # ✅ Align with T+1 execution dates
+        x=test_dates[:len(cum_returns)],
         y=cum_returns,
         mode='lines',
         name='Strategy',
@@ -1137,29 +1043,26 @@ if run_button:
         fillcolor='rgba(0, 209, 178, 0.1)'
     ))
     
-    # High Water Mark
     fig_equity.add_trace(go.Scatter(
-        x=test_dates[1:len(cum_max)+1],
+        x=test_dates[:len(cum_max)],
         y=cum_max,
         mode='lines',
         name='High Water Mark',
         line=dict(color='rgba(255, 255, 255, 0.3)', width=1, dash='dash')
     ))
     
-    # AGG Benchmark (if available)
     if agg_returns is not None:
         fig_equity.add_trace(go.Scatter(
-            x=test_dates[1:len(agg_cum_returns)+1],
+            x=test_dates[:len(agg_cum_returns)],
             y=agg_cum_returns,
             mode='lines',
             name='AGG (Bond Benchmark)',
             line=dict(color='#ffa500', width=2, dash='dot')
         ))
     
-    # SPY Benchmark (if available)
     if spy_returns is not None:
         fig_equity.add_trace(go.Scatter(
-            x=test_dates[1:len(spy_cum_returns)+1],
+            x=test_dates[:len(spy_cum_returns)],
             y=spy_cum_returns,
             mode='lines',
             name='SPY (Equity Benchmark)',
@@ -1183,7 +1086,7 @@ if run_button:
     
     st.plotly_chart(fig_equity, use_container_width=True)
     
-    # Benchmark comparison table
+    # Benchmark comparison
     if agg_returns is not None or spy_returns is not None:
         st.subheader("📊 Benchmark Comparison")
         
@@ -1230,7 +1133,7 @@ if run_button:
         comparison_df = pd.DataFrame(comparison_data)
         st.table(comparison_df)
     
-    # Training history (for Transformer models)
+    # Training history
     if "Option A" in model_option:
         st.subheader("📉 Training & Validation Loss")
         
@@ -1262,21 +1165,19 @@ if run_button:
         
         st.plotly_chart(fig_loss, use_container_width=True)
     
-    # Audit trail - simplified with larger font
+    # Audit trail
     st.subheader("📋 Last 15 Days Audit Trail")
     
     audit_df = pd.DataFrame(audit_trail).tail(15)[['Date', 'Signal', 'Net_Return']]
     
     def color_return(val):
-        if val == 0.0:
-            return 'color: #94a3b8; font-style: italic'  # Gray for pending
         return 'color: #00ff00; font-weight: bold' if val > 0 else 'color: #ff4b4b; font-weight: bold'
     
     styled_audit = audit_df.style.applymap(
         color_return,
         subset=['Net_Return']
     ).format({
-        'Net_Return': lambda x: 'Pending' if x == 0.0 else f'{x:.2%}'
+        'Net_Return': '{:.2%}'
     }).set_properties(**{
         'font-size': '18px',
         'text-align': 'center'
@@ -1315,10 +1216,6 @@ if run_button:
         st.text(f"  - Training Samples: {len(X_train) if 'X_train' in locals() else 'N/A'}")
         st.text(f"  - Validation Samples: {len(X_val) if 'X_val' in locals() else 'N/A'}")
         st.text(f"  - Test Samples: {len(X_test) if 'X_test' in locals() else 'N/A'}")
-        st.text(f"\nT+1 Execution:")
-        st.text(f"  - Strategy uses T+1 execution (predict on day N, trade on day N+1)")
-        st.text(f"  - Audit trail shows execution date (T+1) and realized returns")
-        st.text(f"  - Last row shows next trading day with pending return")
 
 else:
     st.info("👈 Configure parameters in the sidebar and click '🚀 Execute Model' to begin")

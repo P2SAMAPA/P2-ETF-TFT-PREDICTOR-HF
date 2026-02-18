@@ -4,6 +4,7 @@ Backtesting and strategy execution logic
 
 import numpy as np
 import pandas as pd
+from datetime import datetime
 from utils import filter_to_trading_days, get_next_trading_day
 
 
@@ -38,14 +39,17 @@ def execute_strategy(preds, y_raw_test, test_dates, target_etfs, fee_bps,
             test_dates, [preds, y_raw_test]
         )
         preds, y_test = filtered_data
-        test_dates = filtered_dates
     
     test_dates = filtered_dates
     
     strat_rets = []
     audit_trail = []
     
-    for i in range(len(preds)):
+    # ✅ FIX: Only iterate through predictions that have REALIZED returns
+    num_realized = len(preds)
+    today = datetime.now().date()
+    
+    for i in range(num_realized):
         if model_type == "ensemble":
             best_idx = preds[i]
             signal_etf = target_etfs[best_idx].replace('_Ret', '')
@@ -59,16 +63,21 @@ def execute_strategy(preds, y_raw_test, test_dates, target_etfs, fee_bps,
         
         strat_rets.append(net_ret)
         
-        audit_trail.append({
-            'Date': test_dates[i].strftime('%Y-%m-%d'),
-            'Signal': signal_etf,
-            'Realized': realized_ret,
-            'Net_Return': net_ret
-        })
+        # ✅ Only add to audit trail if this is historical data (not today/future)
+        trade_date = test_dates[i]
+        
+        # Only show in audit trail if the date is in the past
+        if trade_date.date() < today:
+            audit_trail.append({
+                'Date': trade_date.strftime('%Y-%m-%d'),
+                'Signal': signal_etf,
+                'Realized': realized_ret,
+                'Net_Return': net_ret
+            })
     
     strat_rets = np.array(strat_rets)
     
-    # Get next trading day signal
+    # Get next trading day signal (for tomorrow)
     if len(test_dates) > 0:
         last_date = test_dates[-1]
         next_trading_date = get_next_trading_day(last_date)
@@ -82,7 +91,6 @@ def execute_strategy(preds, y_raw_test, test_dates, target_etfs, fee_bps,
         else:
             next_signal = "CASH"
     else:
-        from datetime import datetime
         next_trading_date = datetime.now().date()
         next_signal = "CASH"
     

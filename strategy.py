@@ -34,7 +34,7 @@ def execute_strategy(preds, y_raw_test, test_dates, target_etfs, fee_bps,
             test_dates, [preds, y_raw_test]
         )
         preds, y_raw_test = filtered_data
-    else:  # transformer
+    else:  # transformer - y_test instead of y_raw_test
         filtered_dates, filtered_data = filter_to_trading_days(
             test_dates, [preds, y_raw_test]
         )
@@ -45,33 +45,31 @@ def execute_strategy(preds, y_raw_test, test_dates, target_etfs, fee_bps,
     strat_rets = []
     audit_trail = []
     
+    # ✅ FIX: Only iterate through predictions that have REALIZED returns
+    num_realized = len(preds)
     today = datetime.now().date()
     
-    # ✅ CRITICAL FIX: T+1 execution means prediction at i executes on day i+1
-    # So we iterate from 0 to len(preds)-1, and use returns from i+1
-    for i in range(len(preds) - 1):  # Stop one before the end to ensure i+1 exists
+    for i in range(num_realized):
         if model_type == "ensemble":
             best_idx = preds[i]
             signal_etf = target_etfs[best_idx].replace('_Ret', '')
-            # ✅ Use NEXT day's return (i+1) because T+1 execution
-            realized_ret = y_raw_test[i + 1][best_idx]
+            realized_ret = y_raw_test[i][best_idx]
         else:  # transformer
             best_idx = np.argmax(preds[i])
             signal_etf = target_etfs[best_idx].replace('_Ret', '')
-            # ✅ Use NEXT day's return (i+1) because T+1 execution
-            realized_ret = y_test[i + 1][best_idx]
+            realized_ret = y_test[i][best_idx]
         
         net_ret = realized_ret - (fee_bps / 10000)
         
         strat_rets.append(net_ret)
         
-        # ✅ Show the EXECUTION date (i+1) in audit trail, not prediction date (i)
-        execution_date = test_dates[i + 1]
+        # ✅ Only add to audit trail if this is historical data (not today/future)
+        trade_date = test_dates[i]
         
-        # Only show in audit trail if the execution date is in the past
-        if execution_date.date() < today:
+        # Only show in audit trail if the date is in the past
+        if trade_date.date() < today:
             audit_trail.append({
-                'Date': execution_date.strftime('%Y-%m-%d'),
+                'Date': trade_date.strftime('%Y-%m-%d'),
                 'Signal': signal_etf,
                 'Realized': realized_ret,
                 'Net_Return': net_ret
@@ -79,17 +77,19 @@ def execute_strategy(preds, y_raw_test, test_dates, target_etfs, fee_bps,
     
     strat_rets = np.array(strat_rets)
     
-    # Get next trading day signal (the last prediction is for the next trading day)
-    if len(test_dates) > 0 and len(preds) > 0:
-        # The last prediction hasn't been executed yet - it's for the next trading day
+    # Get next trading day signal (for tomorrow)
+    if len(test_dates) > 0:
         last_date = test_dates[-1]
         next_trading_date = get_next_trading_day(last_date)
         
-        if model_type == "ensemble":
-            next_best_idx = preds[-1]
+        if len(preds) > 0:
+            if model_type == "ensemble":
+                next_best_idx = preds[-1]
+            else:
+                next_best_idx = np.argmax(preds[-1])
+            next_signal = target_etfs[next_best_idx].replace('_Ret', '')
         else:
-            next_best_idx = np.argmax(preds[-1])
-        next_signal = target_etfs[next_best_idx].replace('_Ret', '')
+            next_signal = "CASH"
     else:
         next_trading_date = datetime.now().date()
         next_signal = "CASH"

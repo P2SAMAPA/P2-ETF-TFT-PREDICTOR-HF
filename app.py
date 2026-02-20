@@ -281,85 +281,101 @@ if run_button:
 
     # ── SIGNAL CONVICTION block ──────────────────────────────────────────────
     conviction_colors = {
-        "Very High": ("#00d1b2", "🟢"),
-        "High":      ("#4CAF50", "🟢"),
-        "Moderate":  ("#FFA500", "🟡"),
-        "Low":       ("#ff4b4b", "🔴"),
+        "Very High": "#00b894",
+        "High":      "#00cec9",
+        "Moderate":  "#fdcb6e",
+        "Low":       "#d63031",
     }
-    conv_color, conv_dot = conviction_colors.get(conviction_label, ("#888", "⚪"))
+    conviction_icons = {
+        "Very High": "🟢", "High": "🟢", "Moderate": "🟡", "Low": "🔴",
+    }
+    conv_color = conviction_colors.get(conviction_label, "#888888")
+    conv_dot   = conviction_icons.get(conviction_label, "⚪")
 
-    # Z-score gauge: map [-3, 3] → [0%, 100%]
     z_clipped = max(-3.0, min(3.0, conviction_zscore))
-    bar_pct = int((z_clipped + 3) / 6 * 100)
+    bar_pct   = int((z_clipped + 3) / 6 * 100)
 
-    # Build per-ETF horizontal bar rows
     etf_names = [e.replace('_Ret', '') for e in target_etfs]
-    max_score = float(np.max(all_etf_scores)) if np.max(all_etf_scores) > 0 else 1.0
-    etf_score_rows = ""
-    for name, score in zip(etf_names, all_etf_scores):
-        bar_w = int(score / max_score * 100)
-        is_winner = name == next_signal
-        highlight = "font-weight:bold; color:#00d1b2;" if is_winner else "color:#ccc;"
-        star = " ★" if is_winner else ""
-        bar_color = "#00d1b2" if is_winner else "#555"
-        etf_score_rows += f"""
-        <div style="display:flex; align-items:center; gap:10px; margin:5px 0;">
-          <span style="width:42px; text-align:right; font-size:13px; {highlight}">{name}{star}</span>
-          <div style="flex:1; background:#2a2a3e; border-radius:4px; height:15px; overflow:hidden;">
-            <div style="width:{bar_w}%; height:100%; background:{bar_color}; border-radius:4px;"></div>
-          </div>
-          <span style="width:52px; font-size:12px; color:#aaa; text-align:right;">{score:.4f}</span>
-        </div>"""
+    sorted_pairs = sorted(zip(etf_names, all_etf_scores), key=lambda x: x[1], reverse=True)
+    max_score = float(sorted_pairs[0][1]) if sorted_pairs[0][1] > 0 else 1.0
 
+    # ── Header + gauge ───────────────────────────────────────────────────────
     st.markdown(f"""
-    <div style="background:#1a1a2e; border:1px solid {conv_color}44; border-left: 4px solid {conv_color};
-                border-radius:12px; padding:20px 25px; margin:10px 0 22px 0;
-                box-shadow: 0 4px 16px rgba(0,0,0,0.5);">
+    <div style="background:#ffffff; border:1px solid #ddd;
+                border-left:5px solid {conv_color}; border-radius:12px 12px 0 0;
+                padding:20px 24px 14px 24px; margin:12px 0 0 0;
+                box-shadow:0 2px 8px rgba(0,0,0,0.07);">
 
-      <!-- Header row -->
-      <div style="display:flex; align-items:center; gap:12px; margin-bottom:16px;">
-        <span style="font-size:24px;">{conv_dot}</span>
-        <span style="font-size:20px; font-weight:bold; color:white; letter-spacing:0.5px;">
-          Signal Conviction
+      <div style="display:flex; align-items:center; gap:12px; margin-bottom:16px; flex-wrap:wrap;">
+        <span style="font-size:22px;">{conv_dot}</span>
+        <span style="font-size:19px; font-weight:700; color:#1a1a1a;">Signal Conviction</span>
+        <span style="background:#f0f0f0; border:1px solid {conv_color};
+                     color:{conv_color}; font-weight:700; font-size:15px;
+                     padding:4px 14px; border-radius:8px;">
+          Z = {conviction_zscore:.2f} &sigma;
         </span>
-        <span style="margin-left:auto; background:{conv_color}; color:#000; font-weight:bold;
-                     padding:5px 16px; border-radius:20px; font-size:14px; letter-spacing:0.5px;">
+        <span style="margin-left:auto; background:{conv_color}; color:#fff;
+                     font-weight:700; padding:5px 18px; border-radius:20px; font-size:14px;">
           {conviction_label}
         </span>
       </div>
 
-      <!-- Z-score gauge -->
-      <div style="margin-bottom:18px;">
-        <div style="display:flex; justify-content:space-between; font-size:11px;
-                    color:#666; margin-bottom:5px;">
-          <span>Weak  −3σ</span>
-          <span style="color:{conv_color}; font-weight:bold; font-size:14px;">
-            Z-Score = {conviction_zscore:.2f} σ
-          </span>
-          <span>Strong  +3σ</span>
-        </div>
-        <div style="background:#2a2a3e; border-radius:8px; height:18px;
-                    overflow:hidden; position:relative;">
-          <div style="position:absolute; left:50%; top:0; width:2px;
-                      height:100%; background:#444;"></div>
-          <div style="width:{bar_pct}%; height:100%;
-                      background:linear-gradient(90deg, #005f73, {conv_color});
-                      border-radius:8px;"></div>
-        </div>
+      <div style="display:flex; justify-content:space-between;
+                  font-size:11px; color:#999; margin-bottom:5px;">
+        <span>Weak &minus;3&sigma;</span>
+        <span>Neutral 0&sigma;</span>
+        <span>Strong +3&sigma;</span>
+      </div>
+      <div style="background:#f0f0f0; border-radius:8px; height:16px;
+                  overflow:hidden; position:relative; border:1px solid #e0e0e0;">
+        <div style="position:absolute; left:50%; top:0; width:2px;
+                    height:100%; background:#ccc;"></div>
+        <div style="width:{bar_pct}%; height:100%;
+                    background:linear-gradient(90deg, #fab1a0, {conv_color});
+                    border-radius:8px;"></div>
       </div>
 
-      <!-- Per-ETF breakdown -->
-      <div style="font-size:12px; color:#777; margin-bottom:8px; letter-spacing:0.3px;">
-        Model score breakdown across all candidate ETFs:
-      </div>
-      {etf_score_rows}
-
-      <div style="margin-top:14px; font-size:11px; color:#555; line-height:1.5;">
-        Z-score = how many standard deviations the selected ETF's model score sits
-        above the mean of all ETF scores.  Higher → model is more decisive.
+      <div style="font-size:12px; color:#999; margin-top:14px; margin-bottom:2px;">
+        Model probability by ETF (ranked high &rarr; low):
       </div>
     </div>
     """, unsafe_allow_html=True)
+
+    # ── ETF bars — one st.markdown per ETF avoids Streamlit HTML escaping ───
+    for i, (name, score) in enumerate(sorted_pairs):
+        bar_w     = int(score / max_score * 100)
+        is_winner = (name == next_signal)
+        is_last   = (i == len(sorted_pairs) - 1)
+
+        name_style  = "font-weight:700; color:#00897b;" if is_winner else "color:#444;"
+        bar_color   = conv_color if is_winner else "#b2dfdb" if score > max_score * 0.5 else "#e0e0e0"
+        star        = " ★" if is_winner else ""
+        bottom_r    = "0 0 12px 12px" if is_last else "0"
+        border_bot  = "border-bottom:1px solid #f0f0f0;" if not is_last else ""
+        footer_html = ""
+        if is_last:
+            footer_html = """
+            <div style="font-size:11px; color:#bbb; padding:10px 0 4px 0; line-height:1.5;">
+              Z-score = std deviations the top ETF sits above the mean of all ETF scores.
+              Higher &rarr; model is more decisive.
+            </div>"""
+
+        st.markdown(f"""
+        <div style="background:#ffffff; border:1px solid #ddd; border-top:none;
+                    border-radius:{bottom_r}; padding:8px 24px; {border_bot}
+                    box-shadow:0 2px 8px rgba(0,0,0,0.07);">
+          <div style="display:flex; align-items:center; gap:12px;">
+            <span style="width:44px; text-align:right; font-size:13px; {name_style}">{name}{star}</span>
+            <div style="flex:1; background:#f5f5f5; border-radius:4px;
+                        height:15px; overflow:hidden; border:1px solid #e8e8e8;">
+              <div style="width:{bar_w}%; height:100%;
+                          background:{bar_color}; border-radius:4px;"></div>
+            </div>
+            <span style="width:56px; font-size:12px; color:#888; text-align:right;">{score:.4f}</span>
+          </div>
+          {footer_html}
+        </div>
+        """, unsafe_allow_html=True)
 
     st.divider()
 

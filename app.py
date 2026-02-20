@@ -345,20 +345,12 @@ if run_button:
     for i, (name, score) in enumerate(sorted_pairs):
         bar_w     = int(score / max_score * 100)
         is_winner = (name == next_signal)
-        is_last   = (i == len(sorted_pairs) - 1)
-
-        name_style  = "font-weight:700; color:#00897b;" if is_winner else "color:#444;"
-        bar_color   = conv_color if is_winner else "#b2dfdb" if score > max_score * 0.5 else "#e0e0e0"
-        star        = " ★" if is_winner else ""
-        bottom_r    = "0 0 12px 12px" if is_last else "0"
-        border_bot  = "border-bottom:1px solid #f0f0f0;" if not is_last else ""
-        footer_html = ""
-        if is_last:
-            footer_html = """
-            <div style="font-size:11px; color:#bbb; padding:10px 0 4px 0; line-height:1.5;">
-              Z-score = std deviations the top ETF sits above the mean of all ETF scores.
-              Higher &rarr; model is more decisive.
-            </div>"""
+        is_last    = (i == len(sorted_pairs) - 1)
+        name_style = "font-weight:700; color:#00897b;" if is_winner else "color:#444;"
+        bar_color  = conv_color if is_winner else "#b2dfdb" if score > max_score * 0.5 else "#e0e0e0"
+        star       = " ★" if is_winner else ""
+        bottom_r   = "0 0 12px 12px" if is_last else "0"
+        border_bot = "border-bottom:1px solid #f0f0f0;" if not is_last else ""
 
         st.markdown(f"""
         <div style="background:#ffffff; border:1px solid #ddd; border-top:none;
@@ -373,9 +365,10 @@ if run_button:
             </div>
             <span style="width:56px; font-size:12px; color:#888; text-align:right;">{score:.4f}</span>
           </div>
-          {footer_html}
         </div>
         """, unsafe_allow_html=True)
+
+    st.caption("Z-score = std deviations the top ETF sits above the mean of all ETF scores. Higher → model is more decisive.")
 
     st.divider()
 

@@ -265,11 +265,19 @@ if run_button:
         all_proba = None                    # transformer uses raw preds directly
 
     # Execute strategy
-    # Risk-free rate: prefer DTB3 (3-Month T-Bill), fall back to fixed 4.5%
-    if 'DTB3' in df.columns:
-        sofr = float(df['DTB3'].dropna().iloc[-1]) / 100
-    else:
-        sofr = 0.045   # fallback: 4.5%
+    # Risk-free rate: fetch DTB3 (3-Month T-Bill) live from FRED
+    # This is independent of the dataset so it's always current and correct
+    sofr = 0.045  # safe fallback
+    try:
+        import pandas_datareader.data as web
+        dtb3 = web.DataReader('DTB3', 'fred', start='2024-01-01')
+        dtb3 = dtb3.dropna()
+        if not dtb3.empty:
+            sofr = float(dtb3.iloc[-1].values[0]) / 100
+    except Exception:
+        # Also try from dataset as secondary fallback
+        if 'DTB3' in df.columns:
+            sofr = float(df['DTB3'].dropna().iloc[-1]) / 100
 
     (strat_rets, audit_trail, next_signal, next_trading_date,
      conviction_zscore, conviction_label, all_etf_scores) = execute_strategy(

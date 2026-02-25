@@ -194,17 +194,27 @@ if run_button:
         # Ensemble: flat features
         X = df[input_features].values
         y_raw = df[target_etfs].values
+
+        # ── T+1 fix: features at day i predict returns at day i+1 ──────────
+        # Drop last row of X (no future return known), drop first row of y_raw
+        X      = X[:-1]
+        y_raw  = y_raw[1:]
+        # Align dates: test dates shift forward by 1 (execution is next day)
+        dates_aligned = df.index[1:]
+
         y = np.argmax(y_raw, axis=1)
 
         train_size = int(len(X) * train_pct)
-        val_size = int(len(X) * val_pct)
+        val_size   = int(len(X) * val_pct)
 
-        X_train = X[:train_size]
-        y_train = y[:train_size]
-        X_val = X[train_size:train_size + val_size]
-        y_val = y[train_size:train_size + val_size]
-        X_test = X[train_size + val_size:]
+        X_train    = X[:train_size]
+        y_train    = y[:train_size]
+        X_val      = X[train_size:train_size + val_size]
+        y_val      = y[train_size:train_size + val_size]
+        X_test     = X[train_size + val_size:]
         y_raw_test = y_raw[train_size + val_size:]
+
+        test_dates = dates_aligned[train_size + val_size:]
 
         st.success(f"✅ Split: Train={len(X_train)} | Val={len(X_val)} | Test={len(X_test)}")
 
@@ -221,22 +231,26 @@ if run_button:
         except Exception:
             ensemble_proba = rf_proba
 
-        last_proba = ensemble_proba[-1]   # shape: (n_etfs,) for the last prediction
-
-        preds = predict_ensemble(rf_model, xgb_model, X_test)
-        test_dates = df.index[train_size + val_size:]
-        model_type = "ensemble"
-        all_proba = ensemble_proba          # full per-day probabilities for stop re-entry
+        last_proba  = ensemble_proba[-1]
+        preds       = predict_ensemble(rf_model, xgb_model, X_test)
+        model_type  = "ensemble"
+        all_proba   = ensemble_proba   # full per-day probabilities for stop re-entry
 
     else:
         # Transformer: sequences
+        # Fit scaler only on training portion to avoid leakage
+        n_total = len(df[input_features])
+        # Approximate train boundary before sequence building
+        approx_train_end = int((n_total - 1) * train_pct)
         scaler = MinMaxScaler()
-        scaled_input = scaler.fit_transform(df[input_features])
+        scaler.fit(df[input_features].values[:approx_train_end])
+        scaled_input = scaler.transform(df[input_features].values)
 
-        X, y = [], []
-        for i in range(lookback, len(scaled_input)):
+        X, y, dates_seq = [], [], []
+        for i in range(lookback, len(scaled_input) - 1):  # -1 for T+1 shift
             X.append(scaled_input[i-lookback:i])
-            y.append(df[target_etfs].iloc[i].values)
+            y.append(df[target_etfs].iloc[i + 1].values)  # T+1: next day's returns
+            dates_seq.append(df.index[i + 1])             # execution date = next day
 
         X = np.array(X)
         y = np.array(y)
@@ -258,11 +272,11 @@ if run_button:
             model, history = train_transformer(X_train, y_train, X_val, y_val, epochs=int(epochs))
             st.success(f"✅ Training completed!")
 
-        preds = model.predict(X_test, verbose=0)
-        test_dates = df.index[lookback + train_size + val_size:]
+        preds      = model.predict(X_test, verbose=0)
+        test_dates = np.array(dates_seq)[train_size + val_size:]
         y_raw_test = y_test
         model_type = "transformer"
-        all_proba = None                    # transformer uses raw preds directly
+        all_proba  = None   # transformer uses raw preds directly
 
     # Execute strategy
     # Risk-free rate: fetch DTB3 (3-Month T-Bill) live from FRED

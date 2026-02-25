@@ -265,7 +265,11 @@ if run_button:
         all_proba = None                    # transformer uses raw preds directly
 
     # Execute strategy
-    sofr = df['T10Y3M'].iloc[-1] / 100 if 'T10Y3M' in df.columns else 0.045
+    # Risk-free rate: prefer DTB3 (3-Month T-Bill), fall back to fixed 4.5%
+    if 'DTB3' in df.columns:
+        sofr = float(df['DTB3'].dropna().iloc[-1]) / 100
+    else:
+        sofr = 0.045   # fallback: 4.5%
 
     (strat_rets, audit_trail, next_signal, next_trading_date,
      conviction_zscore, conviction_label, all_etf_scores) = execute_strategy(

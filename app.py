@@ -236,6 +236,13 @@ if run_button:
         model_type  = "ensemble"
         all_proba   = ensemble_proba   # full per-day probabilities for stop re-entry
 
+        # ── Diagnostic: how often does model pick the correct best ETF? ──────
+        y_test_labels = np.argmax(y_raw_test, axis=1)
+        accuracy = np.mean(preds == y_test_labels)
+        random_baseline = 1.0 / len(target_etfs)
+        st.info(f"🎯 **Test Accuracy:** {accuracy:.1%} | Random baseline: {random_baseline:.1%} | "
+                f"{'✅ Above random' if accuracy > random_baseline else '❌ Below random — inverse pattern learned'}")
+
     else:
         # Transformer: sequences
         # Fit scaler only on training portion to avoid leakage

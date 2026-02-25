@@ -97,6 +97,23 @@ with st.sidebar:
 
     st.divider()
 
+    st.subheader("🛑 Trailing Stop Loss")
+    stop_loss_pct = st.slider(
+        "Stop Loss (2-day cumulative return)",
+        min_value=-20, max_value=-8, value=-12, step=1,
+        format="%d%%",
+        help="If 2-day cumulative return ≤ this value, switch to CASH."
+    ) / 100.0
+
+    z_reentry = st.slider(
+        "Re-entry Conviction Z-score (σ)",
+        min_value=0.75, max_value=1.50, value=1.00, step=0.05,
+        format="%.2f",
+        help="Return to ETF when model conviction Z-score exceeds this threshold."
+    )
+
+    st.divider()
+
     run_button = st.button("🚀 Execute Model", type="primary", use_container_width=True)
 
     st.divider()
@@ -209,6 +226,7 @@ if run_button:
         preds = predict_ensemble(rf_model, xgb_model, X_test)
         test_dates = df.index[train_size + val_size:]
         model_type = "ensemble"
+        all_proba = ensemble_proba          # full per-day probabilities for stop re-entry
 
     else:
         # Transformer: sequences
@@ -244,13 +262,16 @@ if run_button:
         test_dates = df.index[lookback + train_size + val_size:]
         y_raw_test = y_test
         model_type = "transformer"
+        all_proba = None                    # transformer uses raw preds directly
 
     # Execute strategy
     sofr = df['T10Y3M'].iloc[-1] / 100 if 'T10Y3M' in df.columns else 0.045
 
     (strat_rets, audit_trail, next_signal, next_trading_date,
      conviction_zscore, conviction_label, all_etf_scores) = execute_strategy(
-        preds, y_raw_test, test_dates, target_etfs, fee_bps, model_type
+        preds, y_raw_test, test_dates, target_etfs, fee_bps, model_type,
+        stop_loss_pct=stop_loss_pct, z_reentry=z_reentry,
+        sofr=sofr, all_proba=all_proba
     )
 
     # ── Override scores with richer RF/XGB probabilities when available ─────

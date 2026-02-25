@@ -33,6 +33,7 @@ def fetch_macro_data_robust(start_date="2008-01-01"):
             fred_symbols = {
                 "T10Y2Y": "T10Y2Y",
                 "T10Y3M": "T10Y3M",
+                "DTB3":   "DTB3",        # 3-Month T-Bill — correct risk-free rate
                 "BAMLH0A0HYM2": "HY_Spread",
                 "VIXCLS": "VIX",
                 "DTWEXBGS": "DXY"

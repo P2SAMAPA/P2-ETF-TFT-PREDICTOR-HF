@@ -45,22 +45,15 @@ def compute_signal_conviction(raw_scores):
 def execute_strategy(preds, y_raw_test, test_dates, target_etfs, fee_bps,
                      model_type="ensemble",
                      stop_loss_pct=-0.12, z_reentry=1.0,
-                     sofr=0.045, all_proba=None):
+                     sofr=0.045, all_proba=None, z_min_entry=0.5):
     """
-    Execute trading strategy with T+1 execution and trailing stop-loss.
+    Execute trading strategy with T+1 execution, trailing stop-loss,
+    and minimum conviction gate.
 
-    Stop-loss: if 2-day cumulative return ≤ stop_loss_pct, switch to CASH
-               earning daily Rf (sofr/252). Re-enter ETF when model conviction
-               Z-score > z_reentry threshold.
-
-    Returns:
-        strat_rets        : Strategy returns (numpy array)
-        audit_trail       : List of dicts with trade details
-        next_signal       : Next trading day's ETF signal (str)
-        next_trading_date : Next trading date (date)
-        conviction_zscore : Z-score of the next signal vs all ETF scores (float)
-        conviction_label  : Human-readable conviction label (str)
-        all_etf_scores    : Raw model scores for all ETFs (numpy array) — for UI bar chart
+    Stop-loss    : if 2-day cumulative return ≤ stop_loss_pct → CASH earning Rf
+    Re-entry     : return to ETF when conviction Z-score ≥ z_reentry
+    Conviction gate: only enter ETF if conviction Z-score ≥ z_min_entry,
+                     otherwise hold CASH (avoids low-confidence trades)
     """
 
     # Filter to only trading days
@@ -115,27 +108,36 @@ def execute_strategy(preds, y_raw_test, test_dates, target_etfs, fee_bps,
             # Stay in CASH until conviction Z-score exceeds re-entry threshold
             if day_z >= z_reentry:
                 stop_active = False
-                # Re-enter: use model signal, apply fee
-                net_ret = realized_ret - (fee_bps / 10000)
-                trade_signal = signal_etf
+                # Re-enter only if conviction also meets minimum entry bar
+                if day_z >= z_min_entry:
+                    net_ret = realized_ret - (fee_bps / 10000)
+                    trade_signal = signal_etf
+                else:
+                    net_ret = daily_rf
+                    trade_signal = "CASH"
             else:
                 # Remain in CASH — earn daily Rf, no fee
                 net_ret = daily_rf
                 trade_signal = "CASH"
         else:
-            # Check 2-day cumulative return for stop trigger
-            if len(recent_rets) >= 2:
-                cum_2d = (1 + recent_rets[-2]) * (1 + recent_rets[-1]) - 1
-                if cum_2d <= stop_loss_pct:
-                    stop_active = True
-                    net_ret = daily_rf      # switch to CASH immediately today
-                    trade_signal = "CASH"
+            # ── Conviction gate: only trade if model is decisive enough ──────
+            if day_z < z_min_entry:
+                net_ret = daily_rf
+                trade_signal = "CASH"
+            else:
+                # Check 2-day cumulative return for stop trigger
+                if len(recent_rets) >= 2:
+                    cum_2d = (1 + recent_rets[-2]) * (1 + recent_rets[-1]) - 1
+                    if cum_2d <= stop_loss_pct:
+                        stop_active = True
+                        net_ret = daily_rf      # switch to CASH immediately today
+                        trade_signal = "CASH"
+                    else:
+                        net_ret = realized_ret - (fee_bps / 10000)
+                        trade_signal = signal_etf
                 else:
                     net_ret = realized_ret - (fee_bps / 10000)
                     trade_signal = signal_etf
-            else:
-                net_ret = realized_ret - (fee_bps / 10000)
-                trade_signal = signal_etf
 
         strat_rets.append(net_ret)
         recent_rets.append(net_ret)

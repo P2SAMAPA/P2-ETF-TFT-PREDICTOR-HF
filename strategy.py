@@ -45,15 +45,18 @@ def compute_signal_conviction(raw_scores):
 def execute_strategy(preds, y_raw_test, test_dates, target_etfs, fee_bps,
                      model_type="ensemble",
                      stop_loss_pct=-0.12, z_reentry=1.0,
-                     sofr=0.045, all_proba=None, z_min_entry=0.5):
+                     sofr=0.045, all_proba=None, z_min_entry=0.5,
+                     daily_ret_override=None):
     """
     Execute trading strategy with T+1 execution, trailing stop-loss,
     and minimum conviction gate.
 
-    Stop-loss    : if 2-day cumulative return ≤ stop_loss_pct → CASH earning Rf
-    Re-entry     : return to ETF when conviction Z-score ≥ z_reentry
-    Conviction gate: only enter ETF if conviction Z-score ≥ z_min_entry,
-                     otherwise hold CASH (avoids low-confidence trades)
+    Stop-loss        : if 2-day cumulative return ≤ stop_loss_pct → CASH earning Rf
+    Re-entry         : return to ETF when conviction Z-score ≥ z_reentry
+    Conviction gate  : only enter ETF if conviction Z-score ≥ z_min_entry
+    daily_ret_override: if provided, use these actual daily returns for P&L
+                        instead of y_raw_test (used when model trained on
+                        multi-day forward returns but P&L should be daily)
     """
 
     # Filter to only trading days
@@ -85,9 +88,13 @@ def execute_strategy(preds, y_raw_test, test_dates, target_etfs, fee_bps,
     for i in range(num_realized):
         # ── Get model scores for conviction Z-score ──────────────────────────
         if model_type == "ensemble":
-            best_idx = int(preds[i])
+            best_idx   = int(preds[i])
             signal_etf = target_etfs[best_idx].replace('_Ret', '')
-            realized_ret = y_raw_test[i][best_idx]
+            # Use daily return for P&L if override provided, else use target
+            if daily_ret_override is not None:
+                realized_ret = daily_ret_override[i][best_idx]
+            else:
+                realized_ret = y_raw_test[i][best_idx]
             # Use full per-day probabilities if available, else one-hot
             if all_proba is not None:
                 day_scores = np.array(all_proba[i], dtype=float)
@@ -95,10 +102,10 @@ def execute_strategy(preds, y_raw_test, test_dates, target_etfs, fee_bps,
                 day_scores = np.zeros(len(target_etfs))
                 day_scores[best_idx] = 1.0
         else:
-            best_idx = np.argmax(preds[i])
-            signal_etf = target_etfs[best_idx].replace('_Ret', '')
+            best_idx     = np.argmax(preds[i])
+            signal_etf   = target_etfs[best_idx].replace('_Ret', '')
             realized_ret = y_test[i][best_idx]
-            day_scores = np.array(preds[i], dtype=float)
+            day_scores   = np.array(preds[i], dtype=float)
 
         # ── Conviction Z-score for today ─────────────────────────────────────
         _, day_z, _ = compute_signal_conviction(day_scores)

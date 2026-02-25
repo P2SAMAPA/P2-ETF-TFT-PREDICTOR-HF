@@ -112,6 +112,13 @@ with st.sidebar:
         help="Return to ETF when model conviction Z-score exceeds this threshold."
     )
 
+    z_min_entry = st.slider(
+        "Minimum Entry Conviction (σ)",
+        min_value=0.0, max_value=1.5, value=0.5, step=0.05,
+        format="%.2f",
+        help="Only enter an ETF position if conviction Z-score ≥ this value. Below threshold = hold CASH."
+    )
+
     st.divider()
 
     run_button = st.button("🚀 Execute Model", type="primary", use_container_width=True)
@@ -307,7 +314,7 @@ if run_button:
      conviction_zscore, conviction_label, all_etf_scores) = execute_strategy(
         preds, y_raw_test, test_dates, target_etfs, fee_bps, model_type,
         stop_loss_pct=stop_loss_pct, z_reentry=z_reentry,
-        sofr=sofr, all_proba=all_proba
+        sofr=sofr, all_proba=all_proba, z_min_entry=z_min_entry
     )
 
     # ── Override scores with richer RF/XGB probabilities when available ─────

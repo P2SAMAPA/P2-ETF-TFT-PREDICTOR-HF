@@ -266,18 +266,21 @@ if run_button:
 
     # Execute strategy
     # Risk-free rate: fetch DTB3 (3-Month T-Bill) live from FRED
-    # This is independent of the dataset so it's always current and correct
-    sofr = 0.045  # safe fallback
+    sofr = 0.045
+    sofr_source = "fallback (4.5%)"
     try:
         import pandas_datareader.data as web
         dtb3 = web.DataReader('DTB3', 'fred', start='2024-01-01')
         dtb3 = dtb3.dropna()
         if not dtb3.empty:
             sofr = float(dtb3.iloc[-1].values[0]) / 100
-    except Exception:
-        # Also try from dataset as secondary fallback
+            sofr_source = f"FRED DTB3 live ({dtb3.index[-1].date()})"
+    except Exception as ex:
         if 'DTB3' in df.columns:
             sofr = float(df['DTB3'].dropna().iloc[-1]) / 100
+            sofr_source = "dataset DTB3 column"
+
+    st.caption(f"📊 Risk-free rate: **{sofr*100:.2f}%** — source: {sofr_source}")
 
     (strat_rets, audit_trail, next_signal, next_trading_date,
      conviction_zscore, conviction_label, all_etf_scores) = execute_strategy(

@@ -119,7 +119,7 @@ def fetch_macro_data_robust(start_date="2008-01-01"):
 
 
 def fetch_etf_data(etfs, start_date="2008-01-01"):
-    """Fetch ETF price data and calculate returns"""
+    """Fetch ETF price data and calculate returns + momentum features"""
     try:
         etf_data = yf.download(
             etfs,
@@ -134,18 +134,58 @@ def fetch_etf_data(etfs, start_date="2008-01-01"):
         if etf_data.index.tz is not None:
             etf_data.index = etf_data.index.tz_localize(None)
         
-        # Calculate daily returns
-        etf_returns = etf_data.pct_change()
+        daily_rets = etf_data.pct_change()
+
+        # ── Daily returns (targets will be built from these) ─────────────────
+        etf_returns = daily_rets.copy()
         etf_returns.columns = [f"{col}_Ret" for col in etf_returns.columns]
-        
-        # Calculate 20-day realized volatility
-        etf_vol = etf_data.pct_change().rolling(20).std() * np.sqrt(252)
+
+        # ── 20-day realized volatility ────────────────────────────────────────
+        etf_vol = daily_rets.rolling(20).std() * np.sqrt(252)
         etf_vol.columns = [f"{col}_Vol" for col in etf_vol.columns]
-        
-        result = pd.concat([etf_returns, etf_vol], axis=1)
-        
+
+        # ── Momentum features: rolling returns over multiple windows ──────────
+        momentum_frames = []
+        for window in [5, 10, 21, 63]:                    # 1W, 2W, 1M, 3M
+            mom = etf_data.pct_change(window)
+            mom.columns = [f"{col}_Mom{window}d" for col in mom.columns]
+            momentum_frames.append(mom)
+
+        # ── Relative strength vs SPY ──────────────────────────────────────────
+        rel_frames = []
+        if 'SPY' in etf_data.columns:
+            spy_ret = etf_data['SPY'].pct_change(21)
+            for col in etf_data.columns:
+                if col != 'SPY':
+                    rel = etf_data[col].pct_change(21) - spy_ret
+                    rel_frames.append(rel.rename(f"{col}_RelSPY21d"))
+
+        # ── Cross-sectional momentum rank (1=worst, 5=best among universe) ───
+        target_etfs_only = [c for c in etf_data.columns
+                            if c not in ['SPY', 'AGG']]
+        rank_frames = []
+        for window in [21, 63]:
+            mom_w = etf_data[target_etfs_only].pct_change(window)
+            ranked = mom_w.rank(axis=1, pct=True)
+            ranked.columns = [f"{col}_Rank{window}d" for col in ranked.columns]
+            rank_frames.append(ranked)
+
+        # ── Recent trend: 5d and 10d price change ─────────────────────────────
+        trend_frames = []
+        for window in [5, 10]:
+            trend = etf_data.pct_change(window)
+            trend.columns = [f"{col}_Trend{window}d" for col in trend.columns]
+            trend_frames.append(trend)
+
+        result = pd.concat(
+            [etf_returns, etf_vol] + momentum_frames +
+            (rel_frames if rel_frames else []) +
+            rank_frames + trend_frames,
+            axis=1
+        )
+
         return result
-        
+
     except Exception as e:
         st.error(f"❌ ETF fetch failed: {e}")
         return pd.DataFrame()
@@ -323,16 +363,25 @@ def get_data(start_year, force_refresh=False, clean_hf_dataset=False):
         if not etf_data.empty and not macro_data.empty:
             df = pd.concat([etf_data, macro_data], axis=1)
     
-    # Feature Engineering: Z-Scores
-    macro_cols = ['VIX', 'DXY', 'COPPER', 'GOLD', 'HY_Spread', 'T10Y2Y', 'T10Y3M', 
+    # Feature Engineering: Z-Scores for macro + vol columns
+    macro_cols = ['VIX', 'DXY', 'COPPER', 'GOLD', 'HY_Spread', 'T10Y2Y', 'T10Y3M',
                   'VIX_Spot', 'VIX_3M', 'VIX_Term_Slope']
-    
+
     for col in df.columns:
         if any(m in col for m in macro_cols) or '_Vol' in col:
             rolling_mean = df[col].rolling(20, min_periods=5).mean()
-            rolling_std = df[col].rolling(20, min_periods=5).std()
+            rolling_std  = df[col].rolling(20, min_periods=5).std()
             z_col = f"{col}_Z"
             df[z_col] = (df[col] - rolling_mean) / (rolling_std + 1e-9)
+
+    # Z-score the momentum/rank/trend features too so they're on same scale
+    mom_pattern_cols = [c for c in df.columns if any(
+        tag in c for tag in ['_Mom', '_RelSPY', '_Rank', '_Trend']
+    )]
+    for col in mom_pattern_cols:
+        rolling_mean = df[col].rolling(60, min_periods=10).mean()
+        rolling_std  = df[col].rolling(60, min_periods=10).std()
+        df[f"{col}_Z"] = (df[col] - rolling_mean) / (rolling_std + 1e-9)
     
     # Add regime features
     st.write("🎯 **Adding Regime Detection Features...**")

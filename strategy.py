@@ -43,9 +43,15 @@ def compute_signal_conviction(raw_scores):
 
 
 def execute_strategy(preds, y_raw_test, test_dates, target_etfs, fee_bps,
-                     model_type="ensemble"):
+                     model_type="ensemble",
+                     stop_loss_pct=-0.12, z_reentry=1.0,
+                     sofr=0.045, all_proba=None):
     """
-    Execute trading strategy with T+1 execution.
+    Execute trading strategy with T+1 execution and trailing stop-loss.
+
+    Stop-loss: if 2-day cumulative return ≤ stop_loss_pct, switch to CASH
+               earning daily Rf (sofr/252). Re-enter ETF when model conviction
+               Z-score > z_reentry threshold.
 
     Returns:
         strat_rets        : Strategy returns (numpy array)
@@ -63,6 +69,8 @@ def execute_strategy(preds, y_raw_test, test_dates, target_etfs, fee_bps,
             test_dates, [preds, y_raw_test]
         )
         preds, y_raw_test = filtered_data
+        if all_proba is not None:
+            _, [all_proba] = filter_to_trading_days(test_dates, [all_proba])
     else:
         filtered_dates, filtered_data = filter_to_trading_days(
             test_dates, [preds, y_raw_test]
@@ -73,30 +81,75 @@ def execute_strategy(preds, y_raw_test, test_dates, target_etfs, fee_bps,
 
     strat_rets = []
     audit_trail = []
+    daily_rf = sofr / 252          # daily risk-free rate earned while in CASH
+
+    stop_active = False            # True = stop triggered, holding CASH
+    recent_rets = []               # rolling buffer for 2-day cumulative return check
 
     num_realized = len(preds)
     today = datetime.now().date()
 
     for i in range(num_realized):
+        # ── Get model scores for conviction Z-score ──────────────────────────
         if model_type == "ensemble":
-            best_idx = preds[i]
+            best_idx = int(preds[i])
             signal_etf = target_etfs[best_idx].replace('_Ret', '')
             realized_ret = y_raw_test[i][best_idx]
+            # Use full per-day probabilities if available, else one-hot
+            if all_proba is not None:
+                day_scores = np.array(all_proba[i], dtype=float)
+            else:
+                day_scores = np.zeros(len(target_etfs))
+                day_scores[best_idx] = 1.0
         else:
             best_idx = np.argmax(preds[i])
             signal_etf = target_etfs[best_idx].replace('_Ret', '')
             realized_ret = y_test[i][best_idx]
+            day_scores = np.array(preds[i], dtype=float)
 
-        net_ret = realized_ret - (fee_bps / 10000)
+        # ── Conviction Z-score for today ─────────────────────────────────────
+        _, day_z, _ = compute_signal_conviction(day_scores)
+
+        # ── Stop-loss logic ──────────────────────────────────────────────────
+        if stop_active:
+            # Stay in CASH until conviction Z-score exceeds re-entry threshold
+            if day_z >= z_reentry:
+                stop_active = False
+                # Re-enter: use model signal, apply fee
+                net_ret = realized_ret - (fee_bps / 10000)
+                trade_signal = signal_etf
+            else:
+                # Remain in CASH — earn daily Rf, no fee
+                net_ret = daily_rf
+                trade_signal = "CASH"
+        else:
+            # Check 2-day cumulative return for stop trigger
+            if len(recent_rets) >= 2:
+                cum_2d = (1 + recent_rets[-2]) * (1 + recent_rets[-1]) - 1
+                if cum_2d <= stop_loss_pct:
+                    stop_active = True
+                    net_ret = daily_rf      # switch to CASH immediately today
+                    trade_signal = "CASH"
+                else:
+                    net_ret = realized_ret - (fee_bps / 10000)
+                    trade_signal = signal_etf
+            else:
+                net_ret = realized_ret - (fee_bps / 10000)
+                trade_signal = signal_etf
+
         strat_rets.append(net_ret)
+        recent_rets.append(net_ret)
+        if len(recent_rets) > 2:
+            recent_rets.pop(0)
 
         trade_date = test_dates[i]
         if trade_date.date() < today:
             audit_trail.append({
                 'Date': trade_date.strftime('%Y-%m-%d'),
-                'Signal': signal_etf,
+                'Signal': trade_signal,
                 'Realized': realized_ret,
-                'Net_Return': net_ret
+                'Net_Return': net_ret,
+                'Stop_Active': stop_active
             })
 
     strat_rets = np.array(strat_rets)

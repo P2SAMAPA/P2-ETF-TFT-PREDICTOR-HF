@@ -265,8 +265,9 @@ if run_button:
         st.info(f"🎯 **Test Accuracy:** {accuracy:.1%} | Random baseline: {random_baseline:.1%} | "
                 f"{'✅ Above random' if accuracy > random_baseline else '❌ Below random — inverse pattern learned'}")
 
-        # ── For P&L: use actual daily returns (not 5-day target) ─────────────
-        daily_ret_test = df_model[target_etfs].values[1:][train_size + val_size:]
+        # ── For P&L: use actual daily returns aligned to test_dates ─────────
+        # test_dates are the execution dates (T+1 shifted), so index directly
+        daily_ret_test = df.loc[test_dates, target_etfs].values
 
     else:
         # Transformer: sequences

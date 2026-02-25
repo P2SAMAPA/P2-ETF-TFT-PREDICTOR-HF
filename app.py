@@ -194,20 +194,35 @@ if run_button:
 
     st.info(f"🎯 **Targets:** {len(target_etfs)} ETFs | **Features:** {len(input_features)} signals")
 
+    # ── Build 5-day forward return targets ───────────────────────────────────
+    # For each ETF, sum the next 5 daily returns as the prediction target
+    # This gives smoother, less noisy labels than 1-day returns
+    FORWARD_DAYS = 5
+    etf_prices_cols = [c for c in df.columns if c.endswith('_Ret') and
+                       any(e in c for e in ['TLT', 'TBT', 'VNQ', 'SLV', 'GLD'])]
+
+    fwd_returns = pd.DataFrame(index=df.index)
+    for col in etf_prices_cols:
+        # 5-day forward return = sum of next 5 daily returns (approx)
+        fwd_returns[col] = df[col].rolling(FORWARD_DAYS).sum().shift(-FORWARD_DAYS)
+
+    # Drop rows where forward return is NaN (last 5 rows)
+    valid_idx = fwd_returns.dropna().index
+    df_model   = df.loc[valid_idx]
+    fwd_model  = fwd_returns.loc[valid_idx]
+
     # Prepare data
     last_proba = None   # will hold per-ETF probabilities for conviction
 
     if "Option B" in model_option:
-        # Ensemble: flat features
-        X = df[input_features].values
-        y_raw = df[target_etfs].values
+        # Ensemble: flat features with 5-day forward return targets
+        X     = df_model[input_features].values
+        y_raw = fwd_model[target_etfs].values
 
-        # ── T+1 fix: features at day i predict returns at day i+1 ──────────
-        # Drop last row of X (no future return known), drop first row of y_raw
-        X      = X[:-1]
-        y_raw  = y_raw[1:]
-        # Align dates: test dates shift forward by 1 (execution is next day)
-        dates_aligned = df.index[1:]
+        # ── T+1 fix: features at day i predict 5-day return starting day i+1 ─
+        X             = X[:-1]
+        y_raw         = y_raw[1:]
+        dates_aligned = df_model.index[1:]
 
         y = np.argmax(y_raw, axis=1)
 
@@ -250,21 +265,25 @@ if run_button:
         st.info(f"🎯 **Test Accuracy:** {accuracy:.1%} | Random baseline: {random_baseline:.1%} | "
                 f"{'✅ Above random' if accuracy > random_baseline else '❌ Below random — inverse pattern learned'}")
 
+        # ── For P&L: use actual daily returns (not 5-day target) ─────────────
+        daily_ret_test = df_model[target_etfs].values[1:][train_size + val_size:]
+
     else:
         # Transformer: sequences
         # Fit scaler only on training portion to avoid leakage
-        n_total = len(df[input_features])
-        # Approximate train boundary before sequence building
+        n_total = len(df_model[input_features])
         approx_train_end = int((n_total - 1) * train_pct)
         scaler = MinMaxScaler()
-        scaler.fit(df[input_features].values[:approx_train_end])
-        scaled_input = scaler.transform(df[input_features].values)
+        scaler.fit(df_model[input_features].values[:approx_train_end])
+        scaled_input = scaler.transform(df_model[input_features].values)
+
+        fwd_vals = fwd_model[target_etfs].values   # 5-day forward returns
 
         X, y, dates_seq = [], [], []
         for i in range(lookback, len(scaled_input) - 1):  # -1 for T+1 shift
             X.append(scaled_input[i-lookback:i])
-            y.append(df[target_etfs].iloc[i + 1].values)  # T+1: next day's returns
-            dates_seq.append(df.index[i + 1])             # execution date = next day
+            y.append(fwd_vals[i + 1])              # T+1: 5-day fwd return from next day
+            dates_seq.append(df_model.index[i + 1])
 
         X = np.array(X)
         y = np.array(y)
@@ -314,7 +333,8 @@ if run_button:
      conviction_zscore, conviction_label, all_etf_scores) = execute_strategy(
         preds, y_raw_test, test_dates, target_etfs, fee_bps, model_type,
         stop_loss_pct=stop_loss_pct, z_reentry=z_reentry,
-        sofr=sofr, all_proba=all_proba, z_min_entry=z_min_entry
+        sofr=sofr, all_proba=all_proba, z_min_entry=z_min_entry,
+        daily_ret_override=daily_ret_test if "Option B" in model_option else None
     )
 
     # ── Override scores with richer RF/XGB probabilities when available ─────

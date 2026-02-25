@@ -307,10 +307,24 @@ if run_button:
             st.success(f"✅ Training completed!")
 
         preds      = model.predict(X_test, verbose=0)
+        # Convert raw return predictions to softmax probabilities for conviction scoring
+        preds_exp  = np.exp(preds - preds.max(axis=1, keepdims=True))
+        preds_prob = preds_exp / preds_exp.sum(axis=1, keepdims=True)
         test_dates = np.array(dates_seq)[train_size + val_size:]
-        y_raw_test = y_test
+        y_raw_test = preds_prob   # use probabilities for conviction Z-score
         model_type = "transformer"
-        all_proba  = None   # transformer uses raw preds directly
+        all_proba  = preds_prob   # same for conviction gate
+
+        # ── Diagnostic: accuracy on 5-day forward direction ──────────────────
+        y_test_labels = np.argmax(y_test, axis=1)
+        pred_labels   = np.argmax(preds,  axis=1)
+        accuracy      = np.mean(pred_labels == y_test_labels)
+        random_baseline = 1.0 / len(target_etfs)
+        st.info(f"🎯 **Test Accuracy:** {accuracy:.1%} | Random baseline: {random_baseline:.1%} | "
+                f"{'✅ Above random' if accuracy > random_baseline else '❌ Below random'}")
+
+        # ── For P&L: use actual daily returns aligned to test_dates ──────────
+        daily_ret_test = df.loc[test_dates, target_etfs].values
 
     # Execute strategy
     # Risk-free rate: fetch DTB3 (3-Month T-Bill) live from FRED
@@ -335,7 +349,7 @@ if run_button:
         preds, y_raw_test, test_dates, target_etfs, fee_bps, model_type,
         stop_loss_pct=stop_loss_pct, z_reentry=z_reentry,
         sofr=sofr, all_proba=all_proba, z_min_entry=z_min_entry,
-        daily_ret_override=daily_ret_test if "Option B" in model_option else None
+        daily_ret_override=daily_ret_test
     )
 
     # ── Override scores with richer RF/XGB probabilities when available ─────

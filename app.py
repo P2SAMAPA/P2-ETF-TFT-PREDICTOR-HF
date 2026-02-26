@@ -243,7 +243,7 @@ if run_button:
     st.success(f"✅ Split → Train: {len(X_train)} | Val: {len(X_val)} | Test: {len(X_test)}")
 
     # ── Train TFT ─────────────────────────────────────────────────────────────
-    with st.spinner(f"🧠 Training TFT (up to {epochs} epochs, early stopping active)..."):
+    with st.spinner("🧠 Training TFT (up to 150 epochs, early stopping active)..."):
         model, history = train_tft(X_train, y_train, X_val, y_val, epochs=150)
         actual_epochs  = len(history.history['loss'])
         st.success(f"✅ Training complete — stopped at epoch {actual_epochs}")

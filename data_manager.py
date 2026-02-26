@@ -111,7 +111,7 @@ def fetch_macro_data_robust(start_date="2008-01-01"):
     if all_data:
         combined = pd.concat(all_data, axis=1, join='outer')
         combined = combined.loc[:, ~combined.columns.duplicated()]
-        combined = combined.fillna(method='ffill', limit=5)
+        combined = combined.ffill(limit=5)
         return combined
     else:
         st.error("❌ Failed to fetch any macro data!")
@@ -399,9 +399,9 @@ def get_data(start_year, force_refresh=False, clean_hf_dataset=False):
         st.warning(f"🗑️ Dropping {len(bad_features)} features with >50% NaNs")
         df = df.drop(columns=bad_features)
     
-    df = df.fillna(method='ffill', limit=5)
-    df = df.fillna(method='bfill', limit=100)
-    df = df.fillna(method='ffill')
+    df = df.ffill(limit=5)
+    df = df.bfill(limit=100)
+    df = df.ffill()
     
     df = df.dropna()
     

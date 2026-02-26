@@ -267,18 +267,18 @@ if run_button:
 
     # ── Risk-free rate ─────────────────────────────────────────────────────────
     sofr        = 0.045
-    sofr_source = "fallback (4.5%)"
+    rf_label    = "fallback (4.5%)"
     try:
         import pandas_datareader.data as web
         dtb3 = web.DataReader('DTB3', 'fred', start='2024-01-01').dropna()
         if not dtb3.empty:
-            sofr        = float(dtb3.iloc[-1].values[0]) / 100
-            sofr_source = f"FRED DTB3 live ({dtb3.index[-1].date()})"
+            sofr     = float(dtb3.iloc[-1].values[0]) / 100
+            rf_label = f"FRED DTB3 live ({dtb3.index[-1].date()})"
     except Exception:
         if 'DTB3' in df.columns:
-            sofr        = float(df['DTB3'].dropna().iloc[-1]) / 100
-            sofr_source = "dataset DTB3"
-    st.caption(f"📊 Risk-free rate: **{sofr*100:.2f}%** — {sofr_source}")
+            sofr     = float(df['DTB3'].dropna().iloc[-1]) / 100
+            rf_label = "dataset DTB3"
+    st.caption(f"📊 Risk-free rate (3M T-Bill): **{sofr*100:.2f}%** — {rf_label}")
 
     # ── Execute strategy ──────────────────────────────────────────────────────
     (strat_rets, audit_trail, next_signal, next_trading_date,
@@ -396,16 +396,17 @@ if run_button:
     # METRICS
     # ─────────────────────────────────────────────────────────────────────────
     c1, c2, c3, c4, c5 = st.columns(5)
+    excess = (metrics['ann_return'] - sofr) * 100
     c1.metric("📈 Ann. Return",   f"{metrics['ann_return']*100:.2f}%",
-              delta=f"vs SOFR: {(metrics['ann_return']-sofr)*100:.2f}%")
+              delta=f"Excess over 3M T-Bill: {excess:+.2f}pp")
     c2.metric("📊 Sharpe",        f"{metrics['sharpe']:.2f}",
-              delta="Risk-Adjusted" if metrics['sharpe'] > 1 else "Below Threshold")
+              delta="Risk-Adjusted" if metrics['sharpe'] > 1 else "Below 1.0 Threshold")
     c3.metric("🎯 Hit Ratio 15d", f"{metrics['hit_ratio']*100:.0f}%",
               delta="Strong" if metrics['hit_ratio'] > 0.6 else "Weak")
     c4.metric("📉 Max Drawdown",  f"{metrics['max_dd']*100:.2f}%",
               delta="Peak to Trough")
     c5.metric("⚠️ Max Daily DD",  f"{metrics['max_daily_dd']*100:.2f}%",
-              delta="Worst Day")
+              delta="Worst Single Day")
 
     # ─────────────────────────────────────────────────────────────────────────
     # EQUITY CURVE
@@ -472,6 +473,103 @@ if run_button:
                       {'selector': 'td', 'props': [('padding', '10px')]}
                   ]))
         st.dataframe(styled, use_container_width=True, height=650)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # METHODOLOGY
+    # ─────────────────────────────────────────────────────────────────────────
+    st.divider()
+    st.subheader("📖 Methodology & Model Notes")
+
+    st.markdown(f"""
+    <div style="background:#1a1a2e;border:1px solid #2d2d4e;border-radius:12px;
+                padding:28px 32px;color:#e0e0e0;font-size:14px;line-height:1.8;">
+
+    <h4 style="color:#00d1b2;margin-top:0;">🏗️ Model Architecture — Temporal Fusion Transformer (TFT)</h4>
+    <p>The TFT is a deep learning architecture specifically designed for multi-horizon time series
+    forecasting. It combines gating mechanisms, variable selection, and multi-head attention to
+    learn <em>which features matter, at which time steps, for which prediction horizon</em>.</p>
+
+    <b style="color:#00d1b2;">Key components:</b>
+    <ul>
+      <li><b>Gated Feature Projection</b> — a learned gate (sigmoid × projection) suppresses
+          irrelevant macro signals and amplifies predictive ones at each timestep</li>
+      <li><b>Causal Conv1D</b> — captures short-range (1–3 day) price momentum patterns before
+          the attention layers</li>
+      <li><b>Gated Residual Networks (GRN)</b> — stacked non-linear blocks with skip connections
+          that allow the model to bypass layers when simpler transformations suffice</li>
+      <li><b>Sinusoidal Positional Encoding</b> — injects time-step ordering information so
+          the attention heads know the temporal distance between observations</li>
+      <li><b>2× Multi-Head Self-Attention (4 heads, key_dim=16)</b> — learns which past days
+          in the lookback window are most relevant to the current prediction</li>
+      <li><b>Softmax Output (5 classes)</b> — outputs a probability distribution over the 5
+          ETFs; the highest probability ETF is selected for next-day execution</li>
+    </ul>
+
+    <h4 style="color:#00d1b2;margin-top:20px;">📊 Training Methodology</h4>
+    <ul>
+      <li><b>Target:</b> Best-performing ETF over the next 5 trading days (5-day forward return
+          argmax). Using 5 days smooths out daily noise and gives the model a cleaner signal
+          to learn from</li>
+      <li><b>T+1 execution shift:</b> Features at day <i>i</i> predict the best ETF starting
+          day <i>i+1</i>. The strategy executes at market open the following day, preventing
+          look-ahead bias</li>
+      <li><b>No data leakage:</b> RobustScaler fitted only on training data, then applied to
+          val/test. Train/Val/Test split is strictly chronological — no shuffling</li>
+      <li><b>Lookback auto-optimised:</b> 5 candidate windows (20/30/40/50/60 days) are probed
+          on the validation set for 30 epochs each; the window with lowest val_loss is selected
+          for full training. Currently best: <b>{lookback} days</b></li>
+      <li><b>Loss function:</b> Sparse categorical cross-entropy — correct classification
+          objective for a 5-class problem</li>
+      <li><b>Early stopping:</b> Patience=25 epochs on val_loss with best-weights restore.
+          LR halved every 10 plateau epochs (min LR=1e-5)</li>
+    </ul>
+
+    <h4 style="color:#00d1b2;margin-top:20px;">🔢 Input Features ({len(input_features)} signals)</h4>
+    <ul>
+      <li><b>Macro Z-scores:</b> VIX, yield curve (T10Y2Y, T10Y3M), credit spreads (HY/IG),
+          DXY, VIX term structure — all rolling Z-scored over 60-day windows</li>
+      <li><b>Regime binary flags:</b> VIX regime (Low/Med/High), yield curve shape
+          (Inverted/Flat/Steep), credit stress levels, rate environment (VeryLow/Low/Normal/High)</li>
+      <li><b>Rate momentum (new):</b> 20d and 60d rate-of-change on T10Y2Y and T10Y3M,
+          rising/falling binary flags at both horizons, rate acceleration — critical for
+          distinguishing TBT (rising rates) from TLT (falling rates) regimes</li>
+      <li><b>ETF momentum:</b> 5d/10d/21d/63d rolling returns per ETF, relative strength
+          vs SPY (21d), cross-sectional rank percentile (21d/63d), 5d/10d price trend</li>
+    </ul>
+
+    <h4 style="color:#00d1b2;margin-top:20px;">⚙️ Strategy Execution</h4>
+    <ul>
+      <li><b>P&L calculation:</b> Uses actual daily returns (not 5-day targets) — the model
+          predicts 5-day direction but re-evaluates and can switch ETFs every single day</li>
+      <li><b>Conviction gate (σ={z_min_entry}):</b> Only enter a position if the top ETF's
+          probability sits at least {z_min_entry}σ above the mean of all 5 ETF probabilities.
+          Below this threshold the strategy holds CASH earning the 3M T-Bill rate</li>
+      <li><b>Trailing stop-loss ({stop_loss_pct*100:.0f}%):</b> If the 2-day cumulative return
+          ≤ {stop_loss_pct*100:.0f}%, switch to CASH. Re-enter when conviction Z-score ≥ {z_reentry}σ</li>
+      <li><b>5-day consecutive loss rotation:</b> If the top-ranked ETF loses money every
+          single day for 5 consecutive days, rotate to the model's #2 ranked ETF until the
+          top pick records a positive day</li>
+      <li><b>Transaction cost:</b> {fee_bps} bps deducted on every position entry/re-entry</li>
+      <li><b>CASH return:</b> 3-Month T-Bill rate (DTB3 from FRED, currently
+          {sofr*100:.2f}% annualised) divided by 252 — earned daily when not in an ETF position</li>
+    </ul>
+
+    <h4 style="color:#00d1b2;margin-top:20px;">⚠️ Important Caveats</h4>
+    <ul>
+      <li>Out-of-sample test period is the last {test_pct*100:.0f}% of data
+          ({len(strat_rets)} trading days). Past performance does not guarantee future results</li>
+      <li>SLV (silver ETF) is highly volatile — single-day moves of ±10% are not uncommon,
+          as seen in the -28.69% worst day. Position sizing in live trading should reflect this</li>
+      <li>TBT is a 2× leveraged inverse bond ETF with daily rebalancing decay — holding it
+          for extended periods in sideways markets erodes value even if rates are flat</li>
+      <li>The model is retrained from scratch on each run — results may vary slightly between
+          runs due to random weight initialisation</li>
+      <li>This tool is for research and educational purposes only and does not constitute
+          financial advice</li>
+    </ul>
+
+    </div>
+    """, unsafe_allow_html=True)
 
 else:
     st.info("👈 Configure parameters and click **🚀 Run TFT Model** to begin")

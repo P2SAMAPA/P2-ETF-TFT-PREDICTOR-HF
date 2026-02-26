@@ -60,19 +60,19 @@ def execute_strategy(proba, y_fwd_test, test_dates, target_etfs, fee_bps,
                       if daily_ret_override is not None
                       else float(y_fwd_test[i][best_idx]))
 
-        # ── 5-day consecutive loss rotation ──────────────────────────────────
-        # Buffer contains PREVIOUS days' returns (appended at end of loop)
-        # So on day i, top_pick_rets has returns from days [i-5 .. i-1]
-        # Check: all 5 previous days negative → rotate to #2
-        # Recovery: top pick positive today → rotate back to #1
+        # ── 5-day cumulative loss rotation ───────────────────────────────────
+        # Rule: if top pick's 5-day cumulative return < 0 → rotate to #2
+        # Recovery: as soon as top pick has a positive day → rotate back to #1
         if rotated_etf_idx is not None:
-            # Currently rotated — check if top pick has recovered today
             if top_actual > 0:
                 rotated_etf_idx = None
-        
-        # Only check rotation trigger if not already rotated
+
         if rotated_etf_idx is None and len(top_pick_rets) >= 5:
-            if all(r < 0 for r in top_pick_rets[-5:]):
+            cum_5d = 1.0
+            for r in top_pick_rets[-5:]:
+                cum_5d *= (1 + r)
+            cum_5d -= 1.0
+            if cum_5d < 0:
                 rotated_etf_idx = second_idx
 
         active_idx  = rotated_etf_idx if rotated_etf_idx is not None else best_idx

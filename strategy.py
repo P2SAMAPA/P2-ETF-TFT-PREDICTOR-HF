@@ -132,6 +132,7 @@ def execute_strategy(proba, y_fwd_test, test_dates, target_etfs, fee_bps,
             audit_trail.append({
                 'Date':         trade_date_val.strftime('%Y-%m-%d'),
                 'Signal':       trade_signal,
+                'Top_Pick':     target_etfs[best_idx].replace('_Ret', ''),
                 'Conviction_Z': round(day_z, 2),
                 'Net_Return':   round(net_ret, 5),
                 'Stop_Active':  stop_active,

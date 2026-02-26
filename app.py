@@ -226,14 +226,18 @@ if run_button:
 
     # ── Build sequences with optimal lookback and T+1 shift ──────────────────
     # Use df_model.index for feature lookup but store the ACTUAL execution date
-    # which is df_model.index[i+1] — this correctly maps to the next trading day
-    df_model_dates = df_model.index  # these are valid trading days from the dataset
+    # df_model ends 5 days before df (due to forward return NaN drop)
+    # We use df.index to ensure test dates extend to the latest available date
+    df_full_dates = df.index  # full date index including last 5 rows
     X, y_cls, y_fwd, dates_seq = [], [], [], []
     for i in range(lookback, len(scaled) - 1):
         X.append(scaled[i - lookback:i])
         y_fwd.append(fwd_vals[i + 1])
         y_cls.append(int(np.argmax(fwd_vals[i + 1])))
-        dates_seq.append(df_model_dates[i + 1])
+        # Map df_model index position back to df_full_dates
+        # df_model is a subset of df, so use iloc position in df
+        model_date = df_model.index[i + 1]
+        dates_seq.append(model_date)
 
     X      = np.array(X,     dtype=np.float32)
     y_cls  = np.array(y_cls, dtype=np.int32)
@@ -251,6 +255,12 @@ if run_button:
     y_cls_test = y_cls[train_size + val_size:]
     test_dates = pd.DatetimeIndex(dates_seq)[train_size + val_size:]
 
+    # Extend test_dates with any dates in df that come AFTER df_model ends
+    # These are the last 5 trading days missing due to forward return NaN drop
+    extra_dates = df.index[df.index > df_model.index[-1]]
+    if len(extra_dates) > 0:
+        test_dates = test_dates.append(extra_dates)
+
     st.success(f"✅ Split → Train: {len(X_train)} | Val: {len(X_val)} | Test: {len(X_test)}")
 
     # ── Train TFT ─────────────────────────────────────────────────────────────
@@ -260,10 +270,18 @@ if run_button:
         st.success(f"✅ Training complete — stopped at epoch {actual_epochs}")
 
     # ── Predict ───────────────────────────────────────────────────────────────
-    proba = predict_tft(model, X_test)   # shape (N, 5) softmax probabilities
+    proba = predict_tft(model, X_test)   # shape (N, 5)
 
-    # ── Accuracy diagnostic ───────────────────────────────────────────────────
-    pred_labels = np.argmax(proba, axis=1)
+    # Pad proba for extra dates (repeat last prediction — model can't see future)
+    if len(extra_dates) > 0:
+        last_pred = proba[-1:].repeat(len(extra_dates), axis=0)
+        proba = np.vstack([proba, last_pred])
+        last_fwd = y_fwd_test[-1:].repeat(len(extra_dates), axis=0)
+        y_fwd_test = np.vstack([y_fwd_test, last_fwd])
+
+    # ── Accuracy diagnostic (original test set only, not padded) ─────────────
+    orig_test_size = len(X_test)
+    pred_labels = np.argmax(proba[:orig_test_size], axis=1)
     accuracy    = np.mean(pred_labels == y_cls_test)
     random_bl   = 1.0 / len(target_etfs)
     st.info(
@@ -409,15 +427,15 @@ if run_button:
     c1, c2, c3, c4, c5 = st.columns(5)
     excess = (metrics['ann_return'] - sofr) * 100
     c1.metric("📈 Ann. Return",   f"{metrics['ann_return']*100:.2f}%",
-              delta=f"Excess over 3M T-Bill: {excess:+.2f}pp")
+              delta=f"{excess:+.1f}pp vs T-Bill")
     c2.metric("📊 Sharpe",        f"{metrics['sharpe']:.2f}",
-              delta="Risk-Adjusted" if metrics['sharpe'] > 1 else "Below 1.0 Threshold")
+              delta="Above 1.0 ✓" if metrics['sharpe'] > 1 else "Below 1.0")
     c3.metric("🎯 Hit Ratio 15d", f"{metrics['hit_ratio']*100:.0f}%",
               delta="Strong" if metrics['hit_ratio'] > 0.6 else "Weak")
     c4.metric("📉 Max Drawdown",  f"{metrics['max_dd']*100:.2f}%",
               delta="Peak to Trough")
     c5.metric("⚠️ Max Daily DD",  f"{metrics['max_daily_dd']*100:.2f}%",
-              delta="Worst Single Day")
+              delta="Worst Day")
 
     # ─────────────────────────────────────────────────────────────────────────
     # EQUITY CURVE

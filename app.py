@@ -46,9 +46,8 @@ with st.sidebar:
     st.subheader("🧠 TFT Training")
     epochs   = st.number_input("Max Epochs", 50, 500, 200, step=25,
                                help="Early stopping will halt before this if val_loss plateaus")
-    lookback = st.slider("Lookback Window (days)", 20, 60, 30, step=5,
-                         help="Sequence length fed into the TFT")
     st.caption("Architecture: VSN → GRN → 2× Multi-Head Attention (4 heads) → Softmax")
+    st.caption("⚙️ Lookback auto-optimised across 20/30/40/50/60 days on validation set")
 
     st.divider()
 
@@ -135,7 +134,8 @@ if run_button:
     input_features = [c for c in df.columns
                       if (c.endswith('_Z') or c.endswith('_Vol') or
                           'Regime' in c or 'YC_' in c or 'Credit_' in c or
-                          'Rates_' in c or 'VIX_Term_' in c)
+                          'Rates_' in c or 'VIX_Term_' in c or
+                          'Rising' in c or 'Falling' in c or 'Accelerating' in c)
                       and c not in target_etfs]
 
     if not target_etfs or not input_features:
@@ -154,18 +154,70 @@ if run_button:
     df_model   = df.loc[valid_idx]
     fwd_model  = fwd_returns.loc[valid_idx]
 
-    # ── Scale features (fit on train only) ───────────────────────────────────
-    n_total          = len(df_model)
-    approx_train_end = int((n_total - lookback - 1) * train_pct)
+    # ── Scale features (fit on train only — approx boundary using 60d max) ──
+    approx_train_end = int((len(df_model) - 60 - 1) * train_pct)
     scaler = RobustScaler()
     scaler.fit(df_model[input_features].values[:approx_train_end])
     scaled = scaler.transform(df_model[input_features].values)
 
     fwd_vals = fwd_model[target_etfs].values
 
-    # ── Build sequences with T+1 shift ────────────────────────────────────────
-    # X[i] = features[i-lookback : i]  (history up to day i)
-    # y[i] = argmax(fwd_returns[i+1])  (best ETF starting tomorrow)
+    # ── Auto-optimise lookback (20/30/40/50/60 days) on validation loss ─────
+    LOOKBACK_CANDIDATES = [20, 30, 40, 50, 60]
+    best_lookback   = 30
+    best_val_loss   = float('inf')
+    lookback_results = {}
+
+    with st.status("🔍 Auto-optimising lookback window...", expanded=False) as status:
+        for lb in LOOKBACK_CANDIDATES:
+            # Build sequences
+            X_lb, y_lb = [], []
+            for i in range(lb, len(scaled) - 1):
+                X_lb.append(scaled[i - lb:i])
+                y_lb.append(int(np.argmax(fwd_vals[i + 1])))
+            X_lb = np.array(X_lb, dtype=np.float32)
+            y_lb = np.array(y_lb, dtype=np.int32)
+
+            ts = int(len(X_lb) * train_pct)
+            vs = int(len(X_lb) * val_pct)
+
+            from models import build_tft_model
+            import tensorflow as tf
+
+            probe_model = build_tft_model(
+                seq_len=lb,
+                num_features=X_lb.shape[2],
+                num_classes=len(np.unique(y_lb)),
+                units=64, num_heads=4, num_attn_layers=2, dropout_rate=0.15
+            )
+            probe_model.compile(
+                optimizer=tf.keras.optimizers.Adam(5e-4),
+                loss='sparse_categorical_crossentropy'
+            )
+            probe_hist = probe_model.fit(
+                X_lb[:ts], y_lb[:ts],
+                validation_data=(X_lb[ts:ts+vs], y_lb[ts:ts+vs]),
+                epochs=30,
+                batch_size=64,
+                callbacks=[tf.keras.callbacks.EarlyStopping(
+                    monitor='val_loss', patience=8, restore_best_weights=True)],
+                verbose=0
+            )
+            val_loss = min(probe_hist.history['val_loss'])
+            lookback_results[lb] = round(val_loss, 4)
+            st.write(f"  lookback={lb}d → val_loss={val_loss:.4f}")
+
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                best_lookback = lb
+
+        status.update(label=f"✅ Best lookback: {best_lookback}d (val_loss={best_val_loss:.4f})",
+                      state="complete")
+
+    lookback = best_lookback
+    st.info(f"📐 **Lookback selected: {lookback} days** | Search results: {lookback_results}")
+
+    # ── Build sequences with optimal lookback and T+1 shift ──────────────────
     X, y_cls, y_fwd, dates_seq = [], [], [], []
     for i in range(lookback, len(scaled) - 1):
         X.append(scaled[i - lookback:i])
@@ -401,7 +453,7 @@ if run_button:
 
     audit_df = pd.DataFrame(audit_trail).tail(20)
     if not audit_df.empty:
-        display_cols = ['Date', 'Signal', 'Conviction_Z', 'Net_Return', 'Stop_Active']
+        display_cols = ['Date', 'Signal', 'Conviction_Z', 'Net_Return', 'Stop_Active', 'Rotated']
         display_cols = [c for c in display_cols if c in audit_df.columns]
         audit_df = audit_df[display_cols]
 

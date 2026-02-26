@@ -149,9 +149,15 @@ if run_button:
     for col in target_etfs:
         fwd_returns[col] = df[col].rolling(FORWARD_DAYS).sum().shift(-FORWARD_DAYS)
 
+    # For training/validation we need valid forward returns (drop last 5 rows)
+    # For test execution dates we want ALL dates including the most recent 5
+    # so we keep df_model for features but track full df dates for P&L
     valid_idx  = fwd_returns.dropna().index
     df_model   = df.loc[valid_idx]
     fwd_model  = fwd_returns.loc[valid_idx]
+
+    # Full date index from df for daily P&L lookup (includes last 5 rows)
+    full_dates = df.index
 
     # ── Scale features (fit on train only — approx boundary using 60d max) ──
     approx_train_end = int((len(df_model) - 60 - 1) * train_pct)
@@ -180,8 +186,10 @@ if run_button:
             ts = int(len(X_lb) * train_pct)
             vs = int(len(X_lb) * val_pct)
 
-            from models import build_tft_model
+            from models import build_tft_model, SEED
             import tensorflow as tf
+            import random as _random
+            _random.seed(SEED); np.random.seed(SEED); tf.random.set_seed(SEED)
 
             probe_model = build_tft_model(
                 seq_len=lb,
@@ -217,12 +225,15 @@ if run_button:
     st.info(f"📐 **Lookback selected: {lookback} days** | Search results: {lookback_results}")
 
     # ── Build sequences with optimal lookback and T+1 shift ──────────────────
+    # Use df_model.index for feature lookup but store the ACTUAL execution date
+    # which is df_model.index[i+1] — this correctly maps to the next trading day
+    df_model_dates = df_model.index  # these are valid trading days from the dataset
     X, y_cls, y_fwd, dates_seq = [], [], [], []
     for i in range(lookback, len(scaled) - 1):
         X.append(scaled[i - lookback:i])
         y_fwd.append(fwd_vals[i + 1])
         y_cls.append(int(np.argmax(fwd_vals[i + 1])))
-        dates_seq.append(df_model.index[i + 1])
+        dates_seq.append(df_model_dates[i + 1])
 
     X      = np.array(X,     dtype=np.float32)
     y_cls  = np.array(y_cls, dtype=np.int32)
@@ -261,8 +272,9 @@ if run_button:
         f"{'✅ Above random' if accuracy > random_bl else '❌ Below random'}"
     )
 
-    # ── Daily returns for P&L (aligned to test_dates) ─────────────────────────
-    daily_ret_test = df.reindex(test_dates)[target_etfs].values
+    # ── Daily returns for P&L — use df (full dataset, not df_model) ──────────
+    # df has all trading days; df_model is missing last 5 rows due to fwd target
+    daily_ret_test = df.reindex(test_dates)[target_etfs].fillna(0.0).values
 
     # ── Risk-free rate ─────────────────────────────────────────────────────────
     sofr        = 0.045
@@ -453,7 +465,7 @@ if run_button:
 
     audit_df = pd.DataFrame(audit_trail).tail(20)
     if not audit_df.empty:
-        display_cols = ['Date', 'Signal', 'Conviction_Z', 'Net_Return', 'Stop_Active', 'Rotated']
+        display_cols = ['Date', 'Signal', 'Top_Pick', 'Conviction_Z', 'Net_Return', 'Stop_Active', 'Rotated']
         display_cols = [c for c in display_cols if c in audit_df.columns]
         audit_df = audit_df[display_cols]
 

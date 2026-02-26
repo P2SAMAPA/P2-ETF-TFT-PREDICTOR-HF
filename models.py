@@ -1,139 +1,173 @@
 """
-Temporal Fusion Transformer (TFT-inspired) in Keras/TensorFlow.
+TFT-inspired ETF classifier in Keras.
+Simplified to be fully compatible with Keras Functional API.
 
-Components:
+Key components:
   - Gated Residual Network (GRN)
-  - Variable Selection Network (VSN)
-  - Multi-head Self-Attention
-  - Classification head (cross-entropy, softmax)
+  - Feature projection + gating (replaces VSN for Functional API compatibility)
+  - Sinusoidal positional encoding
+  - Stacked multi-head self-attention (correct key_dim)
+  - Sparse categorical cross-entropy loss
 """
 
+import numpy as np
 import tensorflow as tf
 from tensorflow.keras.models import Model
 from tensorflow.keras.layers import (
     Input, Dense, Dropout, LayerNormalization,
     MultiHeadAttention, GlobalAveragePooling1D,
-    Multiply, Add
+    Multiply, Add, Activation, Conv1D
 )
-from tensorflow.keras.regularizers import l2
 from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
-import numpy as np
+from tensorflow.keras.regularizers import l2
 
 
-def gated_residual_network(x, units, dropout_rate=0.1, time_dist=True):
-    residual = x
-    def td(layer): return tf.keras.layers.TimeDistributed(layer) if time_dist else layer
-
-    h = td(Dense(units, kernel_regularizer=l2(1e-4)))(x)
-    h = tf.keras.layers.ELU()(h)
-    h = Dropout(dropout_rate)(h)
-    h = td(Dense(units, kernel_regularizer=l2(1e-4)))(h)
-    gate = td(Dense(units, activation='sigmoid'))(x)
-    h = Multiply()([h, gate])
-    if residual.shape[-1] != units:
-        residual = td(Dense(units, use_bias=False))(residual)
-    out = Add()([h, residual])
-    return LayerNormalization(epsilon=1e-6)(out)
-
-
-def variable_selection_network(inputs, num_features, units, dropout_rate=0.1):
-    feature_outputs = []
-    for i in range(num_features):
-        feat = tf.keras.layers.Lambda(
-            lambda t, idx=i: tf.expand_dims(t[:, :, idx], axis=-1)
-        )(inputs)
-        feature_outputs.append(
-            gated_residual_network(feat, units, dropout_rate, time_dist=True)
-        )
-    stacked = tf.stack(feature_outputs, axis=2)
-    w = gated_residual_network(inputs, num_features, dropout_rate, time_dist=True)
-    w = tf.keras.layers.TimeDistributed(Dense(num_features, activation='softmax'))(w)
-    w_exp = tf.expand_dims(w, axis=-1)
-    return tf.reduce_sum(stacked * w_exp, axis=2)
-
-
-def build_tft_model(seq_len, num_features, num_outputs,
-                    d_model=64, num_heads=4, num_layers=2,
-                    dropout_rate=0.15, ff_mult=2):
-    d_model = (d_model // num_heads) * num_heads
-    inputs = Input(shape=(seq_len, num_features), name='seq_input')
-
-    x = variable_selection_network(inputs, num_features, d_model, dropout_rate)
-    x = gated_residual_network(x, d_model, dropout_rate, time_dist=True)
-
-    positions = tf.range(start=0, limit=seq_len, delta=1)
-    pos_emb = tf.keras.layers.Embedding(
-        input_dim=seq_len, output_dim=d_model, name='pos_emb'
-    )(positions)
-    pos_emb = tf.expand_dims(pos_emb, axis=0)
-    x = x + pos_emb
-
-    for i in range(num_layers):
-        attn = MultiHeadAttention(
-            num_heads=num_heads, key_dim=d_model // num_heads,
-            dropout=dropout_rate, name=f'attn_{i}'
-        )(x, x)
-        x = LayerNormalization(epsilon=1e-6)(x + attn)
-        ff = gated_residual_network(x, d_model * ff_mult, dropout_rate, time_dist=True)
-        ff = gated_residual_network(ff, d_model, dropout_rate, time_dist=True)
-        x = LayerNormalization(epsilon=1e-6)(x + ff)
-
-    x = GlobalAveragePooling1D()(x)
-    x = Dropout(dropout_rate)(x)
-    x = gated_residual_network(x, d_model, dropout_rate, time_dist=False)
-    x = Dropout(dropout_rate)(x)
-    outputs = Dense(num_outputs, activation='softmax', name='etf_probs')(x)
-
-    return Model(inputs=inputs, outputs=outputs, name='TFT_ETF_Classifier')
-
-
-def train_tft(X_train, y_train, X_val, y_val, epochs=200,
-              d_model=64, num_heads=4, num_layers=2, dropout_rate=0.15):
+def grn_block(x, units, dropout_rate=0.15):
     """
-    Train TFT classifier.
-    y_train/y_val: integer class labels (0-4, argmax of 5-day fwd returns)
-    Loss: sparse_categorical_crossentropy  (correct for classification)
-    LR  : cosine decay with warm restarts
+    Gated Residual Network block.
+    Works on both 2D (B, units) and 3D (B, T, units) tensors.
+    """
+    # Project residual if needed
+    if x.shape[-1] != units:
+        residual = Dense(units, use_bias=False)(x)
+    else:
+        residual = x
+
+    # Hidden transformation
+    h = Dense(units)(x)
+    h = Activation('elu')(h)
+    h = Dense(units)(h)
+    h = Dropout(dropout_rate)(h)
+
+    # Gate
+    gate = Dense(units, activation='sigmoid')(x)
+    h = Multiply()([h, gate])
+
+    # Add & Norm
+    out = Add()([residual, h])
+    out = LayerNormalization(epsilon=1e-6)(out)
+    return out
+
+
+def build_tft_model(seq_len, num_features, num_classes,
+                    units=64, num_heads=4, num_attn_layers=2,
+                    dropout_rate=0.15):
+    """
+    TFT-inspired classifier compatible with Keras Functional API.
+
+    Architecture:
+      Input → Feature Projection → GRN → Positional Encoding
+      → N × (Multi-Head Attention + GRN) → GlobalAvgPool
+      → GRN → Dense(softmax)
+    """
+    inputs = Input(shape=(seq_len, num_features), name='input')
+
+    # ── 1. Feature projection + gating (lightweight VSN replacement) ──────
+    # Projects all features to 'units' dim with a learned gating mechanism
+    proj  = Dense(units)(inputs)                          # (B, T, units)
+    gate  = Dense(units, activation='sigmoid')(inputs)    # (B, T, units)
+    x     = Multiply()([proj, gate])                      # (B, T, units)
+    x     = LayerNormalization(epsilon=1e-6)(x)
+
+    # ── 2. Local temporal convolution (captures short-range patterns) ────
+    x = Conv1D(units, kernel_size=3, padding='causal',
+               activation='relu')(x)                      # (B, T, units)
+
+    # ── 3. GRN on temporal features ──────────────────────────────────────
+    x = grn_block(x, units, dropout_rate)
+
+    # ── 4. Sinusoidal positional encoding ────────────────────────────────
+    positions = np.arange(seq_len).reshape(-1, 1).astype(np.float32)
+    dims      = np.arange(0, units, 2).astype(np.float32)
+    angles    = positions / np.power(10000.0, dims / units)
+    sin_enc   = np.sin(angles)
+    cos_enc   = np.cos(angles)
+    if units % 2 == 0:
+        pos_enc = np.concatenate([sin_enc, cos_enc], axis=-1)
+    else:
+        pos_enc = np.concatenate([sin_enc, cos_enc[:, :-1]], axis=-1)
+    pos_enc = pos_enc[np.newaxis, :, :]                   # (1, T, units)
+
+    x = x + pos_enc.astype(np.float32)                   # broadcast add
+
+    # ── 5. Stacked multi-head self-attention ─────────────────────────────
+    key_dim = max(1, units // num_heads)
+    for i in range(num_attn_layers):
+        attn = MultiHeadAttention(
+            num_heads=num_heads,
+            key_dim=key_dim,
+            dropout=dropout_rate,
+            name=f'attn_{i}'
+        )(x, x)
+        attn = Dropout(dropout_rate)(attn)
+        x    = LayerNormalization(epsilon=1e-6, name=f'attn_norm_{i}')(x + attn)
+        x    = grn_block(x, units, dropout_rate)
+
+    # ── 6. Aggregate temporal dimension ──────────────────────────────────
+    x = GlobalAveragePooling1D()(x)                       # (B, units)
+
+    # ── 7. Classification head ────────────────────────────────────────────
+    x = grn_block(x, units // 2, dropout_rate)
+    x = Dropout(dropout_rate)(x)
+    outputs = Dense(num_classes, activation='softmax',
+                    name='class_probs')(x)
+
+    return Model(inputs=inputs, outputs=outputs, name='TFT_Classifier')
+
+
+def train_tft(X_train, y_train, X_val, y_val, epochs=200):
+    """
+    Train the TFT classifier.
+    y_train/y_val: integer class labels (argmax of 5-day fwd returns).
     """
     seq_len      = X_train.shape[1]
     num_features = X_train.shape[2]
-    num_outputs  = int(np.max(y_train)) + 1
+    num_classes  = len(np.unique(y_train))
 
     model = build_tft_model(
-        seq_len=seq_len, num_features=num_features, num_outputs=num_outputs,
-        d_model=d_model, num_heads=num_heads, num_layers=num_layers,
-        dropout_rate=dropout_rate
+        seq_len=seq_len,
+        num_features=num_features,
+        num_classes=num_classes,
+        units=64,
+        num_heads=4,
+        num_attn_layers=2,
+        dropout_rate=0.15
     )
 
-    lr_schedule = tf.keras.optimizers.schedules.CosineDecayRestarts(
-        initial_learning_rate=5e-4, first_decay_steps=500,
-        t_mul=2.0, m_mul=0.9, alpha=1e-5
-    )
     model.compile(
-        optimizer=tf.keras.optimizers.Adam(learning_rate=lr_schedule),
+        optimizer=tf.keras.optimizers.Adam(learning_rate=5e-4),
         loss='sparse_categorical_crossentropy',
         metrics=['accuracy']
     )
 
     callbacks = [
-        EarlyStopping(monitor='val_accuracy', patience=30,
-                      restore_best_weights=True, mode='max', verbose=1),
-        ReduceLROnPlateau(monitor='val_loss', factor=0.5,
-                          patience=10, min_lr=1e-6, verbose=0)
+        EarlyStopping(
+            monitor='val_loss',
+            patience=25,
+            restore_best_weights=True,
+            verbose=0
+        ),
+        ReduceLROnPlateau(
+            monitor='val_loss',
+            factor=0.5,
+            patience=10,
+            min_lr=1e-5,
+            verbose=0
+        )
     ]
 
     history = model.fit(
         X_train, y_train,
         validation_data=(X_val, y_val),
-        epochs=epochs, batch_size=64,
-        callbacks=callbacks, verbose=1, shuffle=True
+        epochs=epochs,
+        batch_size=64,
+        callbacks=callbacks,
+        verbose=0
     )
+
     return model, history
 
 
 def predict_tft(model, X_test):
-    """
-    Run inference with the TFT model.
-    Returns softmax probability array of shape (N, num_classes).
-    """
+    """Returns softmax probability array shape (N, num_classes)."""
     return model.predict(X_test, verbose=0)

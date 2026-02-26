@@ -247,38 +247,62 @@ def smart_update_hf_dataset(new_data, token):
 
 
 def add_regime_features(df):
-    """Add regime detection features"""
-    
+    """Add regime detection features including rate momentum"""
+
     # VIX Regime
     if 'VIX' in df.columns:
-        df['VIX_Regime_Low'] = (df['VIX'] < 15).astype(int)
-        df['VIX_Regime_Med'] = ((df['VIX'] >= 15) & (df['VIX'] < 25)).astype(int)
+        df['VIX_Regime_Low']  = (df['VIX'] < 15).astype(int)
+        df['VIX_Regime_Med']  = ((df['VIX'] >= 15) & (df['VIX'] < 25)).astype(int)
         df['VIX_Regime_High'] = (df['VIX'] >= 25).astype(int)
-    
+
     # Yield Curve Regime
     if 'T10Y2Y' in df.columns:
         df['YC_Inverted'] = (df['T10Y2Y'] < 0).astype(int)
-        df['YC_Flat'] = ((df['T10Y2Y'] >= 0) & (df['T10Y2Y'] < 0.5)).astype(int)
-        df['YC_Steep'] = (df['T10Y2Y'] >= 0.5).astype(int)
-    
+        df['YC_Flat']     = ((df['T10Y2Y'] >= 0) & (df['T10Y2Y'] < 0.5)).astype(int)
+        df['YC_Steep']    = (df['T10Y2Y'] >= 0.5).astype(int)
+
     # Credit Stress Regime
     if 'HY_Spread' in df.columns:
-        df['Credit_Stress_Low'] = (df['HY_Spread'] < 400).astype(int)
-        df['Credit_Stress_Med'] = ((df['HY_Spread'] >= 400) & (df['HY_Spread'] < 600)).astype(int)
+        df['Credit_Stress_Low']  = (df['HY_Spread'] < 400).astype(int)
+        df['Credit_Stress_Med']  = ((df['HY_Spread'] >= 400) & (df['HY_Spread'] < 600)).astype(int)
         df['Credit_Stress_High'] = (df['HY_Spread'] >= 600).astype(int)
-    
+
     # VIX Term Structure Regime
     if 'VIX_Term_Slope' in df.columns:
-        df['VIX_Term_Contango'] = (df['VIX_Term_Slope'] > 2).astype(int)
+        df['VIX_Term_Contango']     = (df['VIX_Term_Slope'] > 2).astype(int)
         df['VIX_Term_Backwardation'] = (df['VIX_Term_Slope'] < -2).astype(int)
-    
-    # Rate Environment
+
+    # Rate Environment (level)
     if 'T10Y3M' in df.columns:
         df['Rates_VeryLow'] = (df['T10Y3M'] < 1.0).astype(int)
-        df['Rates_Low'] = ((df['T10Y3M'] >= 1.0) & (df['T10Y3M'] < 2.0)).astype(int)
-        df['Rates_Normal'] = ((df['T10Y3M'] >= 2.0) & (df['T10Y3M'] < 3.0)).astype(int)
-        df['Rates_High'] = (df['T10Y3M'] >= 3.0).astype(int)
-    
+        df['Rates_Low']     = ((df['T10Y3M'] >= 1.0) & (df['T10Y3M'] < 2.0)).astype(int)
+        df['Rates_Normal']  = ((df['T10Y3M'] >= 2.0) & (df['T10Y3M'] < 3.0)).astype(int)
+        df['Rates_High']    = (df['T10Y3M'] >= 3.0).astype(int)
+
+    # ── Rate momentum & regime change features ────────────────────────────
+    # These tell the model WHETHER rates are rising or falling and HOW FAST
+    # Critical for distinguishing TBT (rising rates) vs TLT (falling rates)
+    if 'T10Y2Y' in df.columns:
+        # Rate of change over multiple windows
+        df['YC_Mom20d']  = df['T10Y2Y'].diff(20)   # 1-month rate change
+        df['YC_Mom60d']  = df['T10Y2Y'].diff(60)   # 3-month rate change
+        # Rising vs falling regime binary flags
+        df['Rates_Rising20d']  = (df['YC_Mom20d'] > 0).astype(int)
+        df['Rates_Falling20d'] = (df['YC_Mom20d'] < 0).astype(int)
+        df['Rates_Rising60d']  = (df['YC_Mom60d'] > 0).astype(int)
+        df['Rates_Falling60d'] = (df['YC_Mom60d'] < 0).astype(int)
+        # Acceleration: is the rate of change itself accelerating?
+        df['YC_Accel'] = df['YC_Mom20d'].diff(20)
+        df['Rates_Accelerating'] = (df['YC_Accel'] > 0).astype(int)
+
+    if 'T10Y3M' in df.columns:
+        df['T10Y3M_Mom20d']     = df['T10Y3M'].diff(20)
+        df['T10Y3M_Mom60d']     = df['T10Y3M'].diff(60)
+        df['T10Y3M_Rising20d']  = (df['T10Y3M_Mom20d'] > 0).astype(int)
+        df['T10Y3M_Falling20d'] = (df['T10Y3M_Mom20d'] < 0).astype(int)
+        df['T10Y3M_Rising60d']  = (df['T10Y3M_Mom60d'] > 0).astype(int)
+        df['T10Y3M_Falling60d'] = (df['T10Y3M_Mom60d'] < 0).astype(int)
+
     return df
 
 
@@ -376,7 +400,8 @@ def get_data(start_year, force_refresh=False, clean_hf_dataset=False):
 
     # Z-score the momentum/rank/trend features too so they're on same scale
     mom_pattern_cols = [c for c in df.columns if any(
-        tag in c for tag in ['_Mom', '_RelSPY', '_Rank', '_Trend']
+        tag in c for tag in ['_Mom', '_RelSPY', '_Rank', '_Trend', 'YC_Mom', 'YC_Accel',
+                              'T10Y3M_Mom', 'T10Y2Y_Mom']
     )]
     for col in mom_pattern_cols:
         rolling_mean = df[col].rolling(60, min_periods=10).mean()

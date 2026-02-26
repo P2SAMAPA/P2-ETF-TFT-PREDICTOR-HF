@@ -35,22 +35,43 @@ def execute_strategy(proba, y_fwd_test, test_dates, target_etfs, fee_bps,
     if daily_ret_override is not None:
         daily_ret_override = filtered_arrays[2]
 
-    strat_rets  = []
-    audit_trail = []
-    daily_rf    = sofr / 252
-    stop_active = False
-    recent_rets = []
-    today       = datetime.now().date()
+    strat_rets       = []
+    audit_trail      = []
+    daily_rf         = sofr / 252
+    stop_active      = False
+    recent_rets      = []         # rolling 2-day buffer for stop check
+    consec_loss_rets = []         # rolling 5-day buffer for consecutive loss check
+    rotated_etf_idx  = None       # set when we've rotated away from top pick
+    today            = datetime.now().date()
 
     for i in range(len(proba)):
-        day_scores = np.array(proba[i], dtype=float)
-        best_idx, day_z, _ = compute_signal_conviction(day_scores)
-        signal_etf = target_etfs[best_idx].replace('_Ret', '')
+        day_scores     = np.array(proba[i], dtype=float)
+        ranked_indices = np.argsort(day_scores)[::-1]    # best → worst
+        best_idx       = int(ranked_indices[0])
+        second_idx     = int(ranked_indices[1]) if len(ranked_indices) > 1 else best_idx
+
+        # ── 5-day consecutive loss rotation ──────────────────────────────────
+        # If top ETF has lost money every single day for 5 days → rotate to #2
+        # Once top ETF has a positive day → rotate back
+        if rotated_etf_idx is not None:
+            top_daily = (float(daily_ret_override[i][best_idx])
+                         if daily_ret_override is not None
+                         else float(y_fwd_test[i][best_idx]))
+            if top_daily > 0:
+                rotated_etf_idx = None   # top pick recovering — return to it
+
+        if rotated_etf_idx is None and len(consec_loss_rets) >= 5:
+            if all(r < 0 for r in consec_loss_rets[-5:]):
+                rotated_etf_idx = second_idx   # rotate to model's #2 pick
+
+        active_idx   = rotated_etf_idx if rotated_etf_idx is not None else best_idx
+        _, day_z, _  = compute_signal_conviction(day_scores)
+        signal_etf   = target_etfs[active_idx].replace('_Ret', '')
 
         if daily_ret_override is not None:
-            realized_ret = float(daily_ret_override[i][best_idx])
+            realized_ret = float(daily_ret_override[i][active_idx])
         else:
-            realized_ret = float(y_fwd_test[i][best_idx])
+            realized_ret = float(y_fwd_test[i][active_idx])
 
         if stop_active:
             if day_z >= z_reentry and day_z >= z_min_entry:
@@ -83,6 +104,14 @@ def execute_strategy(proba, y_fwd_test, test_dates, target_etfs, fee_bps,
         if len(recent_rets) > 2:
             recent_rets.pop(0)
 
+        # Track top-pick's actual daily return for consecutive loss detection
+        top_actual = (float(daily_ret_override[i][best_idx])
+                      if daily_ret_override is not None
+                      else float(y_fwd_test[i][best_idx]))
+        consec_loss_rets.append(top_actual)
+        if len(consec_loss_rets) > 5:
+            consec_loss_rets.pop(0)
+
         trade_date = test_dates[i]
         if trade_date.date() < today:
             audit_trail.append({
@@ -91,7 +120,8 @@ def execute_strategy(proba, y_fwd_test, test_dates, target_etfs, fee_bps,
                 'Conviction_Z': round(day_z, 2),
                 'Realized':     round(realized_ret, 5),
                 'Net_Return':   round(net_ret, 5),
-                'Stop_Active':  stop_active
+                'Stop_Active':  stop_active,
+                'Rotated':      rotated_etf_idx is not None
             })
 
     strat_rets = np.array(strat_rets)

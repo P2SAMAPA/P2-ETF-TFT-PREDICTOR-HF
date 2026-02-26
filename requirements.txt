@@ -1,8 +1,6 @@
 pandas
 numpy<2.0.0
 yfinance
-fredapi
-torch
 scikit-learn
 plotly
 huggingface_hub
@@ -12,5 +10,4 @@ pandas_market_calendars
 datasets
 tensorflow
 pandas-datareader
-xgboost
 pillow>=10.0.0

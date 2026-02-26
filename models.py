@@ -92,23 +92,6 @@ def build_binary_tft(seq_len, num_features, units=64, num_heads=4,
     return Model(inputs=inputs, outputs=output, name='BinaryTFT')
 
 
-def grn_block(x, units, dropout_rate=0.15):
-    """Gated Residual Network."""
-    if x.shape[-1] != units:
-        residual = Dense(units, use_bias=False)(x)
-    else:
-        residual = x
-    h    = Dense(units)(x)
-    h    = Activation('elu')(h)
-    h    = Dense(units)(h)
-    h    = Dropout(dropout_rate)(h)
-    gate = Dense(units, activation='sigmoid')(x)
-    h    = Multiply()([h, gate])
-    out  = Add()([residual, h])
-    out  = LayerNormalization(epsilon=1e-6)(out)
-    return out
-
-
 def train_binary_tft(X_train, y_train, X_val, y_val, etf_name="ETF", epochs=150):
     """
     Train one binary TFT for a single ETF.

@@ -129,3 +129,11 @@ def train_tft(X_train, y_train, X_val, y_val, epochs=200,
         callbacks=callbacks, verbose=1, shuffle=True
     )
     return model, history
+
+
+def predict_tft(model, X_test):
+    """
+    Run inference with the TFT model.
+    Returns softmax probability array of shape (N, num_classes).
+    """
+    return model.predict(X_test, verbose=0)

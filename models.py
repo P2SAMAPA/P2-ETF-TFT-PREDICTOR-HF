@@ -10,6 +10,8 @@ Key components:
   - Sparse categorical cross-entropy loss
 """
 
+import random
+import os
 import numpy as np
 import tensorflow as tf
 from tensorflow.keras.models import Model
@@ -19,6 +21,13 @@ from tensorflow.keras.layers import (
     Multiply, Add, Activation, Conv1D
 )
 from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
+
+# ── Fixed random seed — ensures reproducible results across runs ─────────────
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+tf.random.set_seed(SEED)
+os.environ["PYTHONHASHSEED"] = str(SEED)
 from tensorflow.keras.regularizers import l2
 
 
@@ -120,6 +129,11 @@ def train_tft(X_train, y_train, X_val, y_val, epochs=200):
     Train the TFT classifier.
     y_train/y_val: integer class labels (argmax of 5-day fwd returns).
     """
+    # Re-apply seed immediately before model build for full reproducibility
+    random.seed(SEED)
+    np.random.seed(SEED)
+    tf.random.set_seed(SEED)
+
     seq_len      = X_train.shape[1]
     num_features = X_train.shape[2]
     num_classes  = len(np.unique(y_train))

@@ -121,14 +121,14 @@ def execute_strategy(proba, y_fwd_test, test_dates, target_etfs, fee_bps,
         if len(top_pick_rets) > 5:
             top_pick_rets.pop(0)
 
-        # ── Audit trail — all dates up to and including today ─────────────────
+        # Audit trail: only show CLOSED trading days (exclude today — market not yet closed)
         trade_date = test_dates[i]
         if hasattr(trade_date, 'date'):
             trade_date_val = trade_date.date()
         else:
             trade_date_val = trade_date
 
-        if trade_date_val <= today:
+        if trade_date_val < today:
             audit_trail.append({
                 'Date':         trade_date_val.strftime('%Y-%m-%d'),
                 'Signal':       trade_signal,

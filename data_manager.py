@@ -247,61 +247,68 @@ def smart_update_hf_dataset(new_data, token):
 
 
 def add_regime_features(df):
-    """Add regime detection features including rate momentum"""
+    """Add regime detection features including rate momentum.
+    Uses pd.concat to avoid DataFrame fragmentation warnings."""
+
+    new_cols = {}
 
     # VIX Regime
     if 'VIX' in df.columns:
-        df['VIX_Regime_Low']  = (df['VIX'] < 15).astype(int)
-        df['VIX_Regime_Med']  = ((df['VIX'] >= 15) & (df['VIX'] < 25)).astype(int)
-        df['VIX_Regime_High'] = (df['VIX'] >= 25).astype(int)
+        new_cols['VIX_Regime_Low']  = (df['VIX'] < 15).astype(int)
+        new_cols['VIX_Regime_Med']  = ((df['VIX'] >= 15) & (df['VIX'] < 25)).astype(int)
+        new_cols['VIX_Regime_High'] = (df['VIX'] >= 25).astype(int)
 
     # Yield Curve Regime
     if 'T10Y2Y' in df.columns:
-        df['YC_Inverted'] = (df['T10Y2Y'] < 0).astype(int)
-        df['YC_Flat']     = ((df['T10Y2Y'] >= 0) & (df['T10Y2Y'] < 0.5)).astype(int)
-        df['YC_Steep']    = (df['T10Y2Y'] >= 0.5).astype(int)
+        new_cols['YC_Inverted'] = (df['T10Y2Y'] < 0).astype(int)
+        new_cols['YC_Flat']     = ((df['T10Y2Y'] >= 0) & (df['T10Y2Y'] < 0.5)).astype(int)
+        new_cols['YC_Steep']    = (df['T10Y2Y'] >= 0.5).astype(int)
 
     # Credit Stress Regime
     if 'HY_Spread' in df.columns:
-        df['Credit_Stress_Low']  = (df['HY_Spread'] < 400).astype(int)
-        df['Credit_Stress_Med']  = ((df['HY_Spread'] >= 400) & (df['HY_Spread'] < 600)).astype(int)
-        df['Credit_Stress_High'] = (df['HY_Spread'] >= 600).astype(int)
+        new_cols['Credit_Stress_Low']  = (df['HY_Spread'] < 400).astype(int)
+        new_cols['Credit_Stress_Med']  = ((df['HY_Spread'] >= 400) & (df['HY_Spread'] < 600)).astype(int)
+        new_cols['Credit_Stress_High'] = (df['HY_Spread'] >= 600).astype(int)
 
     # VIX Term Structure Regime
     if 'VIX_Term_Slope' in df.columns:
-        df['VIX_Term_Contango']     = (df['VIX_Term_Slope'] > 2).astype(int)
-        df['VIX_Term_Backwardation'] = (df['VIX_Term_Slope'] < -2).astype(int)
+        new_cols['VIX_Term_Contango']      = (df['VIX_Term_Slope'] > 2).astype(int)
+        new_cols['VIX_Term_Backwardation'] = (df['VIX_Term_Slope'] < -2).astype(int)
 
     # Rate Environment (level)
     if 'T10Y3M' in df.columns:
-        df['Rates_VeryLow'] = (df['T10Y3M'] < 1.0).astype(int)
-        df['Rates_Low']     = ((df['T10Y3M'] >= 1.0) & (df['T10Y3M'] < 2.0)).astype(int)
-        df['Rates_Normal']  = ((df['T10Y3M'] >= 2.0) & (df['T10Y3M'] < 3.0)).astype(int)
-        df['Rates_High']    = (df['T10Y3M'] >= 3.0).astype(int)
+        new_cols['Rates_VeryLow'] = (df['T10Y3M'] < 1.0).astype(int)
+        new_cols['Rates_Low']     = ((df['T10Y3M'] >= 1.0) & (df['T10Y3M'] < 2.0)).astype(int)
+        new_cols['Rates_Normal']  = ((df['T10Y3M'] >= 2.0) & (df['T10Y3M'] < 3.0)).astype(int)
+        new_cols['Rates_High']    = (df['T10Y3M'] >= 3.0).astype(int)
 
-    # ── Rate momentum & regime change features ────────────────────────────
-    # These tell the model WHETHER rates are rising or falling and HOW FAST
-    # Critical for distinguishing TBT (rising rates) vs TLT (falling rates)
+    # Rate momentum & regime change features
     if 'T10Y2Y' in df.columns:
-        # Rate of change over multiple windows
-        df['YC_Mom20d']  = df['T10Y2Y'].diff(20)   # 1-month rate change
-        df['YC_Mom60d']  = df['T10Y2Y'].diff(60)   # 3-month rate change
-        # Rising vs falling regime binary flags
-        df['Rates_Rising20d']  = (df['YC_Mom20d'] > 0).astype(int)
-        df['Rates_Falling20d'] = (df['YC_Mom20d'] < 0).astype(int)
-        df['Rates_Rising60d']  = (df['YC_Mom60d'] > 0).astype(int)
-        df['Rates_Falling60d'] = (df['YC_Mom60d'] < 0).astype(int)
-        # Acceleration: is the rate of change itself accelerating?
-        df['YC_Accel'] = df['YC_Mom20d'].diff(20)
-        df['Rates_Accelerating'] = (df['YC_Accel'] > 0).astype(int)
+        yc_mom20 = df['T10Y2Y'].diff(20)
+        yc_mom60 = df['T10Y2Y'].diff(60)
+        new_cols['YC_Mom20d']        = yc_mom20
+        new_cols['YC_Mom60d']        = yc_mom60
+        new_cols['Rates_Rising20d']  = (yc_mom20 > 0).astype(int)
+        new_cols['Rates_Falling20d'] = (yc_mom20 < 0).astype(int)
+        new_cols['Rates_Rising60d']  = (yc_mom60 > 0).astype(int)
+        new_cols['Rates_Falling60d'] = (yc_mom60 < 0).astype(int)
+        yc_accel = yc_mom20.diff(20)
+        new_cols['YC_Accel']            = yc_accel
+        new_cols['Rates_Accelerating']  = (yc_accel > 0).astype(int)
 
     if 'T10Y3M' in df.columns:
-        df['T10Y3M_Mom20d']     = df['T10Y3M'].diff(20)
-        df['T10Y3M_Mom60d']     = df['T10Y3M'].diff(60)
-        df['T10Y3M_Rising20d']  = (df['T10Y3M_Mom20d'] > 0).astype(int)
-        df['T10Y3M_Falling20d'] = (df['T10Y3M_Mom20d'] < 0).astype(int)
-        df['T10Y3M_Rising60d']  = (df['T10Y3M_Mom60d'] > 0).astype(int)
-        df['T10Y3M_Falling60d'] = (df['T10Y3M_Mom60d'] < 0).astype(int)
+        t3m_mom20 = df['T10Y3M'].diff(20)
+        t3m_mom60 = df['T10Y3M'].diff(60)
+        new_cols['T10Y3M_Mom20d']     = t3m_mom20
+        new_cols['T10Y3M_Mom60d']     = t3m_mom60
+        new_cols['T10Y3M_Rising20d']  = (t3m_mom20 > 0).astype(int)
+        new_cols['T10Y3M_Falling20d'] = (t3m_mom20 < 0).astype(int)
+        new_cols['T10Y3M_Rising60d']  = (t3m_mom60 > 0).astype(int)
+        new_cols['T10Y3M_Falling60d'] = (t3m_mom60 < 0).astype(int)
+
+    # Concat all new columns at once — avoids DataFrame fragmentation
+    if new_cols:
+        df = pd.concat([df, pd.DataFrame(new_cols, index=df.index)], axis=1)
 
     return df
 

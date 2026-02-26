@@ -44,10 +44,9 @@ with st.sidebar:
     st.divider()
 
     st.subheader("🧠 TFT Training")
-    epochs   = st.number_input("Max Epochs", 50, 500, 200, step=25,
-                               help="Early stopping will halt before this if val_loss plateaus")
     st.caption("Architecture: VSN → GRN → 2× Multi-Head Attention (4 heads) → Softmax")
     st.caption("⚙️ Lookback auto-optimised across 20/30/40/50/60 days on validation set")
+    st.caption("⚙️ Max epochs: 150 (early stopping active — typically stops at 25–50)")
 
     st.divider()
 
@@ -245,7 +244,7 @@ if run_button:
 
     # ── Train TFT ─────────────────────────────────────────────────────────────
     with st.spinner(f"🧠 Training TFT (up to {epochs} epochs, early stopping active)..."):
-        model, history = train_tft(X_train, y_train, X_val, y_val, epochs=int(epochs))
+        model, history = train_tft(X_train, y_train, X_val, y_val, epochs=150)
         actual_epochs  = len(history.history['loss'])
         st.success(f"✅ Training complete — stopped at epoch {actual_epochs}")
 

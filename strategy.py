@@ -24,68 +24,64 @@ def execute_strategy(proba, y_fwd_test, test_dates, target_etfs, fee_bps,
                      stop_loss_pct=-0.12, z_reentry=1.0,
                      sofr=0.045, z_min_entry=0.5,
                      daily_ret_override=None):
+    """
+    Execute strategy on test set.
+    NOTE: We do NOT filter by NYSE calendar here — test_dates already come
+    from the dataset which only contains trading days. Calendar filtering
+    was dropping recent dates due to calendar library lag.
+    """
+    # Convert to pandas DatetimeIndex if needed
+    if not isinstance(test_dates, pd.DatetimeIndex):
+        test_dates = pd.DatetimeIndex(test_dates)
 
-    # ── Filter to NYSE trading days ──────────────────────────────────────────
-    arrays_to_filter = [proba, y_fwd_test]
+    # Convert arrays to numpy
+    proba      = np.array(proba)
+    y_fwd_test = np.array(y_fwd_test)
     if daily_ret_override is not None:
-        arrays_to_filter.append(daily_ret_override)
-
-    filtered_dates, filtered_arrays = filter_to_trading_days(test_dates, arrays_to_filter)
-
-    # Safety: if filter dropped too many dates (calendar issue), use original
-    if len(filtered_dates) < len(test_dates) * 0.8:
-        filtered_dates  = test_dates
-        filtered_arrays = arrays_to_filter
-
-    test_dates = filtered_dates
-    proba      = filtered_arrays[0]
-    y_fwd_test = filtered_arrays[1]
-    if daily_ret_override is not None:
-        daily_ret_override = filtered_arrays[2]
+        daily_ret_override = np.array(daily_ret_override)
 
     strat_rets      = []
     audit_trail     = []
     daily_rf        = sofr / 252
     stop_active     = False
-    recent_rets     = []    # rolling 2-day buffer for stop-loss check
-    top_pick_rets   = []    # rolling 5-day buffer of TOP PICK's actual daily returns
-                            # (always tracks #1 ranked ETF regardless of rotation)
-    rotated_etf_idx = None  # None = use top pick; int = rotated to this index
+    recent_rets     = []   # last 2 net returns for stop-loss check
+    top_pick_rets   = []   # last 5 TOP-PICK actual daily returns for rotation
+    rotated_etf_idx = None
     today           = datetime.now().date()
 
     for i in range(len(proba)):
         day_scores     = np.array(proba[i], dtype=float)
-        ranked_indices = np.argsort(day_scores)[::-1]   # best → worst
+        ranked_indices = np.argsort(day_scores)[::-1]
         best_idx       = int(ranked_indices[0])
         second_idx     = int(ranked_indices[1]) if len(ranked_indices) > 1 else best_idx
 
-        # ── Get top pick's actual return for this day (for rotation tracking) ─
+        # Top pick's actual daily return (always track #1 pick for rotation)
         top_actual = (float(daily_ret_override[i][best_idx])
                       if daily_ret_override is not None
                       else float(y_fwd_test[i][best_idx]))
 
         # ── 5-day consecutive loss rotation ──────────────────────────────────
-        # Evaluate BEFORE appending today — buffer contains last 5 completed days
-        # Rule: if top pick lost every day for 5 consecutive days → rotate to #2
-        # Recovery: as soon as top pick has a positive day → rotate back to #1
+        # Buffer contains PREVIOUS days' returns (appended at end of loop)
+        # So on day i, top_pick_rets has returns from days [i-5 .. i-1]
+        # Check: all 5 previous days negative → rotate to #2
+        # Recovery: top pick positive today → rotate back to #1
         if rotated_etf_idx is not None:
-            # Already rotated — check if top pick recovered
+            # Currently rotated — check if top pick has recovered today
             if top_actual > 0:
-                rotated_etf_idx = None   # top pick positive → return to it
-        else:
-            # Not rotated — check if 5 consecutive losses warrant rotation
-            if len(top_pick_rets) >= 5 and all(r < 0 for r in top_pick_rets[-5:]):
+                rotated_etf_idx = None
+        
+        # Only check rotation trigger if not already rotated
+        if rotated_etf_idx is None and len(top_pick_rets) >= 5:
+            if all(r < 0 for r in top_pick_rets[-5:]):
                 rotated_etf_idx = second_idx
 
-        # ── Active ETF for today ──────────────────────────────────────────────
-        active_idx = rotated_etf_idx if rotated_etf_idx is not None else best_idx
+        active_idx  = rotated_etf_idx if rotated_etf_idx is not None else best_idx
         _, day_z, _ = compute_signal_conviction(day_scores)
         signal_etf  = target_etfs[active_idx].replace('_Ret', '')
 
-        if daily_ret_override is not None:
-            realized_ret = float(daily_ret_override[i][active_idx])
-        else:
-            realized_ret = float(y_fwd_test[i][active_idx])
+        realized_ret = (float(daily_ret_override[i][active_idx])
+                        if daily_ret_override is not None
+                        else float(y_fwd_test[i][active_idx]))
 
         # ── Stop-loss + conviction gate ───────────────────────────────────────
         if stop_active:
@@ -116,7 +112,7 @@ def execute_strategy(proba, y_fwd_test, test_dates, target_etfs, fee_bps,
 
         strat_rets.append(net_ret)
 
-        # Update rolling buffers AFTER trade decision
+        # ── Update rolling buffers AFTER decision ────────────────────────────
         recent_rets.append(net_ret)
         if len(recent_rets) > 2:
             recent_rets.pop(0)
@@ -125,11 +121,16 @@ def execute_strategy(proba, y_fwd_test, test_dates, target_etfs, fee_bps,
         if len(top_pick_rets) > 5:
             top_pick_rets.pop(0)
 
-        # ── Audit trail — include all dates up to and including today ────────
+        # ── Audit trail — all dates up to and including today ─────────────────
         trade_date = test_dates[i]
-        if trade_date.date() <= today:
+        if hasattr(trade_date, 'date'):
+            trade_date_val = trade_date.date()
+        else:
+            trade_date_val = trade_date
+
+        if trade_date_val <= today:
             audit_trail.append({
-                'Date':         trade_date.strftime('%Y-%m-%d'),
+                'Date':         trade_date_val.strftime('%Y-%m-%d'),
                 'Signal':       trade_signal,
                 'Conviction_Z': round(day_z, 2),
                 'Net_Return':   round(net_ret, 5),

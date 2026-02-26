@@ -113,7 +113,7 @@ def execute_strategy(proba, y_fwd_test, test_dates, target_etfs, fee_bps,
             consec_loss_rets.pop(0)
 
         trade_date = test_dates[i]
-        if trade_date.date() < today:
+        if trade_date.date() <= today:
             audit_trail.append({
                 'Date':         trade_date.strftime('%Y-%m-%d'),
                 'Signal':       trade_signal,

@@ -23,6 +23,12 @@ from utils import get_est_time
 REPO_ID = "P2SAMAPA/my-etf-data"
 
 
+# ── UPDATED ETF LIST ─────────────────────────────────────────────────────────
+# Removed: TBT
+# Added: VCIT, LQD, HYG (Fixed Income ETFs)
+ETF_LIST = ["TLT", "VCIT", "LQD", "HYG", "VNQ", "SLV", "GLD", "AGG", "SPY"]
+
+
 def fetch_macro_data_robust(start_date="2008-01-01"):
     """Fetch macro signals from multiple sources with proper error handling"""
     all_data = []
@@ -374,9 +380,8 @@ def get_data(start_year, force_refresh=False, clean_hf_dataset=False):
         sync_reason = "🔄 Manual Refresh" if force_refresh else "🔄 Sync Window Active"
         
         with st.status(f"{sync_reason} - Updating Dataset...", expanded=False):
-            etf_list = ["TLT", "TBT", "VNQ", "SLV", "GLD", "AGG", "SPY"]
-            
-            etf_data = fetch_etf_data(etf_list)
+            # Use centralized ETF_LIST constant
+            etf_data = fetch_etf_data(ETF_LIST)
             macro_data = fetch_macro_data_robust()
             
             if not etf_data.empty and not macro_data.empty:
@@ -387,8 +392,8 @@ def get_data(start_year, force_refresh=False, clean_hf_dataset=False):
     # Fetch fresh if still empty
     if df.empty:
         st.warning("📊 Fetching fresh data...")
-        etf_list = ["TLT", "TBT", "VNQ", "SLV", "GLD", "AGG", "SPY"]
-        etf_data = fetch_etf_data(etf_list)
+        # Use centralized ETF_LIST constant
+        etf_data = fetch_etf_data(ETF_LIST)
         macro_data = fetch_macro_data_robust()
         
         if not etf_data.empty and not macro_data.empty:

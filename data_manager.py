@@ -230,10 +230,17 @@ def smart_update_hf_dataset(new_data, token, force_upload=False):
                 st.info(f"📋 Sample data:\n{sample.to_string()}")
             out_df = combined.reset_index()
             st.info(f"📋 CSV will have {len(out_df)} rows, {len(out_df.columns)} columns")
-            out_df.to_csv("etf_data.csv", index=False)
+            # Write to a unique filename to avoid any file caching issues
+            import time
+            csv_filename = f"etf_data_{int(time.time())}.csv"
+            out_df.to_csv(csv_filename, index=False)
+            # Verify file on disk before upload
+            verify = pd.read_csv(csv_filename, nrows=5)
+            new_etf_check = [c for c in ["VCIT_Ret","LQD_Ret","HYG_Ret"] if c in verify.columns]
+            st.info(f"📋 File on disk check — new ETF cols: {new_etf_check}, shape: {verify.shape}")
             api = HfApi()
             api.upload_file(
-                path_or_fileobj="etf_data.csv",
+                path_or_fileobj=csv_filename,
                 path_in_repo="etf_data.csv",
                 repo_id=REPO_ID,
                 repo_type="dataset",
@@ -352,7 +359,7 @@ def get_data(start_year, force_refresh=False, clean_hf_dataset=False):
                     df.reset_index().to_csv("etf_data.csv", index=False)
                     api = HfApi()
                     api.upload_file(
-                        path_or_fileobj="etf_data.csv",
+                        path_or_fileobj=csv_filename,
                         path_in_repo="etf_data.csv",
                         repo_id=REPO_ID,
                         repo_type="dataset",

@@ -152,7 +152,10 @@ def smart_update_hf_dataset(new_data, token, force_upload=False):
     raw_url = f"https://huggingface.co/datasets/{REPO_ID}/resolve/main/etf_data.csv"
 
     try:
-        existing_df = pd.read_csv(raw_url)
+        # Cache-bust the HF CDN so we always read the latest version
+        import time
+        bust_url = f"{raw_url}?t={int(time.time())}"
+        existing_df = pd.read_csv(bust_url)
         existing_df.columns = existing_df.columns.str.strip()
         date_col = next(
             (c for c in existing_df.columns if c.lower() in ["date", "unnamed: 0"]),
@@ -319,7 +322,8 @@ def get_data(start_year, force_refresh=False, clean_hf_dataset=False):
 
     # ── Load from HuggingFace ─────────────────────────────────────────────────
     try:
-        df = pd.read_csv(raw_url)
+        import time
+        df = pd.read_csv(f"{raw_url}?t={int(time.time())}")
         df.columns = df.columns.str.strip()
         date_col = next(
             (c for c in df.columns if c.lower() in ["date", "unnamed: 0"]), df.columns[0]

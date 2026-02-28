@@ -191,7 +191,7 @@ def fetch_etf_data(etfs, start_date="2008-01-01"):
         return pd.DataFrame()
 
 
-def smart_update_hf_dataset(new_data, token):
+def smart_update_hf_dataset(new_data, token, force_upload=False):
     """Smart update: Only uploads if new data exists or gaps are filled.
     
     Handles new ETFs added to ETF_LIST: detects columns present in new_data
@@ -265,7 +265,7 @@ def smart_update_hf_dataset(new_data, token):
 
         # Force upload if new ETFs were backfilled (filled_gaps may undercount
         # because existing_df was reindexed to match the new date union)
-        needs_update = new_rows > 0 or filled_gaps > 0 or len(new_etf_cols) > 0
+        needs_update = force_upload or new_rows > 0 or filled_gaps > 0 or len(new_etf_cols) > 0
         
         if needs_update:
             combined.index.name = "Date"
@@ -278,7 +278,7 @@ def smart_update_hf_dataset(new_data, token):
                 repo_id=REPO_ID,
                 repo_type="dataset",
                 token=token,
-                commit_message=f"Update: {get_est_time().strftime('%Y-%m-%d %H:%M EST')} | +{new_rows} rows, filled {filled_gaps} gaps" + (f", backfilled {new_etf_cols}" if new_etf_cols else "")
+                commit_message=("FORCE " if force_upload else "") + f"Update: {get_est_time().strftime('%Y-%m-%d %H:%M EST')} | +{new_rows} rows, filled {filled_gaps} gaps" + (f", backfilled {new_etf_cols}" if new_etf_cols else ""),
             )
             
             st.success(f"✅ Dataset updated: +{new_rows} rows, filled {filled_gaps} gaps")
@@ -397,7 +397,7 @@ def get_data(start_year, force_refresh=False, clean_hf_dataset=False):
             if not etf_data.empty and not macro_data.empty:
                 new_df = pd.concat([etf_data, macro_data], axis=1)
                 token = os.getenv("HF_TOKEN")
-                df = smart_update_hf_dataset(new_df, token)
+                df = smart_update_hf_dataset(new_df, token, force_upload=force_refresh)
     
     # Fetch fresh if still empty
     if df.empty:

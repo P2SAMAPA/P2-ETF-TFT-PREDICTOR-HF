@@ -218,7 +218,16 @@ def smart_update_hf_dataset(new_data, token, force_upload=False):
 
         if needs_update:
             combined.index.name = "Date"
-            combined.reset_index().to_csv("etf_data.csv", index=False)
+            # Verify new ETFs are in combined before writing
+            missing = [e for e in ["VCIT","LQD","HYG"] if f"{e}_Ret" not in combined.columns]
+            present = [e for e in ["VCIT","LQD","HYG"] if f"{e}_Ret" in combined.columns]
+            st.info(f"📋 Pre-upload check — new ETFs present: {present} | missing: {missing}")
+            if present:
+                sample = combined[[f"{e}_Ret" for e in present]].dropna().head(3)
+                st.info(f"📋 Sample data:\n{sample.to_string()}")
+            out_df = combined.reset_index()
+            st.info(f"📋 CSV will have {len(out_df)} rows, {len(out_df.columns)} columns")
+            out_df.to_csv("etf_data.csv", index=False)
             api = HfApi()
             api.upload_file(
                 path_or_fileobj="etf_data.csv",

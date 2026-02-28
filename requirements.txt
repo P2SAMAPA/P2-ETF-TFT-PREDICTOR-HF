@@ -11,3 +11,4 @@ datasets
 tensorflow
 pandas-datareader
 pillow>=10.0.0
+scikit-learn

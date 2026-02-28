@@ -163,41 +163,38 @@ def smart_update_hf_dataset(new_data, token, force_upload=False):
         if existing_df.index.tz is not None:
             existing_df.index = existing_df.index.tz_localize(None)
 
-        # ── Step 1: merge recent new_data on top of existing ─────────────────
-        combined = new_data.combine_first(existing_df)
+        # ── Step 1: fetch FULL history for all target ETFs from 2008 ─────────
+        # Always fetch full history so new ETFs get complete backfill and
+        # existing ETFs stay current. This is the authoritative data source.
+        st.info("📡 Fetching full ETF history from 2008...")
+        full_etf = fetch_etf_data(ETF_LIST, start_date="2008-01-01")
+        if full_etf.index.tz is not None:
+            full_etf.index = full_etf.index.tz_localize(None)
 
-        # ── Step 2: detect ETFs missing / all-NaN in existing dataset ────────
-        new_etf_cols = []
-        all_etfs = [c.replace("_Ret", "") for c in new_data.columns if c.endswith("_Ret")]
-        for etf in all_etfs:
-            ret_col = f"{etf}_Ret"
-            if ret_col not in existing_df.columns or existing_df[ret_col].isna().mean() > 0.9:
-                new_etf_cols.append(etf)
-
+        # Detect which ETFs are new (missing or all-NaN in existing dataset)
+        new_etf_cols = [
+            etf for etf in ETF_LIST
+            if f"{etf}_Ret" not in existing_df.columns
+            or existing_df[f"{etf}_Ret"].isna().mean() > 0.9
+        ]
         if new_etf_cols:
-            st.info(f"🆕 New ETFs detected: {new_etf_cols} — fetching full history from 2008...")
-            full_history = fetch_etf_data(new_etf_cols, start_date="2008-01-01")
-            if not full_history.empty:
-                if full_history.index.tz is not None:
-                    full_history.index = full_history.index.tz_localize(None)
-                # Expand combined to cover all dates in full_history
-                full_index = combined.index.union(full_history.index)
-                combined   = combined.reindex(full_index)
-                # Write full history directly into combined (overwrites NaN-only columns)
-                cols_to_backfill = [
-                    c for c in full_history.columns
-                    if c not in combined.columns or combined[c].isna().mean() > 0.9
-                ]
-                for col in cols_to_backfill:
-                    combined[col] = full_history.reindex(full_index)[col]
-                st.success(
-                    f"✅ Full history fetched for {new_etf_cols}: "
-                    f"{len(full_history)} rows "
-                    f"({full_history.index[0].date()} → {full_history.index[-1].date()}), "
-                    f"{len(cols_to_backfill)} columns backfilled"
+            st.info(f"🆕 New ETFs: {new_etf_cols} — will be fully backfilled")
+
+        # ── Step 2: build combined — full ETF history + existing macro ────────
+        # Start from existing, expand index to cover all ETF dates
+        full_index = existing_df.index.union(full_etf.index)
+        combined   = existing_df.reindex(full_index)
+        # Write all ETF columns from full history (overwrites stale/NaN data)
+        for col in full_etf.columns:
+            combined[col] = full_etf.reindex(full_index)[col]
+        # Merge in any macro columns from new_data not already in combined
+        for col in new_data.columns:
+            if col not in full_etf.columns:
+                combined[col] = new_data.reindex(full_index)[col].combine_first(
+                    combined.get(col, pd.Series(dtype=float))
                 )
-            else:
-                st.warning(f"⚠️ Could not fetch full history for {new_etf_cols}")
+        st.success(f"✅ ETF history: {len(full_etf)} rows, {len(full_etf.columns)} columns"
+                   + (f" | New ETFs backfilled: {new_etf_cols}" if new_etf_cols else ""))
 
         # ── Step 3: decide whether to upload ─────────────────────────────────
         new_rows    = len(combined) - len(existing_df)

@@ -254,13 +254,18 @@ def smart_update_hf_dataset(new_data, token):
                 st.warning(f"⚠️ Could not fetch full history for {new_etf_cols}")
 
         combined = new_data.combine_first(existing_df)
-        
-        new_rows = len(combined) - len(existing_df)
-        old_nulls = existing_df.isna().sum().sum()
-        new_nulls = combined.isna().sum().sum()
+
+        # Count changes — compare against original existing_df row count
+        # (existing_df may have been reindexed above if new ETFs were added)
+        original_row_count = len(pd.read_csv(raw_url, nrows=1)) if False else None
+        new_rows    = len(combined) - len(existing_df)
+        old_nulls   = existing_df.isna().sum().sum()
+        new_nulls   = combined.isna().sum().sum()
         filled_gaps = old_nulls - new_nulls
-        
-        needs_update = new_rows > 0 or filled_gaps > 0
+
+        # Force upload if new ETFs were backfilled (filled_gaps may undercount
+        # because existing_df was reindexed to match the new date union)
+        needs_update = new_rows > 0 or filled_gaps > 0 or len(new_etf_cols) > 0
         
         if needs_update:
             combined.index.name = "Date"
@@ -273,7 +278,7 @@ def smart_update_hf_dataset(new_data, token):
                 repo_id=REPO_ID,
                 repo_type="dataset",
                 token=token,
-                commit_message=f"Update: {get_est_time().strftime('%Y-%m-%d %H:%M EST')} | +{new_rows} rows, filled {filled_gaps} gaps"
+                commit_message=f"Update: {get_est_time().strftime('%Y-%m-%d %H:%M EST')} | +{new_rows} rows, filled {filled_gaps} gaps" + (f", backfilled {new_etf_cols}" if new_etf_cols else "")
             )
             
             st.success(f"✅ Dataset updated: +{new_rows} rows, filled {filled_gaps} gaps")

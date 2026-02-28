@@ -50,7 +50,7 @@ with st.sidebar:
     st.divider()
 
     st.subheader("🧠 TFT Training")
-    st.caption("Architecture: 5 Binary TFTs — each predicts P(ETF beats cash next 5d)")
+    st.caption(f"Architecture: {len(TARGET_ETFS) if 'TARGET_ETFS' in dir() else 7} Binary TFTs — each predicts P(ETF beats cash next 5d)")
     st.caption("⚙️ Lookback auto-optimised · Max 150 epochs · Early stopping active")
 
     st.divider()
@@ -97,7 +97,7 @@ st.caption("Temporal Fusion Transformer — Fixed Income ETF Rotation")
 if refresh_only_button:
     st.info("🔄 Refreshing dataset...")
     with st.status("📡 Fetching fresh data...", expanded=True):
-        etf_list   = ["TLT", "VCIT", "LQD", "HYG", "VNQ", "SLV", "GLD", "AGG", "SPY"]
+        etf_list   = ["TLT", "TBT", "VNQ", "SLV", "GLD", "AGG", "SPY"]
         etf_data   = fetch_etf_data(etf_list)
         macro_data = fetch_macro_data_robust()
         if not etf_data.empty and not macro_data.empty:
@@ -131,7 +131,7 @@ if run_button:
     st.write(f"📅 **Data:** {df.index[0].date()} → {df.index[-1].date()} ({years} years)")
 
     # ── Identify targets and features ─────────────────────────────────────────
-    TARGET_ETFS = ['TLT', 'VCIT', 'LQD', 'HYG', 'VNQ', 'SLV', 'GLD']
+    TARGET_ETFS = ['TLT', 'TBT', 'VNQ', 'SLV', 'GLD']
     target_etfs = [c for c in df.columns
                    if c.endswith('_Ret') and any(e in c for e in TARGET_ETFS)]
 
@@ -286,9 +286,9 @@ if run_button:
 
     st.success(f"✅ Split → Train: {len(X_train)} | Val: {len(X_val)} | Test: {len(X_test)}")
 
-    # ── Train 5 binary TFTs (one per ETF) ────────────────────────────────────
+    # ── Train binary TFTs (one per ETF) ──────────────────────────────────────
     etf_names = [e.replace('_Ret', '') for e in target_etfs]
-    with st.spinner("🧠 Training 5 Binary TFTs (one per ETF, early stopping active)..."):
+    with st.spinner(f"🧠 Training {len(target_etfs)} Binary TFTs (one per ETF, early stopping active)..."):
         models, histories = train_all_binary_tfts(
             X_train, y_bin_train, X_val, y_bin_val,
             etf_names=etf_names, epochs=150
@@ -520,7 +520,7 @@ if run_button:
     <div style="background:#1a1a2e;border:1px solid #2d2d4e;border-radius:12px;
                 padding:28px 32px;color:#e0e0e0;font-size:14px;line-height:1.8;">
 
-    <h4 style="color:#00d1b2;margin-top:0;">🏗️ Model Architecture — 5 Binary Temporal Fusion Transformers</h4>
+    <h4 style="color:#00d1b2;margin-top:0;">🏗️ Model Architecture — 7 Binary Temporal Fusion Transformers</h4>
     <p>Instead of a single 5-class model (which tends to lock onto one dominant ETF), we train
     <b>one independent binary TFT per ETF</b>. Each model answers a focused question:
     <em>"Will this ETF beat the risk-free rate (3M T-Bill) over the next 5 trading days?"</em>
@@ -562,7 +562,7 @@ if run_button:
           (Inverted/Flat/Steep), credit stress levels, rate environment (VeryLow/Low/Normal/High)</li>
       <li><b>Rate momentum (new):</b> 20d and 60d rate-of-change on T10Y2Y and T10Y3M,
           rising/falling binary flags at both horizons, rate acceleration — critical for
-          distinguishing rate-sensitive ETFs (VCIT, LQD, HYG) from TLT regimes</li>
+          distinguishing TBT (rising rates) from TLT (falling rates) regimes</li>
       <li><b>ETF momentum:</b> 5d/10d/21d/63d rolling returns per ETF, relative strength
           vs SPY (21d), cross-sectional rank percentile (21d/63d), 5d/10d price trend</li>
     </ul>
@@ -590,8 +590,8 @@ if run_button:
           ({len(strat_rets)} trading days). Past performance does not guarantee future results</li>
       <li>SLV (silver ETF) is highly volatile — single-day moves of ±10% are not uncommon,
           as seen in the -28.69% worst day. Position sizing in live trading should reflect this</li>
-      <li>VCIT, LQD and HYG are credit ETFs with duration and spread risk — in risk-off
-          environments credit spreads can widen sharply causing simultaneous losses</li>
+      <li>TBT is a 2× leveraged inverse bond ETF with daily rebalancing decay — holding it
+          for extended periods in sideways markets erodes value even if rates are flat</li>
       <li>The model is retrained from scratch on each run — results may vary slightly between
           runs due to random weight initialisation</li>
       <li>This tool is for research and educational purposes only and does not constitute

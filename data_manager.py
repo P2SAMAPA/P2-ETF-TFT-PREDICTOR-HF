@@ -163,40 +163,53 @@ def smart_update_hf_dataset(new_data, token, force_upload=False):
         if existing_df.index.tz is not None:
             existing_df.index = existing_df.index.tz_localize(None)
 
-        # ── Step 1: fetch FULL history for all target ETFs from 2008 ─────────
-        # Always fetch full history so new ETFs get complete backfill and
-        # existing ETFs stay current. This is the authoritative data source.
+        # ── Step 1: fetch FULL ETF history from 2008 ───────────────────────
         st.info("📡 Fetching full ETF history from 2008...")
         full_etf = fetch_etf_data(ETF_LIST, start_date="2008-01-01")
         if full_etf.index.tz is not None:
             full_etf.index = full_etf.index.tz_localize(None)
+        st.info(f"📊 Full ETF fetch: {len(full_etf)} rows, columns: {list(full_etf.columns)}")
 
-        # Detect which ETFs are new (missing or all-NaN in existing dataset)
+        # Detect new ETFs for reporting
         new_etf_cols = [
             etf for etf in ETF_LIST
             if f"{etf}_Ret" not in existing_df.columns
             or existing_df[f"{etf}_Ret"].isna().mean() > 0.9
         ]
         if new_etf_cols:
-            st.info(f"🆕 New ETFs: {new_etf_cols} — will be fully backfilled")
+            st.info(f"🆕 New ETFs detected: {new_etf_cols}")
 
-        # ── Step 2: build combined — full ETF history + existing macro ────────
-        # Start from existing, expand index to cover all ETF dates
-        full_index = existing_df.index.union(full_etf.index)
-        combined   = existing_df.reindex(full_index)
-        # Write all ETF columns from full history (overwrites stale/NaN data)
-        for col in full_etf.columns:
-            combined[col] = full_etf.reindex(full_index)[col]
-        # Merge in any macro columns from new_data not already in combined
-        for col in new_data.columns:
-            if col not in full_etf.columns:
-                combined[col] = new_data.reindex(full_index)[col].combine_first(
-                    combined.get(col, pd.Series(dtype=float))
-                )
-        st.success(f"✅ ETF history: {len(full_etf)} rows, {len(full_etf.columns)} columns"
-                   + (f" | New ETFs backfilled: {new_etf_cols}" if new_etf_cols else ""))
+        # ── Step 2: extract macro columns from existing_df ───────────────────
+        # Macro cols = everything in existing_df that is NOT an ETF column
+        etf_col_names = [c for c in existing_df.columns
+                         if any(c.startswith(f"{e}_") for e in
+                                ["TLT","TBT","VCIT","LQD","HYG","VNQ","SLV","GLD","AGG","SPY"])]
+        macro_col_names = [c for c in existing_df.columns if c not in etf_col_names]
+        macro_existing  = existing_df[macro_col_names].copy()
+        st.info(f"📊 Macro cols from existing: {macro_col_names}")
 
-        # ── Step 3: decide whether to upload ─────────────────────────────────
+        # ── Step 3: build combined from scratch using pd.concat ──────────────
+        # ETF data: full_etf (authoritative, full history)
+        # Macro data: new_data macro cols combined_first with existing macro
+        macro_new_cols = [c for c in new_data.columns
+                          if not any(c.startswith(f"{e}_") for e in
+                                     ["TLT","TBT","VCIT","LQD","HYG","VNQ","SLV","GLD","AGG","SPY"])]
+        macro_new = new_data[macro_new_cols].copy() if macro_new_cols else pd.DataFrame()
+
+        if not macro_new.empty:
+            macro_combined = macro_new.combine_first(macro_existing)
+        else:
+            macro_combined = macro_existing
+
+        # Align on union of all dates
+        full_index = full_etf.index.union(macro_combined.index)
+        etf_aligned   = full_etf.reindex(full_index)
+        macro_aligned = macro_combined.reindex(full_index)
+
+        combined = pd.concat([etf_aligned, macro_aligned], axis=1)
+        st.info(f"📊 Combined shape: {combined.shape} | ETF cols: {len(full_etf.columns)} | Macro cols: {len(macro_col_names)}")
+
+        # ── Step 4: decide whether to upload ─────────────────────────────────
         new_rows    = len(combined) - len(existing_df)
         old_nulls   = existing_df.isna().sum().sum()
         new_nulls   = combined.isna().sum().sum()

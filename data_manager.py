@@ -23,12 +23,6 @@ from utils import get_est_time
 REPO_ID = "P2SAMAPA/my-etf-data"
 
 
-# ── UPDATED ETF LIST ─────────────────────────────────────────────────────────
-# Removed: TBT
-# Added: VCIT, LQD, HYG (Fixed Income ETFs)
-ETF_LIST = ["TLT", "VCIT", "LQD", "HYG", "VNQ", "SLV", "GLD", "AGG", "SPY"]
-
-
 def fetch_macro_data_robust(start_date="2008-01-01"):
     """Fetch macro signals from multiple sources with proper error handling"""
     all_data = []
@@ -117,7 +111,7 @@ def fetch_macro_data_robust(start_date="2008-01-01"):
     if all_data:
         combined = pd.concat(all_data, axis=1, join='outer')
         combined = combined.loc[:, ~combined.columns.duplicated()]
-        combined = combined.ffill(limit=5)
+        combined = combined.fillna(method='ffill', limit=5)
         return combined
     else:
         st.error("❌ Failed to fetch any macro data!")
@@ -198,7 +192,13 @@ def fetch_etf_data(etfs, start_date="2008-01-01"):
 
 
 def smart_update_hf_dataset(new_data, token):
-    """Smart update: Only uploads if new data exists or gaps are filled"""
+    """Smart update: Only uploads if new data exists or gaps are filled.
+    
+    Handles new ETFs added to ETF_LIST: detects columns present in new_data
+    but missing from existing HF dataset, fetches their full history, and
+    backfills before merging — so the full history is populated, not just
+    recent days.
+    """
     if not token:
         st.warning("⚠️ No HF_TOKEN found. Skipping dataset update.")
         return new_data
@@ -217,7 +217,41 @@ def smart_update_hf_dataset(new_data, token):
         
         if existing_df.index.tz is not None:
             existing_df.index = existing_df.index.tz_localize(None)
-        
+
+        # ── Detect newly added ETFs ───────────────────────────────────────────
+        # New ETF columns will be in new_data but have all-NaN in existing_df
+        # (or be completely absent). Fetch their full history and backfill.
+        new_etf_cols = []
+        for etf in ETF_LIST:
+            ret_col = f"{etf}_Ret"
+            if ret_col in new_data.columns:
+                if ret_col not in existing_df.columns or existing_df[ret_col].isna().all():
+                    new_etf_cols.append(etf)
+
+        if new_etf_cols:
+            st.info(f"🆕 Detected new ETFs not in HF dataset: {new_etf_cols} — fetching full history...")
+            # Fetch full history for new ETFs from 2008
+            full_history = fetch_etf_data(new_etf_cols, start_date="2008-01-01")
+            if not full_history.empty:
+                if full_history.index.tz is not None:
+                    full_history.index = full_history.index.tz_localize(None)
+                st.success(f"✅ Full history fetched for {new_etf_cols}: "
+                           f"{len(full_history)} rows from "
+                           f"{full_history.index[0].date()} to "
+                           f"{full_history.index[-1].date()}")
+                # Merge full history into new_data by reindexing to the union of dates
+                combined_index = existing_df.index.union(full_history.index)
+                existing_df   = existing_df.reindex(combined_index)
+                new_data      = new_data.reindex(combined_index)
+                # Write new ETF columns directly into new_data across full date range
+                new_cols_only = [c for c in full_history.columns
+                                 if c not in existing_df.columns
+                                 or existing_df[c].isna().mean() > 0.9]
+                for col in new_cols_only:
+                    new_data[col] = full_history.reindex(combined_index)[col]
+            else:
+                st.warning(f"⚠️ Could not fetch full history for {new_etf_cols}")
+
         combined = new_data.combine_first(existing_df)
         
         new_rows = len(combined) - len(existing_df)
@@ -253,69 +287,38 @@ def smart_update_hf_dataset(new_data, token):
 
 
 def add_regime_features(df):
-    """Add regime detection features including rate momentum.
-    Uses pd.concat to avoid DataFrame fragmentation warnings."""
-
-    new_cols = {}
-
+    """Add regime detection features"""
+    
     # VIX Regime
     if 'VIX' in df.columns:
-        new_cols['VIX_Regime_Low']  = (df['VIX'] < 15).astype(int)
-        new_cols['VIX_Regime_Med']  = ((df['VIX'] >= 15) & (df['VIX'] < 25)).astype(int)
-        new_cols['VIX_Regime_High'] = (df['VIX'] >= 25).astype(int)
-
+        df['VIX_Regime_Low'] = (df['VIX'] < 15).astype(int)
+        df['VIX_Regime_Med'] = ((df['VIX'] >= 15) & (df['VIX'] < 25)).astype(int)
+        df['VIX_Regime_High'] = (df['VIX'] >= 25).astype(int)
+    
     # Yield Curve Regime
     if 'T10Y2Y' in df.columns:
-        new_cols['YC_Inverted'] = (df['T10Y2Y'] < 0).astype(int)
-        new_cols['YC_Flat']     = ((df['T10Y2Y'] >= 0) & (df['T10Y2Y'] < 0.5)).astype(int)
-        new_cols['YC_Steep']    = (df['T10Y2Y'] >= 0.5).astype(int)
-
+        df['YC_Inverted'] = (df['T10Y2Y'] < 0).astype(int)
+        df['YC_Flat'] = ((df['T10Y2Y'] >= 0) & (df['T10Y2Y'] < 0.5)).astype(int)
+        df['YC_Steep'] = (df['T10Y2Y'] >= 0.5).astype(int)
+    
     # Credit Stress Regime
     if 'HY_Spread' in df.columns:
-        new_cols['Credit_Stress_Low']  = (df['HY_Spread'] < 400).astype(int)
-        new_cols['Credit_Stress_Med']  = ((df['HY_Spread'] >= 400) & (df['HY_Spread'] < 600)).astype(int)
-        new_cols['Credit_Stress_High'] = (df['HY_Spread'] >= 600).astype(int)
-
+        df['Credit_Stress_Low'] = (df['HY_Spread'] < 400).astype(int)
+        df['Credit_Stress_Med'] = ((df['HY_Spread'] >= 400) & (df['HY_Spread'] < 600)).astype(int)
+        df['Credit_Stress_High'] = (df['HY_Spread'] >= 600).astype(int)
+    
     # VIX Term Structure Regime
     if 'VIX_Term_Slope' in df.columns:
-        new_cols['VIX_Term_Contango']      = (df['VIX_Term_Slope'] > 2).astype(int)
-        new_cols['VIX_Term_Backwardation'] = (df['VIX_Term_Slope'] < -2).astype(int)
-
-    # Rate Environment (level)
+        df['VIX_Term_Contango'] = (df['VIX_Term_Slope'] > 2).astype(int)
+        df['VIX_Term_Backwardation'] = (df['VIX_Term_Slope'] < -2).astype(int)
+    
+    # Rate Environment
     if 'T10Y3M' in df.columns:
-        new_cols['Rates_VeryLow'] = (df['T10Y3M'] < 1.0).astype(int)
-        new_cols['Rates_Low']     = ((df['T10Y3M'] >= 1.0) & (df['T10Y3M'] < 2.0)).astype(int)
-        new_cols['Rates_Normal']  = ((df['T10Y3M'] >= 2.0) & (df['T10Y3M'] < 3.0)).astype(int)
-        new_cols['Rates_High']    = (df['T10Y3M'] >= 3.0).astype(int)
-
-    # Rate momentum & regime change features
-    if 'T10Y2Y' in df.columns:
-        yc_mom20 = df['T10Y2Y'].diff(20)
-        yc_mom60 = df['T10Y2Y'].diff(60)
-        new_cols['YC_Mom20d']        = yc_mom20
-        new_cols['YC_Mom60d']        = yc_mom60
-        new_cols['Rates_Rising20d']  = (yc_mom20 > 0).astype(int)
-        new_cols['Rates_Falling20d'] = (yc_mom20 < 0).astype(int)
-        new_cols['Rates_Rising60d']  = (yc_mom60 > 0).astype(int)
-        new_cols['Rates_Falling60d'] = (yc_mom60 < 0).astype(int)
-        yc_accel = yc_mom20.diff(20)
-        new_cols['YC_Accel']            = yc_accel
-        new_cols['Rates_Accelerating']  = (yc_accel > 0).astype(int)
-
-    if 'T10Y3M' in df.columns:
-        t3m_mom20 = df['T10Y3M'].diff(20)
-        t3m_mom60 = df['T10Y3M'].diff(60)
-        new_cols['T10Y3M_Mom20d']     = t3m_mom20
-        new_cols['T10Y3M_Mom60d']     = t3m_mom60
-        new_cols['T10Y3M_Rising20d']  = (t3m_mom20 > 0).astype(int)
-        new_cols['T10Y3M_Falling20d'] = (t3m_mom20 < 0).astype(int)
-        new_cols['T10Y3M_Rising60d']  = (t3m_mom60 > 0).astype(int)
-        new_cols['T10Y3M_Falling60d'] = (t3m_mom60 < 0).astype(int)
-
-    # Concat all new columns at once — avoids DataFrame fragmentation
-    if new_cols:
-        df = pd.concat([df, pd.DataFrame(new_cols, index=df.index)], axis=1)
-
+        df['Rates_VeryLow'] = (df['T10Y3M'] < 1.0).astype(int)
+        df['Rates_Low'] = ((df['T10Y3M'] >= 1.0) & (df['T10Y3M'] < 2.0)).astype(int)
+        df['Rates_Normal'] = ((df['T10Y3M'] >= 2.0) & (df['T10Y3M'] < 3.0)).astype(int)
+        df['Rates_High'] = (df['T10Y3M'] >= 3.0).astype(int)
+    
     return df
 
 
@@ -380,8 +383,9 @@ def get_data(start_year, force_refresh=False, clean_hf_dataset=False):
         sync_reason = "🔄 Manual Refresh" if force_refresh else "🔄 Sync Window Active"
         
         with st.status(f"{sync_reason} - Updating Dataset...", expanded=False):
-            # Use centralized ETF_LIST constant
-            etf_data = fetch_etf_data(ETF_LIST)
+            etf_list = ["TLT", "TBT", "VNQ", "SLV", "GLD", "AGG", "SPY"]
+            
+            etf_data = fetch_etf_data(etf_list)
             macro_data = fetch_macro_data_robust()
             
             if not etf_data.empty and not macro_data.empty:
@@ -392,8 +396,8 @@ def get_data(start_year, force_refresh=False, clean_hf_dataset=False):
     # Fetch fresh if still empty
     if df.empty:
         st.warning("📊 Fetching fresh data...")
-        # Use centralized ETF_LIST constant
-        etf_data = fetch_etf_data(ETF_LIST)
+        etf_list = ["TLT", "TBT", "VNQ", "SLV", "GLD", "AGG", "SPY"]
+        etf_data = fetch_etf_data(etf_list)
         macro_data = fetch_macro_data_robust()
         
         if not etf_data.empty and not macro_data.empty:
@@ -412,8 +416,7 @@ def get_data(start_year, force_refresh=False, clean_hf_dataset=False):
 
     # Z-score the momentum/rank/trend features too so they're on same scale
     mom_pattern_cols = [c for c in df.columns if any(
-        tag in c for tag in ['_Mom', '_RelSPY', '_Rank', '_Trend', 'YC_Mom', 'YC_Accel',
-                              'T10Y3M_Mom', 'T10Y2Y_Mom']
+        tag in c for tag in ['_Mom', '_RelSPY', '_Rank', '_Trend']
     )]
     for col in mom_pattern_cols:
         rolling_mean = df[col].rolling(60, min_periods=10).mean()
@@ -436,9 +439,9 @@ def get_data(start_year, force_refresh=False, clean_hf_dataset=False):
         st.warning(f"🗑️ Dropping {len(bad_features)} features with >50% NaNs")
         df = df.drop(columns=bad_features)
     
-    df = df.ffill(limit=5)
-    df = df.bfill(limit=100)
-    df = df.ffill()
+    df = df.fillna(method='ffill', limit=5)
+    df = df.fillna(method='bfill', limit=100)
+    df = df.fillna(method='ffill')
     
     df = df.dropna()
     

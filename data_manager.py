@@ -167,11 +167,9 @@ def smart_update_hf_dataset(new_data, token, force_upload=False):
             existing_df.index = existing_df.index.tz_localize(None)
 
         # ── Step 1: fetch FULL ETF history from 2008 ───────────────────────
-        st.info("📡 Fetching full ETF history from 2008...")
         full_etf = fetch_etf_data(ETF_LIST, start_date="2008-01-01")
         if full_etf.index.tz is not None:
             full_etf.index = full_etf.index.tz_localize(None)
-        st.info(f"📊 Full ETF fetch: {len(full_etf)} rows, columns: {list(full_etf.columns)}")
 
         # Detect new ETFs for reporting
         new_etf_cols = [
@@ -179,8 +177,6 @@ def smart_update_hf_dataset(new_data, token, force_upload=False):
             if f"{etf}_Ret" not in existing_df.columns
             or existing_df[f"{etf}_Ret"].isna().mean() > 0.9
         ]
-        if new_etf_cols:
-            st.info(f"🆕 New ETFs detected: {new_etf_cols}")
 
         # ── Step 2: extract macro columns from existing_df ───────────────────
         # Macro cols = everything in existing_df that is NOT an ETF column
@@ -189,7 +185,6 @@ def smart_update_hf_dataset(new_data, token, force_upload=False):
                                 ["TLT","TBT","VCIT","LQD","HYG","VNQ","SLV","GLD","AGG","SPY"])]
         macro_col_names = [c for c in existing_df.columns if c not in etf_col_names]
         macro_existing  = existing_df[macro_col_names].copy()
-        st.info(f"📊 Macro cols from existing: {macro_col_names}")
 
         # ── Step 3: build combined from scratch using pd.concat ──────────────
         # ETF data: full_etf (authoritative, full history)
@@ -210,7 +205,6 @@ def smart_update_hf_dataset(new_data, token, force_upload=False):
         macro_aligned = macro_combined.reindex(full_index)
 
         combined = pd.concat([etf_aligned, macro_aligned], axis=1)
-        st.info(f"📊 Combined shape: {combined.shape} | ETF cols: {len(full_etf.columns)} | Macro cols: {len(macro_col_names)}")
 
         # ── Step 4: decide whether to upload ─────────────────────────────────
         new_rows    = len(combined) - len(existing_df)

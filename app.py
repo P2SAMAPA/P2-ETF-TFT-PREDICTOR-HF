@@ -97,7 +97,7 @@ st.caption("Temporal Fusion Transformer — Fixed Income ETF Rotation")
 if refresh_only_button:
     st.info("🔄 Refreshing dataset...")
     with st.status("📡 Fetching fresh data...", expanded=True):
-        etf_list   = ["TLT", "TBT", "VNQ", "SLV", "GLD", "AGG", "SPY"]
+        etf_list   = ["TLT", "VCIT", "LQD", "HYG", "VNQ", "SLV", "GLD", "AGG", "SPY"]
         etf_data   = fetch_etf_data(etf_list)
         macro_data = fetch_macro_data_robust()
         if not etf_data.empty and not macro_data.empty:
@@ -131,7 +131,7 @@ if run_button:
     st.write(f"📅 **Data:** {df.index[0].date()} → {df.index[-1].date()} ({years} years)")
 
     # ── Identify targets and features ─────────────────────────────────────────
-    TARGET_ETFS = ['TLT', 'TBT', 'VNQ', 'SLV', 'GLD']
+    TARGET_ETFS = ['TLT', 'VCIT', 'LQD', 'HYG', 'VNQ', 'SLV', 'GLD']
     target_etfs = [c for c in df.columns
                    if c.endswith('_Ret') and any(e in c for e in TARGET_ETFS)]
 
@@ -562,7 +562,7 @@ if run_button:
           (Inverted/Flat/Steep), credit stress levels, rate environment (VeryLow/Low/Normal/High)</li>
       <li><b>Rate momentum (new):</b> 20d and 60d rate-of-change on T10Y2Y and T10Y3M,
           rising/falling binary flags at both horizons, rate acceleration — critical for
-          distinguishing TBT (rising rates) from TLT (falling rates) regimes</li>
+          distinguishing rate-sensitive ETFs (VCIT, LQD, HYG) from TLT regimes</li>
       <li><b>ETF momentum:</b> 5d/10d/21d/63d rolling returns per ETF, relative strength
           vs SPY (21d), cross-sectional rank percentile (21d/63d), 5d/10d price trend</li>
     </ul>
@@ -590,8 +590,8 @@ if run_button:
           ({len(strat_rets)} trading days). Past performance does not guarantee future results</li>
       <li>SLV (silver ETF) is highly volatile — single-day moves of ±10% are not uncommon,
           as seen in the -28.69% worst day. Position sizing in live trading should reflect this</li>
-      <li>TBT is a 2× leveraged inverse bond ETF with daily rebalancing decay — holding it
-          for extended periods in sideways markets erodes value even if rates are flat</li>
+      <li>VCIT, LQD and HYG are credit ETFs with duration and spread risk — in risk-off
+          environments credit spreads can widen sharply causing simultaneous losses</li>
       <li>The model is retrained from scratch on each run — results may vary slightly between
           runs due to random weight initialisation</li>
       <li>This tool is for research and educational purposes only and does not constitute

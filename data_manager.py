@@ -239,18 +239,27 @@ def smart_update_hf_dataset(new_data, token, force_upload=False):
             new_etf_check = [c for c in ["VCIT_Ret","LQD_Ret","HYG_Ret"] if c in verify.columns]
             st.info(f"📋 File on disk check — new ETF cols: {new_etf_check}, shape: {verify.shape}")
             api = HfApi()
-            api.upload_file(
-                path_or_fileobj=csv_filename,
+            commit_msg = (
+                ("FORCE " if force_upload else "") +
+                f"Update: {get_est_time().strftime('%Y-%m-%d %H:%M EST')} | "
+                f"+{new_rows} rows, filled {filled_gaps} gaps" +
+                (f", backfilled {new_etf_cols}" if new_etf_cols else "")
+            )
+            # Use CommitOperationAdd for atomic commit — bypasses CDN/Parquet cache issues
+            from huggingface_hub import CommitOperationAdd
+            with open(csv_filename, "rb") as f:
+                file_bytes = f.read()
+            st.info(f"📤 Uploading {len(file_bytes):,} bytes to HF via CommitOperationAdd...")
+            operations = [CommitOperationAdd(
                 path_in_repo="etf_data.csv",
+                path_or_fileobj=file_bytes,
+            )]
+            api.create_commit(
                 repo_id=REPO_ID,
                 repo_type="dataset",
                 token=token,
-                commit_message=(
-                    ("FORCE " if force_upload else "") +
-                    f"Update: {get_est_time().strftime('%Y-%m-%d %H:%M EST')} | "
-                    f"+{new_rows} rows, filled {filled_gaps} gaps" +
-                    (f", backfilled {new_etf_cols}" if new_etf_cols else "")
-                ),
+                commit_message=commit_msg,
+                operations=operations,
             )
             st.success(f"✅ Dataset updated: +{new_rows} rows, filled {filled_gaps} gaps"
                        + (f", backfilled {new_etf_cols}" if new_etf_cols else ""))

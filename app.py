@@ -131,7 +131,7 @@ if run_button:
     st.write(f"📅 **Data:** {df.index[0].date()} → {df.index[-1].date()} ({years} years)")
 
     # ── Identify targets and features ─────────────────────────────────────────
-    TARGET_ETFS = ['TLT', 'TBT', 'VNQ', 'SLV', 'GLD']
+    TARGET_ETFS = ['TLT', 'VCIT', 'LQD', 'HYG', 'VNQ', 'SLV', 'GLD']
     target_etfs = [c for c in df.columns
                    if c.endswith('_Ret') and any(e in c for e in TARGET_ETFS)]
 

@@ -222,11 +222,12 @@ def smart_update_hf_dataset(new_data, token):
         # New ETF columns will be in new_data but have all-NaN in existing_df
         # (or be completely absent). Fetch their full history and backfill.
         new_etf_cols = []
-        for etf in ETF_LIST:
+        # Infer ETF names from new_data columns ending in _Ret
+        all_etfs = [c.replace("_Ret", "") for c in new_data.columns if c.endswith("_Ret")]
+        for etf in all_etfs:
             ret_col = f"{etf}_Ret"
-            if ret_col in new_data.columns:
-                if ret_col not in existing_df.columns or existing_df[ret_col].isna().all():
-                    new_etf_cols.append(etf)
+            if ret_col not in existing_df.columns or existing_df[ret_col].isna().mean() > 0.9:
+                new_etf_cols.append(etf)
 
         if new_etf_cols:
             st.info(f"🆕 Detected new ETFs not in HF dataset: {new_etf_cols} — fetching full history...")
@@ -383,7 +384,7 @@ def get_data(start_year, force_refresh=False, clean_hf_dataset=False):
         sync_reason = "🔄 Manual Refresh" if force_refresh else "🔄 Sync Window Active"
         
         with st.status(f"{sync_reason} - Updating Dataset...", expanded=False):
-            etf_list = ["TLT", "TBT", "VNQ", "SLV", "GLD", "AGG", "SPY"]
+            etf_list = ["TLT", "VCIT", "LQD", "HYG", "VNQ", "SLV", "GLD", "AGG", "SPY"]
             
             etf_data = fetch_etf_data(etf_list)
             macro_data = fetch_macro_data_robust()
@@ -396,7 +397,7 @@ def get_data(start_year, force_refresh=False, clean_hf_dataset=False):
     # Fetch fresh if still empty
     if df.empty:
         st.warning("📊 Fetching fresh data...")
-        etf_list = ["TLT", "TBT", "VNQ", "SLV", "GLD", "AGG", "SPY"]
+        etf_list = ["TLT", "VCIT", "LQD", "HYG", "VNQ", "SLV", "GLD", "AGG", "SPY"]
         etf_data = fetch_etf_data(etf_list)
         macro_data = fetch_macro_data_robust()
         

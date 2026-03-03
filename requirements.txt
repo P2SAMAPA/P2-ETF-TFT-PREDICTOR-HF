@@ -9,6 +9,6 @@ pytz
 pandas_market_calendars
 datasets
 tensorflow
-pandas-datareader
+pandas-datareader==0.10.0
 pillow>=10.0.0
 scikit-learn

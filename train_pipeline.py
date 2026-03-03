@@ -260,7 +260,22 @@ def main(force_refresh: bool = False, start_year: int = 2016):
         acc_per_etf[name] = round(float(np.mean(preds_j == y_bin_test[:, j])), 4)
     log.info(f"Binary accuracy: {acc_per_etf}")
 
-    # ── 11. Daily returns on test set (for live strategy replay in app) ───────
+    # ── 11. Extend test_dates with extra dates beyond fwd-return window ──────
+    # df has dates up to today, but df_model ends FORWARD_DAYS earlier due to
+    # shift(-FORWARD_DAYS). Pad proba/returns with last prediction so audit
+    # trail shows all recent trading days.
+    extra_dates = df.index[df.index > df_model.index[-1]]
+    if len(extra_dates) > 0:
+        log.info(f"Padding {len(extra_dates)} extra dates: "
+                 f"{extra_dates[0].date()} → {extra_dates[-1].date()}")
+        # Repeat last prediction for extra dates
+        last_proba   = proba[-1:].repeat(len(extra_dates), axis=0)
+        proba        = np.vstack([proba, last_proba])
+        last_fwd     = y_fwd_test[-1:].repeat(len(extra_dates), axis=0)
+        y_fwd_test   = np.vstack([y_fwd_test, last_fwd])
+        test_dates   = test_dates.append(pd.DatetimeIndex(extra_dates))
+
+    # ── 12. Daily returns on test set (for live strategy replay in app) ───────
     daily_ret_test = df.reindex(test_dates)[target_etfs].fillna(0.0).values
     # Also save full benchmark returns on test period
     spy_ret_test = df.reindex(test_dates)['SPY_Ret'].fillna(0.0).values \
@@ -268,7 +283,7 @@ def main(force_refresh: bool = False, start_year: int = 2016):
     agg_ret_test = df.reindex(test_dates)['AGG_Ret'].fillna(0.0).values \
                    if 'AGG_Ret' in df.columns else np.zeros(len(test_dates))
 
-    # ── 12. Compute next-day signal (from last row of proba) ──────────────────
+    # ── 13. Compute next-day signal (from last row of proba after padding) ────
     from strategy import compute_signal_conviction
     from utils import get_next_trading_day
     last_scores = proba[-1]
@@ -276,7 +291,7 @@ def main(force_refresh: bool = False, start_year: int = 2016):
     next_signal = etf_names[best_idx]
     next_date   = get_next_trading_day(test_dates[-1])
 
-    # ── 13. Save outputs ──────────────────────────────────────────────────────
+    # ── 14. Save outputs ──────────────────────────────────────────────────────
     log.info("Saving outputs...")
 
     # --- model_outputs.npz ---

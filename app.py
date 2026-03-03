@@ -158,7 +158,7 @@ with st.spinner("📦 Loading pre-computed model outputs..."):
     signals, sig_err = load_signals()
     meta = load_training_meta()
 
-if outputs is None:
+if not outputs:@st.cache_data(ttl=1800)
     st.error(f"❌ Could not load model outputs: {err}")
     st.info("💡 The model may not have been trained yet. "
             "Trigger the GitHub Actions workflow manually to run the first training.")

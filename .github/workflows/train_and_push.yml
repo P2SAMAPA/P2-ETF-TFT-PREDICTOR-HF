@@ -1,20 +1,26 @@
 # .github/workflows/train_and_push.yml
-# Two jobs:
-#   1. train      — daily 7am EST default (start_year=2016) + manual trigger with custom start_year
-#   2. cleanup    — daily midnight EST wipes p2-etf-tft-outputs dataset clean
+# Three triggers:
+#   1. train        — daily 7am EST (start_year=2016) + manual single-year
+#   2. sweep_YYYY   — manual consensus sweep (parallel jobs, missing years only)
+#   3. cleanup      — daily midnight EST, wipes single-year outputs only
 
 name: Daily TFT Training
 
 on:
   schedule:
-    - cron: "0 12 * * 1-5"    # 12:00 UTC = 7:00am EST, Mon-Fri (default training)
-    - cron: "0 5 * * *"        # 05:00 UTC = midnight EST, daily (cleanup)
+    - cron: "0 12 * * 1-5"   # 12:00 UTC = 7am EST Mon-Fri
+    - cron: "0 5 * * *"       # 05:00 UTC = midnight EST daily cleanup
   workflow_dispatch:
     inputs:
       start_year:
-        description: "Start year for training data"
+        description: "Start year for single-year run"
         required: false
         default: "2016"
+        type: string
+      sweep_mode:
+        description: "Comma-separated sweep years e.g. 2008,2014,2016,2019,2021 (leave blank for single-year)"
+        required: false
+        default: ""
         type: string
       force_refresh:
         description: "Force full dataset rebuild"
@@ -23,16 +29,18 @@ on:
         type: boolean
 
 jobs:
-  # ── Cleanup job — runs at midnight EST, wipes output dataset ────────────────
+
+  # ── Midnight cleanup — wipes single-year outputs, keeps sweep cache ─────────
   cleanup:
     if: >
-      github.event_name == 'schedule' && github.event.schedule == '0 5 * * *'
+      github.event_name == 'schedule' &&
+      github.event.schedule == '0 5 * * *'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
     steps:
-      - name: Wipe p2-etf-tft-outputs dataset
+      - name: Wipe single-year outputs (preserve sweep cache)
         run: |
           pip install huggingface_hub -q
           python - <<'EOF'
@@ -41,7 +49,6 @@ jobs:
           api = HfApi()
           token = os.environ["HF_TOKEN"]
           repo_id = "P2SAMAPA/p2-etf-tft-outputs"
-          # Delete each output file if it exists
           for filename in ["model_outputs.npz", "signals.json", "training_meta.json"]:
               try:
                   api.delete_file(
@@ -49,58 +56,171 @@ jobs:
                       repo_id=repo_id,
                       repo_type="dataset",
                       token=token,
-                      commit_message=f"Midnight cleanup: remove {filename}"
+                      commit_message=f"Midnight cleanup: {filename}"
                   )
-                  print(f"✅ Deleted {filename}")
+                  print(f"Deleted {filename}")
               except Exception as e:
-                  print(f"ℹ️ {filename} not found or already deleted: {e}")
-          print("✅ Cleanup complete")
+                  print(f"{filename} not found or already gone: {e}")
+          print("Cleanup done — sweep cache preserved")
           EOF
 
-  # ── Training job — runs at 7am EST daily + manual triggers ─────────────────
+  # ── Single-year train — daily default + manual (no sweep_mode) ──────────────
   train:
     if: >
-      github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'schedule' && github.event.schedule == '0 12 * * 1-5')
+      (github.event_name == 'schedule' &&
+       github.event.schedule == '0 12 * * 1-5') ||
+      (github.event_name == 'workflow_dispatch' &&
+       (github.event.inputs.sweep_mode == '' || github.event.inputs.sweep_mode == null))
     runs-on: ubuntu-latest
     timeout-minutes: 180
-
     env:
       HF_TOKEN:     ${{ secrets.HF_TOKEN }}
       FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
-
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set up Python 3.11
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: "pip"
-
       - name: Install dependencies
+        run: pip install --no-cache-dir -r requirements.txt
+      - name: Train
         run: |
-          pip install --no-cache-dir -r requirements.txt
-
-      - name: Train TFT models and push outputs
-        run: |
-          # Use workflow input start_year if manual trigger, else default 2016
           START_YEAR="${{ github.event.inputs.start_year }}"
           START_YEAR="${START_YEAR:-2016}"
-
           ARGS="--start-year $START_YEAR"
           if [ "${{ github.event.inputs.force_refresh }}" = "true" ]; then
             ARGS="$ARGS --force-refresh"
           fi
-
-          echo "Running: python train_pipeline.py $ARGS"
           python train_pipeline.py $ARGS
-
-      - name: Upload training logs
-        if: always()
+      - if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: training-logs-${{ github.run_id }}
+          name: logs-single-${{ github.run_id }}
+          path: "*.log"
+          retention-days: 7
+
+  # ── Sweep 2008 ───────────────────────────────────────────────────────────────
+  sweep_2008:
+    if: >
+      github.event_name == 'workflow_dispatch' &&
+      contains(github.event.inputs.sweep_mode, '2008')
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      HF_TOKEN:     ${{ secrets.HF_TOKEN }}
+      FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+      - run: pip install --no-cache-dir -r requirements.txt
+      - run: python train_pipeline.py --start-year 2008
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-sweep-2008-${{ github.run_id }}
+          path: "*.log"
+          retention-days: 7
+
+  # ── Sweep 2014 ───────────────────────────────────────────────────────────────
+  sweep_2014:
+    if: >
+      github.event_name == 'workflow_dispatch' &&
+      contains(github.event.inputs.sweep_mode, '2014')
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      HF_TOKEN:     ${{ secrets.HF_TOKEN }}
+      FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+      - run: pip install --no-cache-dir -r requirements.txt
+      - run: python train_pipeline.py --start-year 2014
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-sweep-2014-${{ github.run_id }}
+          path: "*.log"
+          retention-days: 7
+
+  # ── Sweep 2016 ───────────────────────────────────────────────────────────────
+  sweep_2016:
+    if: >
+      github.event_name == 'workflow_dispatch' &&
+      contains(github.event.inputs.sweep_mode, '2016')
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      HF_TOKEN:     ${{ secrets.HF_TOKEN }}
+      FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+      - run: pip install --no-cache-dir -r requirements.txt
+      - run: python train_pipeline.py --start-year 2016
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-sweep-2016-${{ github.run_id }}
+          path: "*.log"
+          retention-days: 7
+
+  # ── Sweep 2019 ───────────────────────────────────────────────────────────────
+  sweep_2019:
+    if: >
+      github.event_name == 'workflow_dispatch' &&
+      contains(github.event.inputs.sweep_mode, '2019')
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      HF_TOKEN:     ${{ secrets.HF_TOKEN }}
+      FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+      - run: pip install --no-cache-dir -r requirements.txt
+      - run: python train_pipeline.py --start-year 2019
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-sweep-2019-${{ github.run_id }}
+          path: "*.log"
+          retention-days: 7
+
+  # ── Sweep 2021 ───────────────────────────────────────────────────────────────
+  sweep_2021:
+    if: >
+      github.event_name == 'workflow_dispatch' &&
+      contains(github.event.inputs.sweep_mode, '2021')
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      HF_TOKEN:     ${{ secrets.HF_TOKEN }}
+      FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+      - run: pip install --no-cache-dir -r requirements.txt
+      - run: python train_pipeline.py --start-year 2021
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-sweep-2021-${{ github.run_id }}
           path: "*.log"
           retention-days: 7

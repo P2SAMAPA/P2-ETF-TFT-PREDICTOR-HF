@@ -37,8 +37,8 @@ log = logging.getLogger(__name__)
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 os.environ["PYTHONHASHSEED"] = "42"
 
-HF_SPACE_REPO = "P2SAMAPA/P2-ETF-TFT-PREDICTOR"
-HF_DATASET_REPO = "P2SAMAPA/my-etf-data"   # READ ONLY — never written by this script
+HF_OUTPUT_REPO  = "P2SAMAPA/p2-etf-tft-outputs"   # dedicated dataset repo — never overwritten by sync.yml
+HF_DATASET_REPO = "P2SAMAPA/my-etf-data"           # READ ONLY — never written by this script
 
 # Hardcoded split
 TRAIN_PCT = 0.80
@@ -67,22 +67,21 @@ def _make_st_mock():
 sys.modules["streamlit"] = _make_st_mock()
 
 
-def push_file_to_hf_space(filename: str, content_bytes: bytes,
-                           commit_msg: str, token: str):
-    """Push a file to the HF Space repo root."""
+def push_file_to_hf_output(filename: str, content_bytes: bytes,
+                            commit_msg: str, token: str):
+    """Push a file to the dedicated HF output dataset repo."""
     from huggingface_hub import HfApi, CommitOperationAdd
     api = HfApi()
     ops = [CommitOperationAdd(path_in_repo=filename,
                                path_or_fileobj=content_bytes)]
-    print(f"Pushing {filename} to repo_id={HF_SPACE_REPO} repo_type=space")                        
     api.create_commit(
-        repo_id=HF_SPACE_REPO,
-        repo_type="space",
+        repo_id=HF_OUTPUT_REPO,
+        repo_type="dataset",
         token=token,
         commit_message=commit_msg,
         operations=ops,
     )
-    log.info(f"✅ Pushed {filename} → {HF_SPACE_REPO} ({len(content_bytes):,} bytes)")
+    log.info(f"✅ Pushed {filename} → {HF_OUTPUT_REPO} ({len(content_bytes):,} bytes)")
 
 
 def fetch_sofr():
@@ -339,26 +338,26 @@ def main(force_refresh: bool = False):
     # ── 14. Push all outputs to HF Space repo ────────────────────────────────
     run_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
-    push_file_to_hf_space(
+    push_file_to_hf_output(
         "model_outputs.npz",
         npz_bytes,
         f"Update model outputs {run_date}",
         token
     )
-    push_file_to_hf_space(
+    push_file_to_hf_output(
         "signals.json",
         json.dumps(signals_payload, indent=2).encode(),
         f"Update signals {run_date} → {next_signal}",
         token
     )
-    push_file_to_hf_space(
+    push_file_to_hf_output(
         "training_meta.json",
         json.dumps(meta_payload, indent=2).encode(),
         f"Update training meta {run_date}",
         token
     )
 
-    log.info(f"✅ All outputs pushed to {HF_SPACE_REPO}")
+    log.info(f"✅ All outputs pushed to {HF_OUTPUT_REPO}")
     log.info(f"📡 Next signal: {next_signal} on {next_date} "
              f"(conviction: {conviction_label}, Z={conviction_z:.2f})")
 

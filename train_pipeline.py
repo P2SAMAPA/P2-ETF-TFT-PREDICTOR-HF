@@ -99,7 +99,7 @@ def fetch_sofr():
     return 0.045, "fallback 4.5%"
 
 
-def main(force_refresh: bool = False):
+def main(force_refresh: bool = False, start_year: int = 2016):
     token = os.getenv("HF_TOKEN")
     if not token:
         raise RuntimeError("HF_TOKEN environment variable not set")
@@ -119,7 +119,7 @@ def main(force_refresh: bool = False):
 
     # ── 2. Load dataset (reads P2SAMAPA/my-etf-data, never writes it) ────────
     log.info("Loading dataset from HF...")
-    df = get_data(start_year=2008, force_refresh=force_refresh,
+    df = get_data(start_year=start_year, force_refresh=force_refresh,
                   clean_hf_dataset=False)
     if df is None or df.empty:
         raise RuntimeError("Dataset is empty — aborting")
@@ -301,6 +301,7 @@ def main(force_refresh: bool = False):
 
     # --- signals.json ---
     signals_payload = {
+        "start_year":        start_year,
         "next_signal":       next_signal,
         "next_date":         str(next_date),
         "conviction_z":      round(float(conviction_z), 4),
@@ -366,5 +367,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--force-refresh", action="store_true",
                         help="Force full dataset rebuild")
+    parser.add_argument("--start-year", type=int, default=2016,
+                        help="Start year for training data (default: 2016)")
     args = parser.parse_args()
-    main(force_refresh=args.force_refresh)
+    main(force_refresh=args.force_refresh, start_year=args.start_year)

@@ -1,13 +1,11 @@
 """
-P2-ETF-PREDICTOR — TFT Edition (Display Mode)
-===============================================
-Reads pre-computed model outputs pushed daily by GitHub Actions.
-Replays execute_strategy() live so all sliders work without retraining.
-
-Files read from HF Space repo root:
-  - model_outputs.npz   — proba, daily returns, dates, target_etfs
-  - signals.json        — next signal, conviction, metadata
-  - training_meta.json  — lookback, epochs, accuracy info
+P2-ETF-PREDICTOR — TFT Edition
+================================
+- User picks start year → clicks Run Model
+- App triggers GitHub Actions via REST API with start_year param
+- Shows last saved outputs while new training runs in background
+- Daily auto-training at 7am EST with default start_year=2016
+- Outputs stored in P2SAMAPA/p2-etf-tft-outputs HF Dataset repo
 """
 
 import streamlit as st
@@ -17,6 +15,7 @@ import plotly.graph_objects as go
 import json
 import os
 import time
+import requests as req
 
 from utils import get_est_time, is_sync_window
 from data_manager import get_data, fetch_etf_data, fetch_macro_data_robust, smart_update_hf_dataset
@@ -24,12 +23,17 @@ from strategy import execute_strategy, calculate_metrics, calculate_benchmark_me
 
 st.set_page_config(page_title="P2-ETF-Predictor | TFT", layout="wide")
 
-HF_OUTPUT_REPO = "P2SAMAPA/p2-etf-tft-outputs"   # dedicated dataset repo for model outputs
+# ── Constants ─────────────────────────────────────────────────────────────────
+HF_OUTPUT_REPO   = "P2SAMAPA/p2-etf-tft-outputs"
+GITHUB_REPO      = "P2SAMAPA/P2-ETF-TFT-PREDICTOR-HF-DATASET"
+GITHUB_WORKFLOW  = "train_and_push.yml"
+GITHUB_API_BASE  = "https://api.github.com"
 
 
-@st.cache_data(ttl=1800)
+# ── Load outputs from HF Dataset repo ────────────────────────────────────────
+
+@st.cache_data(ttl=300)   # 5 min cache — refreshes frequently to catch new training
 def load_model_outputs():
-    """Load pre-computed model outputs from HF Dataset repo."""
     try:
         from huggingface_hub import hf_hub_download
         path = hf_hub_download(
@@ -39,15 +43,13 @@ def load_model_outputs():
             force_download=True,
         )
         npz = np.load(path, allow_pickle=True)
-        data = {k: npz[k] for k in npz.files}
-        return data, None
+        return {k: npz[k] for k in npz.files}, None
     except Exception as e:
         return {}, str(e)
 
 
-@st.cache_data(ttl=1800)
+@st.cache_data(ttl=300)
 def load_signals():
-    """Load latest signals.json from HF Dataset repo."""
     try:
         from huggingface_hub import hf_hub_download
         path = hf_hub_download(
@@ -62,9 +64,8 @@ def load_signals():
         return None, str(e)
 
 
-@st.cache_data(ttl=1800)
+@st.cache_data(ttl=300)
 def load_training_meta():
-    """Load training_meta.json from HF Dataset repo."""
     try:
         from huggingface_hub import hf_hub_download
         path = hf_hub_download(
@@ -79,6 +80,83 @@ def load_training_meta():
         return None
 
 
+def trigger_github_training(start_year: int, force_refresh: bool = False) -> bool:
+    """
+    Trigger GitHub Actions workflow via REST API.
+    Passes start_year as workflow input.
+    Returns True if trigger was accepted (HTTP 204).
+    """
+    pat = os.getenv("GITHUB_PAT")
+    if not pat:
+        st.error("❌ GITHUB_PAT secret not found in HF Space secrets.")
+        return False
+
+    url = (f"{GITHUB_API_BASE}/repos/{GITHUB_REPO}/actions/workflows/"
+           f"{GITHUB_WORKFLOW}/dispatches")
+    payload = {
+        "ref": "main",
+        "inputs": {
+            "start_year":    str(start_year),
+            "force_refresh": str(force_refresh).lower(),
+        }
+    }
+    headers = {
+        "Authorization": f"Bearer {pat}",
+        "Accept":        "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    try:
+        r = req.post(url, json=payload, headers=headers, timeout=15)
+        if r.status_code == 204:
+            return True
+        else:
+            st.error(f"❌ GitHub API error {r.status_code}: {r.text[:200]}")
+            return False
+    except Exception as e:
+        st.error(f"❌ Failed to trigger GitHub Actions: {e}")
+        return False
+
+
+def get_latest_workflow_run() -> dict:
+    """Get status of the latest GitHub Actions workflow run."""
+    pat = os.getenv("GITHUB_PAT")
+    if not pat:
+        return {}
+    url = (f"{GITHUB_API_BASE}/repos/{GITHUB_REPO}/actions/workflows/"
+           f"{GITHUB_WORKFLOW}/runs?per_page=1")
+    headers = {
+        "Authorization": f"Bearer {pat}",
+        "Accept":        "application/vnd.github+json",
+    }
+    try:
+        r = req.get(url, headers=headers, timeout=10)
+        if r.status_code == 200:
+            runs = r.json().get("workflow_runs", [])
+            return runs[0] if runs else {}
+    except Exception:
+        pass
+    return {}
+
+
+# ── Load outputs first (needed for sidebar slider range) ─────────────────────
+with st.spinner("📦 Loading model outputs..."):
+    outputs, load_err = load_model_outputs()
+    signals, sig_err  = load_signals()
+    meta              = load_training_meta()
+
+# Derive test date range for slider
+if outputs and 'test_dates' in outputs:
+    _test_dates = pd.DatetimeIndex(outputs['test_dates'])
+    _trained_start_yr = int(signals.get('start_year', 2016)) if signals else 2016
+else:
+    _test_dates        = None
+    _trained_start_yr  = 2016
+
+# ── Check workflow status ─────────────────────────────────────────────────────
+latest_run    = get_latest_workflow_run()
+is_training   = latest_run.get("status") in ("queued", "in_progress")
+run_started   = latest_run.get("created_at", "")[:16].replace("T", " ") if latest_run else ""
+
 # ─────────────────────────────────────────────────────────────────────────────
 # SIDEBAR
 # ─────────────────────────────────────────────────────────────────────────────
@@ -87,23 +165,17 @@ with st.sidebar:
 
     current_time = get_est_time()
     st.write(f"🕒 **EST:** {current_time.strftime('%H:%M:%S')}")
-    if is_sync_window():
-        st.success("✅ Sync Window Active")
-    else:
-        st.info("⏸️ Sync Window Inactive")
 
     st.divider()
 
-    st.subheader("📥 Dataset")
-    force_refresh  = st.checkbox("Force Dataset Refresh", value=False)
-    clean_dataset  = st.checkbox("Clean HF Dataset (>30% NaN columns)", value=False)
-    refresh_only_button = st.button("🔄 Refresh Dataset Only",
-                                     type="secondary", use_container_width=True)
+    st.subheader("📅 Training Period")
+    start_yr = st.slider("Start Year", 2008, 2024, _trained_start_yr,
+                         help="Model trains on data from this year to present (80/10/10 split)")
 
     st.divider()
 
-    start_yr = st.slider("📅 Start Year (OOS display)", 2008, 2024, 2016)
-    fee_bps  = st.slider("💰 Transaction Fee (bps)", 0, 100, 15)
+    st.subheader("💰 Transaction Cost")
+    fee_bps = st.slider("Transaction Fee (bps)", 0, 100, 15)
 
     st.divider()
 
@@ -125,7 +197,36 @@ with st.sidebar:
     )
 
     st.divider()
-    st.caption("🤖 Model retrained daily via GitHub Actions · Split: 80/10/10 (hardcoded)")
+
+    st.subheader("📥 Dataset")
+    force_refresh   = st.checkbox("Force Dataset Refresh", value=False)
+    clean_dataset   = st.checkbox("Clean HF Dataset (>30% NaN columns)", value=False)
+
+    st.divider()
+
+    # ── Run Model button ──────────────────────────────────────────────────────
+    run_button = st.button(
+        "🚀 Run TFT Model",
+        type="primary",
+        use_container_width=True,
+        disabled=is_training,
+        help="Triggers GitHub Actions to train with selected start year (~1.5hrs)"
+    )
+    if is_training:
+        st.warning(f"⏳ Training in progress (started {run_started} UTC)...\n\n"
+                   f"Results will auto-update when complete.")
+
+    refresh_only_button = st.button(
+        "🔄 Refresh Dataset Only",
+        type="secondary",
+        use_container_width=True
+    )
+
+    st.divider()
+    st.caption("🤖 Training runs on GitHub Actions · Split: 80/10/10")
+    if signals:
+        st.caption(f"📅 Current outputs: start_year={signals.get('start_year', '?')} · "
+                   f"trained {signals.get('run_timestamp_utc', '')[:10]}")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # HEADER
@@ -134,7 +235,23 @@ st.title("🤖 P2-ETF-PREDICTOR")
 st.caption("Temporal Fusion Transformer — Fixed Income ETF Rotation")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# DATASET REFRESH ONLY (unchanged — still works exactly as before)
+# HANDLE RUN BUTTON — trigger GitHub Actions
+# ─────────────────────────────────────────────────────────────────────────────
+if run_button:
+    with st.spinner(f"🚀 Triggering GitHub Actions training for start_year={start_yr}..."):
+        success = trigger_github_training(start_year=start_yr, force_refresh=force_refresh)
+    if success:
+        st.success(
+            f"✅ Training triggered for **start_year={start_yr}**! "
+            f"GitHub Actions is now training (~1.5hrs). "
+            f"This page will show the previous results in the meantime — "
+            f"refresh in ~90 minutes to see updated outputs."
+        )
+        time.sleep(2)
+        st.rerun()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HANDLE REFRESH DATASET ONLY
 # ─────────────────────────────────────────────────────────────────────────────
 if refresh_only_button:
     st.info("🔄 Refreshing dataset...")
@@ -160,75 +277,76 @@ if refresh_only_button:
     st.stop()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# LOAD PRE-COMPUTED OUTPUTS
+# TRAINING IN PROGRESS BANNER
 # ─────────────────────────────────────────────────────────────────────────────
-with st.spinner("📦 Loading pre-computed model outputs..."):
-    outputs, err = load_model_outputs()
-    signals, sig_err = load_signals()
-    meta = load_training_meta()
+if is_training:
+    st.warning(
+        f"⏳ **Training in progress** (started {run_started} UTC) — "
+        f"showing previous results below. Refresh in ~90 minutes for updated outputs.",
+        icon="🔄"
+    )
 
+# ─────────────────────────────────────────────────────────────────────────────
+# YEAR MISMATCH WARNING
+# ─────────────────────────────────────────────────────────────────────────────
+if signals and signals.get('start_year') and int(signals.get('start_year')) != start_yr and not is_training:
+    st.info(
+        f"ℹ️ Showing results for **start_year={signals.get('start_year')}** "
+        f"(last trained). Click **🚀 Run TFT Model** to train for **{start_yr}**."
+    )
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CHECK IF OUTPUTS AVAILABLE
+# ─────────────────────────────────────────────────────────────────────────────
 if not outputs:
-    st.error(f"❌ Could not load model outputs: {err}")
-    st.info("💡 The model may not have been trained yet. "
-            "Trigger the GitHub Actions workflow manually to run the first training.")
+    st.error(f"❌ No model outputs available yet: {load_err}")
+    st.info("👈 Click **🚀 Run TFT Model** to trigger the first training run.")
     st.stop()
 
-if signals is None:
-    st.warning(f"⚠️ Could not load signals.json: {sig_err}")
-
 # ── Extract arrays ────────────────────────────────────────────────────────────
-proba          = outputs['proba']           # (N, 7)
-daily_ret_test = outputs['daily_ret_test']  # (N, 7)
-y_fwd_test     = outputs['y_fwd_test']      # (N, 7)
-spy_ret_test   = outputs['spy_ret_test']    # (N,)
-agg_ret_test   = outputs['agg_ret_test']    # (N,)
+proba          = outputs['proba']
+daily_ret_test = outputs['daily_ret_test']
+y_fwd_test     = outputs['y_fwd_test']
+spy_ret_test   = outputs['spy_ret_test']
+agg_ret_test   = outputs['agg_ret_test']
 test_dates     = pd.DatetimeIndex(outputs['test_dates'])
 target_etfs    = list(outputs['target_etfs'])
 sofr           = float(outputs['sofr'][0])
 etf_names      = [e.replace('_Ret', '') for e in target_etfs]
 
-# ── Apply start year filter ───────────────────────────────────────────────────
-start_mask = test_dates.year >= start_yr
-if start_mask.sum() < 50:
-    st.warning(f"⚠️ Less than 50 test days after {start_yr} filter. Showing all data.")
-    start_mask = np.ones(len(test_dates), dtype=bool)
-
-proba_f      = proba[start_mask]
-daily_ret_f  = daily_ret_test[start_mask]
-y_fwd_f      = y_fwd_test[start_mask]
-spy_ret_f    = spy_ret_test[start_mask]
-agg_ret_f    = agg_ret_test[start_mask]
-test_dates_f = test_dates[start_mask]
-
 # ── Show dataset info ─────────────────────────────────────────────────────────
 if signals:
-    st.info(f"📅 **Data:** {signals['data_start']} → {signals['data_end']} | "
-            f"**OOS Test:** {test_dates_f[0].date()} → {test_dates_f[-1].date()} "
-            f"({len(test_dates_f)} days) | "
-            f"🕒 Last trained: {signals['run_timestamp_utc'][:10]}")
-    if meta:
-        st.caption(f"📐 Lookback: {meta['lookback_days']}d · "
-                   f"Features: {meta['n_features']} · "
-                   f"Split: {meta['split']} · "
-                   f"Targets: {', '.join(etf_names)}")
+    st.info(
+        f"📅 **Trained from:** {signals.get('start_year', '?')} · "
+        f"**Data:** {signals['data_start']} → {signals['data_end']} | "
+        f"**OOS Test:** {signals['test_start']} → {signals['test_end']} "
+        f"({signals['n_test_days']} days) | "
+        f"🕒 Trained: {signals['run_timestamp_utc'][:10]}"
+    )
+if meta:
+    st.caption(
+        f"📐 Lookback: {meta['lookback_days']}d · "
+        f"Features: {meta['n_features']} · "
+        f"Split: {meta['split']} · "
+        f"Targets: {', '.join(etf_names)}"
+    )
 
 # ─────────────────────────────────────────────────────────────────────────────
-# LIVE STRATEGY REPLAY (all sliders applied here — no retraining needed)
+# LIVE STRATEGY REPLAY — all risk sliders applied here
 # ─────────────────────────────────────────────────────────────────────────────
 (strat_rets, audit_trail, next_signal, next_trading_date,
  conviction_zscore, conviction_label, all_etf_scores) = execute_strategy(
-    proba_f, y_fwd_f, test_dates_f, target_etfs,
+    proba, y_fwd_test, test_dates, target_etfs,
     fee_bps,
     stop_loss_pct=stop_loss_pct,
     z_reentry=z_reentry,
     sofr=sofr,
     z_min_entry=z_min_entry,
-    daily_ret_override=daily_ret_f
+    daily_ret_override=daily_ret_test
 )
 
 metrics = calculate_metrics(strat_rets, sofr)
 
-# ── Accuracy info from meta ───────────────────────────────────────────────────
 if meta and 'accuracy_per_etf' in meta:
     st.info(f"🎯 **Binary Accuracy per ETF:** {meta['accuracy_per_etf']} | "
             f"Random baseline: 50.0%")
@@ -353,7 +471,7 @@ c5.metric("⚠️ Max Daily DD",  f"{metrics['max_daily_dd']*100:.2f}%",
 # ─────────────────────────────────────────────────────────────────────────────
 st.subheader("📈 Out-of-Sample Equity Curve (with Benchmarks)")
 
-plot_dates = test_dates_f[:len(metrics['cum_returns'])]
+plot_dates = test_dates[:len(metrics['cum_returns'])]
 fig = go.Figure()
 fig.add_trace(go.Scatter(
     x=plot_dates, y=metrics['cum_returns'], mode='lines',
@@ -366,11 +484,10 @@ fig.add_trace(go.Scatter(
     line=dict(color='rgba(255,255,255,0.3)', width=1, dash='dash')
 ))
 
-# Benchmarks
 spy_m = calculate_benchmark_metrics(
-    np.nan_to_num(spy_ret_f[:len(strat_rets)], nan=0.0), sofr)
+    np.nan_to_num(spy_ret_test[:len(strat_rets)], nan=0.0), sofr)
 agg_m = calculate_benchmark_metrics(
-    np.nan_to_num(agg_ret_f[:len(strat_rets)], nan=0.0), sofr)
+    np.nan_to_num(agg_ret_test[:len(strat_rets)], nan=0.0), sofr)
 
 fig.add_trace(go.Scatter(
     x=plot_dates, y=spy_m['cum_returns'], mode='lines',
@@ -422,6 +539,7 @@ st.divider()
 st.subheader("📖 Methodology & Model Notes")
 lookback_display = meta['lookback_days'] if meta else "auto"
 rf_label_display = signals['rf_label'] if signals else "4.5% fallback"
+trained_start    = signals.get('start_year', start_yr) if signals else start_yr
 
 st.markdown(f"""
 <div style="background:#1a1a2e;border:1px solid #2d2d4e;border-radius:12px;
@@ -434,13 +552,14 @@ At inference time, ETFs are ranked by their confidence probability.</p>
 
 <h4 style="color:#00d1b2;margin-top:20px;">📊 Training Methodology</h4>
 <ul>
+  <li><b>Training period:</b> {trained_start} → present (user-selectable via sidebar)</li>
   <li><b>Split:</b> 80% train / 10% val / 10% test — strictly chronological</li>
   <li><b>Lookback auto-optimised:</b> Best window = <b>{lookback_display} days</b></li>
-  <li><b>Retrained daily</b> via GitHub Actions on the latest data from HF Dataset</li>
+  <li><b>Runs on GitHub Actions</b> — triggered from sidebar, outputs saved to HF Dataset</li>
   <li><b>Risk-free rate:</b> {sofr*100:.2f}% ({rf_label_display})</li>
 </ul>
 
-<h4 style="color:#00d1b2;margin-top:20px;">⚙️ Strategy Execution (live, applied to saved predictions)</h4>
+<h4 style="color:#00d1b2;margin-top:20px;">⚙️ Strategy Execution (live — applied to saved predictions)</h4>
 <ul>
   <li><b>Conviction gate (σ={z_min_entry}):</b> Only enter if top ETF sits ≥ {z_min_entry}σ above mean</li>
   <li><b>Trailing stop-loss ({stop_loss_pct*100:.0f}%):</b> Switch to CASH if 2-day cumulative ≤ threshold</li>

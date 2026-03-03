@@ -34,8 +34,11 @@ jobs:
           python-version: "3.11"
           cache: "pip"
 
+     
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: |
+          pip install --no-cache-dir -r requirements.txt
+          pip install --no-cache-dir --force-reinstall pandas-datareader==0.10.0
 
       - name: Train TFT models and push outputs to HF Space
         run: |

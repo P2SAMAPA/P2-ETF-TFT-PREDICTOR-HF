@@ -351,8 +351,9 @@ def main(force_refresh: bool = False, start_year: int = 2016):
         "run_timestamp_utc": datetime.now(timezone.utc).isoformat(),
     }
 
-    # ── 14. Push all outputs to HF Space repo ────────────────────────────────
+    # ── 14. Push all outputs to HF output repo ───────────────────────────────
     run_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    is_sweep_year = start_year in [2008, 2014, 2016, 2019, 2021]
 
     push_file_to_hf_output(
         "model_outputs.npz",
@@ -372,6 +373,33 @@ def main(force_refresh: bool = False, start_year: int = 2016):
         f"Update training meta {run_date}",
         token
     )
+
+    # Also push sweep cache files (never wiped by midnight cleanup)
+    if is_sweep_year:
+        # Compute backtest metrics for sweep scoring
+        from strategy import execute_strategy, calculate_metrics
+        strat_rets_sweep, _, _, _, _, _, _ = execute_strategy(
+            proba, y_fwd_test, test_dates, target_etfs,
+            fee_bps=15, stop_loss_pct=-0.12, z_reentry=1.0,
+            sofr=sofr, z_min_entry=0.5,
+            daily_ret_override=daily_ret_test
+        )
+        sweep_metrics = calculate_metrics(strat_rets_sweep, sofr)
+
+        sweep_payload = {
+            **signals_payload,
+            "ann_return":   round(float(sweep_metrics['ann_return']), 6),
+            "sharpe":       round(float(sweep_metrics['sharpe']), 4),
+            "max_dd":       round(float(sweep_metrics['max_dd']), 6),
+            "is_sweep":     True,
+        }
+        push_file_to_hf_output(
+            f"signals_{start_year}.json",
+            json.dumps(sweep_payload, indent=2).encode(),
+            f"Sweep cache {start_year} → {next_signal}",
+            token
+        )
+        log.info(f"✅ Sweep cache pushed: signals_{start_year}.json")
 
     log.info(f"✅ All outputs pushed to {HF_OUTPUT_REPO}")
     log.info(f"📡 Next signal: {next_signal} on {next_date} "

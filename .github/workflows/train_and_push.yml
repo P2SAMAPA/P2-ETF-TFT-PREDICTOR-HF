@@ -1,0 +1,54 @@
+# .github/workflows/train_and_push.yml
+# Runs every weekday at 12:00 UTC (7am EST)
+# Retrains TFT models on latest data and pushes outputs to HF Space
+
+name: Daily TFT Training
+
+on:
+  schedule:
+    - cron: "0 12 * * 1-5"   # 12:00 UTC = 7:00am EST, Mon-Fri
+  workflow_dispatch:
+    inputs:
+      force_refresh:
+        description: "Force full dataset rebuild"
+        required: false
+        default: "false"
+        type: boolean
+
+jobs:
+  train:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180   # TFT training can take ~2hrs on CPU
+
+    env:
+      HF_TOKEN:     ${{ secrets.HF_TOKEN }}
+      FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Train TFT models and push outputs to HF Space
+        run: |
+          ARGS=""
+          if [ "${{ github.event.inputs.force_refresh }}" = "true" ]; then
+            ARGS="--force-refresh"
+          fi
+          python train_pipeline.py $ARGS
+
+      - name: Upload training logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: training-logs-${{ github.run_id }}
+          path: "*.log"
+          retention-days: 7

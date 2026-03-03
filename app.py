@@ -24,19 +24,19 @@ from strategy import execute_strategy, calculate_metrics, calculate_benchmark_me
 
 st.set_page_config(page_title="P2-ETF-Predictor | TFT", layout="wide")
 
-HF_SPACE_REPO = "P2SAMAPA/P2-ETF-TFT-PREDICTOR"
+HF_OUTPUT_REPO = "P2SAMAPA/p2-etf-tft-outputs"   # dedicated dataset repo for model outputs
 
 
 @st.cache_data(ttl=1800)
 def load_model_outputs():
-    """Load pre-computed model outputs from HF Space repo via hf_hub_download."""
+    """Load pre-computed model outputs from HF Dataset repo."""
     try:
         from huggingface_hub import hf_hub_download
         path = hf_hub_download(
-            repo_id=HF_SPACE_REPO,
+            repo_id=HF_OUTPUT_REPO,
             filename="model_outputs.npz",
-            repo_type="space",
-            force_download=True,   # always get latest, bypass local cache
+            repo_type="dataset",
+            force_download=True,
         )
         npz = np.load(path, allow_pickle=True)
         data = {k: npz[k] for k in npz.files}
@@ -47,13 +47,13 @@ def load_model_outputs():
 
 @st.cache_data(ttl=1800)
 def load_signals():
-    """Load latest signals.json from HF Space repo."""
+    """Load latest signals.json from HF Dataset repo."""
     try:
         from huggingface_hub import hf_hub_download
         path = hf_hub_download(
-            repo_id=HF_SPACE_REPO,
+            repo_id=HF_OUTPUT_REPO,
             filename="signals.json",
-            repo_type="space",
+            repo_type="dataset",
             force_download=True,
         )
         with open(path) as f:
@@ -64,13 +64,13 @@ def load_signals():
 
 @st.cache_data(ttl=1800)
 def load_training_meta():
-    """Load training_meta.json from HF Space repo."""
+    """Load training_meta.json from HF Dataset repo."""
     try:
         from huggingface_hub import hf_hub_download
         path = hf_hub_download(
-            repo_id=HF_SPACE_REPO,
+            repo_id=HF_OUTPUT_REPO,
             filename="training_meta.json",
-            repo_type="space",
+            repo_type="dataset",
             force_download=True,
         )
         with open(path) as f:

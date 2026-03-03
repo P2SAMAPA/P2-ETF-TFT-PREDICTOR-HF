@@ -74,6 +74,7 @@ def push_file_to_hf_space(filename: str, content_bytes: bytes,
     api = HfApi()
     ops = [CommitOperationAdd(path_in_repo=filename,
                                path_or_fileobj=content_bytes)]
+    print(f"Pushing {filename} to repo_id={HF_SPACE_REPO} repo_type=space")                        
     api.create_commit(
         repo_id=HF_SPACE_REPO,
         repo_type="space",

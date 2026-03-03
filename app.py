@@ -16,7 +16,6 @@ import numpy as np
 import plotly.graph_objects as go
 import json
 import os
-import requests
 import time
 
 from utils import get_est_time, is_sync_window
@@ -25,20 +24,21 @@ from strategy import execute_strategy, calculate_metrics, calculate_benchmark_me
 
 st.set_page_config(page_title="P2-ETF-Predictor | TFT", layout="wide")
 
-# ── HF Space raw URL base ─────────────────────────────────────────────────────
-HF_SPACE_RAW = "https://huggingface.co/spaces/P2SAMAPA/P2-ETF-TFT-PREDICTOR/resolve/main"
+HF_SPACE_REPO = "P2SAMAPA/P2-ETF-TFT-PREDICTOR"
 
 
-@st.cache_data(ttl=1800)   # refresh cache every 30 min
+@st.cache_data(ttl=1800)
 def load_model_outputs():
+    """Load pre-computed model outputs from HF Space repo via hf_hub_download."""
     try:
-        url = f"{HF_SPACE_RAW}/model_outputs.npz?t={int(time.time())}"
-        r = requests.get(url, timeout=60)
-        if r.status_code != 200:
-            return {}, f"model_outputs.npz not found (HTTP {r.status_code})"
-        from io import BytesIO
-        npz = np.load(BytesIO(r.content), allow_pickle=True)
-        # Convert NpzFile → plain dict so st.cache_data can pickle it
+        from huggingface_hub import hf_hub_download
+        path = hf_hub_download(
+            repo_id=HF_SPACE_REPO,
+            filename="model_outputs.npz",
+            repo_type="space",
+            force_download=True,   # always get latest, bypass local cache
+        )
+        npz = np.load(path, allow_pickle=True)
         data = {k: npz[k] for k in npz.files}
         return data, None
     except Exception as e:
@@ -49,11 +49,15 @@ def load_model_outputs():
 def load_signals():
     """Load latest signals.json from HF Space repo."""
     try:
-        url = f"{HF_SPACE_RAW}/signals.json?t={int(time.time())}"
-        r = requests.get(url, timeout=30)
-        if r.status_code != 200:
-            return None, f"signals.json not found (HTTP {r.status_code})"
-        return r.json(), None
+        from huggingface_hub import hf_hub_download
+        path = hf_hub_download(
+            repo_id=HF_SPACE_REPO,
+            filename="signals.json",
+            repo_type="space",
+            force_download=True,
+        )
+        with open(path) as f:
+            return json.load(f), None
     except Exception as e:
         return None, str(e)
 
@@ -62,11 +66,15 @@ def load_signals():
 def load_training_meta():
     """Load training_meta.json from HF Space repo."""
     try:
-        url = f"{HF_SPACE_RAW}/training_meta.json?t={int(time.time())}"
-        r = requests.get(url, timeout=30)
-        if r.status_code != 200:
-            return None
-        return r.json()
+        from huggingface_hub import hf_hub_download
+        path = hf_hub_download(
+            repo_id=HF_SPACE_REPO,
+            filename="training_meta.json",
+            repo_type="space",
+            force_download=True,
+        )
+        with open(path) as f:
+            return json.load(f)
     except Exception:
         return None
 

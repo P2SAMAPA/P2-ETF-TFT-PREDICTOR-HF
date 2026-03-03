@@ -31,17 +31,18 @@ HF_SPACE_RAW = "https://huggingface.co/spaces/P2SAMAPA/P2-ETF-TFT-PREDICTOR/reso
 
 @st.cache_data(ttl=1800)   # refresh cache every 30 min
 def load_model_outputs():
-    """Load pre-computed model outputs from HF Space repo."""
     try:
         url = f"{HF_SPACE_RAW}/model_outputs.npz?t={int(time.time())}"
         r = requests.get(url, timeout=60)
         if r.status_code != 200:
-            return None, f"model_outputs.npz not found (HTTP {r.status_code})"
+            return {}, f"model_outputs.npz not found (HTTP {r.status_code})"
         from io import BytesIO
-        data = np.load(BytesIO(r.content), allow_pickle=True)
+        npz = np.load(BytesIO(r.content), allow_pickle=True)
+        # Convert NpzFile → plain dict so st.cache_data can pickle it
+        data = {k: npz[k] for k in npz.files}
         return data, None
     except Exception as e:
-        return None, str(e)
+        return {}, str(e)
 
 
 @st.cache_data(ttl=1800)

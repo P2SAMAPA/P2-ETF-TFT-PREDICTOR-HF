@@ -99,7 +99,7 @@ def fetch_sofr():
     return 0.045, "fallback 4.5%"
 
 
-def main(force_refresh: bool = False, start_year: int = 2016):
+def main(force_refresh: bool = False, start_year: int = 2016, sweep_date: str = None):
     token = os.getenv("HF_TOKEN")
     if not token:
         raise RuntimeError("HF_TOKEN environment variable not set")
@@ -393,13 +393,17 @@ def main(force_refresh: bool = False, start_year: int = 2016):
             "max_dd":       round(float(sweep_metrics['max_dd']), 6),
             "is_sweep":     True,
         }
+        # Date-stamp: signals_2008_20260304.json
+        from datetime import timezone as _tz
+        _date_tag = sweep_date or (datetime.now(_tz.utc) - timedelta(hours=5)).strftime("%Y%m%d")
+        sweep_fname = f"signals_{start_year}_{_date_tag}.json"
         push_file_to_hf_output(
-            f"signals_{start_year}.json",
+            sweep_fname,
             json.dumps(sweep_payload, indent=2).encode(),
-            f"Sweep cache {start_year} → {next_signal}",
+            f"Sweep cache {start_year} {_date_tag} → {next_signal}",
             token
         )
-        log.info(f"✅ Sweep cache pushed: signals_{start_year}.json")
+        log.info(f"✅ Sweep cache pushed: {sweep_fname}")
 
     log.info(f"✅ All outputs pushed to {HF_OUTPUT_REPO}")
     log.info(f"📡 Next signal: {next_signal} on {next_date} "
@@ -412,5 +416,7 @@ if __name__ == "__main__":
                         help="Force full dataset rebuild")
     parser.add_argument("--start-year", type=int, default=2016,
                         help="Start year for training data (default: 2016)")
+    parser.add_argument("--sweep-date", type=str, default=None,
+                        help="Date stamp for sweep file e.g. 20260304 (default: today EST)")
     args = parser.parse_args()
-    main(force_refresh=args.force_refresh, start_year=args.start_year)
+    main(force_refresh=args.force_refresh, start_year=args.start_year, sweep_date=args.sweep_date)

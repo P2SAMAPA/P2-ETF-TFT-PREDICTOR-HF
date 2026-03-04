@@ -73,8 +73,8 @@ def load_training_meta():
 
 
 def _today_est():
-    from datetime import timezone
-    return (datetime.now(timezone.utc) - timedelta(hours=5)).date()
+    from datetime import datetime as _dt, timezone, timedelta
+    return (_dt.now(timezone.utc) - timedelta(hours=5)).date()
 
 
 @st.cache_data(ttl=60)

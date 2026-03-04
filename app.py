@@ -72,17 +72,40 @@ def load_training_meta():
         return None
 
 
-@st.cache_data(ttl=300)
-def load_sweep_signals(year: int):
-    """Load cached sweep signals for a given year. Returns None if not yet trained."""
+def _today_est():
+    from datetime import timezone
+    return (datetime.now(timezone.utc) - timedelta(hours=5)).date()
+
+
+@st.cache_data(ttl=60)
+def load_sweep_signals(year: int, for_date: str):
+    """Load date-stamped sweep signals. Returns (data, is_today)."""
+    from huggingface_hub import hf_hub_download
+    date_tag = for_date.replace("-", "")
+
+    # Try today's file
     try:
-        from huggingface_hub import hf_hub_download
-        path = hf_hub_download(repo_id=HF_OUTPUT_REPO, filename=f"signals_{year}.json",
+        path = hf_hub_download(repo_id=HF_OUTPUT_REPO,
+                               filename=f"signals_{year}_{date_tag}.json",
                                repo_type="dataset", force_download=True)
         with open(path) as f:
-            return json.load(f)
+            return json.load(f), True
     except Exception:
-        return None
+        pass
+
+    # Fall back to yesterday's file
+    try:
+        from datetime import date as _date, timedelta as _td
+        yesterday = (_date.fromisoformat(for_date) - _td(days=1)).strftime("%Y%m%d")
+        path = hf_hub_download(repo_id=HF_OUTPUT_REPO,
+                               filename=f"signals_{year}_{yesterday}.json",
+                               repo_type="dataset", force_download=True)
+        with open(path) as f:
+            return json.load(f), False
+    except Exception:
+        pass
+
+    return None, False
 
 
 # ── GitHub Actions helpers ────────────────────────────────────────────────────
@@ -561,15 +584,43 @@ with tab2:
         "**Score:** 40% Return · 20% Z · 20% Sharpe · 20% (–MaxDD)"
     )
 
-    # ── Load cached sweep signals ─────────────────────────────────────────────
-    sweep_cache = {}
-    missing_years = []
+    # ── Date-aware sweep cache loading ───────────────────────────────────────
+    today_str   = str(_today_est())
+    sweep_cache = {}       # today's results
+    prev_cache  = {}       # yesterday's results (fallback)
+    stale_years = []       # years where only yesterday's data exists
+    missing_years = []     # years with no data at all
+
     for yr in SWEEP_YEARS:
-        cached = load_sweep_signals(yr)
-        if cached:
-            sweep_cache[yr] = cached
+        data, is_today = load_sweep_signals(yr, today_str)
+        if data and is_today:
+            sweep_cache[yr] = data
+        elif data and not is_today:
+            prev_cache[yr]  = data
+            stale_years.append(yr)
         else:
             missing_years.append(yr)
+
+    # Display cache = today's where available, yesterday's as fallback
+    display_cache = {**prev_cache, **sweep_cache}  # today overrides yesterday
+    years_needing_run = [yr for yr in SWEEP_YEARS if yr not in sweep_cache]
+    sweep_complete = len(sweep_cache) == len(SWEEP_YEARS)
+
+    # ── Stale data warning banner ─────────────────────────────────────────────
+    if stale_years and not sweep_complete:
+        from datetime import date as _d, timedelta as _td
+        yesterday = str(_d.fromisoformat(today_str) - _td(days=1))
+        st.warning(
+            f"⚠️ Showing **yesterday's results** ({yesterday}) for: "
+            f"{', '.join(str(y) for y in stale_years)}. "
+            f"Today's sweep has not run yet — auto-runs at 8pm EST or click below.",
+            icon="📅"
+        )
+    if is_training and not sweep_complete:
+        st.info(
+            f"⏳ **Training in progress** — {len(sweep_cache)}/{len(SWEEP_YEARS)} years "
+            f"complete today. Showing previous results where available.", icon="🔄"
+        )
 
     # ── Status grid ──────────────────────────────────────────────────────────
     cols = st.columns(len(SWEEP_YEARS))
@@ -577,10 +628,14 @@ with tab2:
         with cols[i]:
             if yr in sweep_cache:
                 sig = sweep_cache[yr]['next_signal']
-                st.success(f"**{yr}**\n⚡ {sig}")
+                st.success(f"**{yr}**\n✅ {sig}")
+            elif yr in prev_cache:
+                sig = prev_cache[yr]['next_signal']
+                st.warning(f"**{yr}**\n📅 {sig}")
             else:
                 st.error(f"**{yr}**\n⏳ Not run")
 
+    st.caption("✅ = today's result  ·  📅 = yesterday's result (stale)  ·  ⏳ = not yet run")
     st.divider()
 
     # ── Sweep button ──────────────────────────────────────────────────────────
@@ -590,30 +645,32 @@ with tab2:
             "🚀 Run Consensus Sweep",
             type="primary",
             use_container_width=True,
-            disabled=(is_training or len(missing_years) == 0),
-            help="Triggers parallel GitHub Actions jobs for missing years only"
+            disabled=(is_training or sweep_complete),
+            help="Only runs years missing today's fresh results"
         )
     with col_info:
-        if len(missing_years) == 0:
-            st.success("✅ All years cached — consensus ready!")
+        if sweep_complete:
+            st.success(f"✅ Today's sweep complete ({today_str}) — {len(SWEEP_YEARS)}/{len(SWEEP_YEARS)} years fresh")
         elif is_training:
-            st.warning(f"⏳ Training in progress... ({len(sweep_cache)}/{len(SWEEP_YEARS)} cached)")
+            st.warning(f"⏳ Training in progress... ({len(sweep_cache)}/{len(SWEEP_YEARS)} fresh today)")
         else:
-            st.info(f"⚡ **{len(sweep_cache)}/{len(SWEEP_YEARS)}** years cached · "
-                    f"Will trigger **{len(missing_years)}** parallel jobs: "
-                    f"{', '.join(str(y) for y in missing_years)}")
+            st.info(
+                f"**{len(sweep_cache)}/{len(SWEEP_YEARS)}** years fresh for today ({today_str}).  \n"
+                f"Will trigger **{len(years_needing_run)}** jobs: "
+                f"{', '.join(str(y) for y in years_needing_run)}"
+            )
 
-    if sweep_btn and missing_years:
-        sweep_mode_str = ",".join(str(y) for y in missing_years)
+    if sweep_btn and years_needing_run:
+        sweep_mode_str = ",".join(str(y) for y in years_needing_run)
         with st.spinner(f"🚀 Triggering parallel training for: {sweep_mode_str}..."):
             ok = trigger_github_training(
-                start_year=missing_years[0],
+                start_year=years_needing_run[0],
                 sweep_mode=sweep_mode_str,
                 force_refresh=False
             )
         if ok:
             st.success(
-                f"✅ Triggered **{len(missing_years)}** parallel jobs for: {sweep_mode_str}. "
+                f"✅ Triggered **{len(years_needing_run)}** parallel jobs for: {sweep_mode_str}. "
                 f"Each takes ~90 mins. Refresh this tab when complete."
             )
             time.sleep(2)
@@ -622,11 +679,11 @@ with tab2:
             st.error("❌ Failed to trigger GitHub Actions sweep.")
 
     # ── Consensus results ─────────────────────────────────────────────────────
-    if len(sweep_cache) == 0:
+    if len(display_cache) == 0:
         st.info("👆 Click **🚀 Run Consensus Sweep** to train all years.")
         st.stop()
 
-    consensus = compute_consensus(sweep_cache)
+    consensus = compute_consensus(display_cache)
     if not consensus:
         st.warning("⚠️ Could not compute consensus.")
         st.stop()
@@ -635,7 +692,7 @@ with tab2:
     w_info      = consensus['etf_summary'][winner]
     win_color   = ETF_COLORS.get(winner, "#00d1b2")
     score_share = w_info['score_share'] * 100
-    n_cached    = len(sweep_cache)
+    n_cached    = len(display_cache)
 
     # ── Consensus winner banner ───────────────────────────────────────────────
     split_signal = w_info['score_share'] < 0.4
@@ -648,7 +705,7 @@ with tab2:
                 padding:32px;text-align:center;margin:20px 0;
                 box-shadow:0 8px 24px rgba(0,0,0,0.4);">
       <div style="font-size:11px;letter-spacing:3px;color:#aaa;margin-bottom:12px;">
-        WEIGHTED CONSENSUS · TFT · {n_cached} START YEARS
+        WEIGHTED CONSENSUS · TFT · {n_cached} START YEARS · {today_str}
       </div>
       <div style="font-size:72px;font-weight:900;color:{win_color};
                   text-shadow:0 0 30px {win_color}88;letter-spacing:2px;">
@@ -762,7 +819,7 @@ with tab2:
     for row in sorted(consensus['per_year'], key=lambda r: r['year']):
         etf    = row['signal']
         col    = ETF_COLORS.get(etf, "#888")
-        cached = row['year'] in sweep_cache
+        _in_today = row['year'] in sweep_cache
         table_rows.append({
             'Start Year':   row['year'],
             'Signal':       etf,
@@ -773,7 +830,7 @@ with tab2:
             'Sharpe':       f"{row['sharpe']:.2f}",
             'Max Drawdown': f"{row['max_dd']*100:.2f}%",
             'Lookback':     f"{row['lookback']}d",
-            'Cache':        "⚡" if cached else "🆕",
+            'Cache':        "✅ Today" if row['year'] in sweep_cache else "📅 Prev",
         })
 
     tbl_df = pd.DataFrame(table_rows)

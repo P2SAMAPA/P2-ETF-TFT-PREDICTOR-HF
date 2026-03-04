@@ -8,8 +8,10 @@ name: Daily TFT Training
 
 on:
   schedule:
-    - cron: "0 12 * * 1-5"   # 12:00 UTC = 7am EST Mon-Fri
+    - cron: "0 12 * * 1-5"   # 12:00 UTC = 7am EST Mon-Fri (single-year default)
     - cron: "0 5 * * *"       # 05:00 UTC = midnight EST daily cleanup
+    - cron: "0 1 * * 2-6"    # 01:00 UTC = 8pm EST Mon-Fri (daily consensus sweep)
+    - cron: "0 0 * * 2-6"    # 00:00 UTC = 7pm EST Mon-Fri (wipe previous day's sweep)
   workflow_dispatch:
     inputs:
       start_year:
@@ -30,7 +32,47 @@ on:
 
 jobs:
 
-  # ── Midnight cleanup — wipes single-year outputs, keeps sweep cache ─────────
+  # ── 7pm EST: wipe previous day sweep cache from HF dataset ─────────────────
+  wipe_sweep_cache:
+    if: >
+      github.event_name == 'schedule' &&
+      github.event.schedule == '0 0 * * 2-6'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+    steps:
+      - name: Delete stale dated sweep files from HF dataset
+        run: |
+          pip install huggingface_hub -q
+          python3 - <<'PYEOF'
+          import os
+          from datetime import datetime, timezone, timedelta
+          from huggingface_hub import HfApi
+          api   = HfApi()
+          token = os.environ["HF_TOKEN"]
+          repo  = "P2SAMAPA/p2-etf-tft-outputs"
+          today = (datetime.now(timezone.utc) - timedelta(hours=5)).strftime("%Y%m%d")
+          try:
+              files = api.list_repo_files(repo_id=repo, repo_type="dataset", token=token)
+          except Exception as e:
+              print(f"Could not list files: {e}"); files = []
+          deleted = 0
+          for f in files:
+              if f.startswith("signals_") and f.endswith(".json") and "_" in f[9:]:
+                  parts = f.replace(".json","").split("_")
+                  if len(parts) == 3 and parts[2] != today:
+                      try:
+                          api.delete_file(path_in_repo=f, repo_id=repo,
+                              repo_type="dataset", token=token,
+                              commit_message=f"Wipe stale sweep: {f}")
+                          print(f"Deleted {f}"); deleted += 1
+                      except Exception as e:
+                          print(f"Could not delete {f}: {e}")
+          print(f"Wiped {deleted} stale sweep files")
+          PYEOF
+
+  # ── Midnight cleanup — wipes single-year outputs only ────────────────────────
   cleanup:
     if: >
       github.event_name == 'schedule' &&
@@ -43,7 +85,7 @@ jobs:
       - name: Wipe single-year outputs (preserve sweep cache)
         run: |
           pip install huggingface_hub -q
-          python - <<'EOF'
+          python3 - <<'PYEOF'
           import os
           from huggingface_hub import HfApi
           api = HfApi()
@@ -51,18 +93,14 @@ jobs:
           repo_id = "P2SAMAPA/p2-etf-tft-outputs"
           for filename in ["model_outputs.npz", "signals.json", "training_meta.json"]:
               try:
-                  api.delete_file(
-                      path_in_repo=filename,
-                      repo_id=repo_id,
-                      repo_type="dataset",
-                      token=token,
-                      commit_message=f"Midnight cleanup: {filename}"
-                  )
+                  api.delete_file(path_in_repo=filename, repo_id=repo_id,
+                      repo_type="dataset", token=token,
+                      commit_message=f"Midnight cleanup: {filename}")
                   print(f"Deleted {filename}")
               except Exception as e:
-                  print(f"{filename} not found or already gone: {e}")
-          print("Cleanup done — sweep cache preserved")
-          EOF
+                  print(f"{filename} not found: {e}")
+          print("Cleanup done")
+          PYEOF
 
   # ── Single-year train — daily default + manual (no sweep_mode) ──────────────
   train:
@@ -103,8 +141,8 @@ jobs:
   # ── Sweep 2008 ───────────────────────────────────────────────────────────────
   sweep_2008:
     if: >
-      github.event_name == 'workflow_dispatch' &&
-      contains(github.event.inputs.sweep_mode, '2008')
+      (github.event_name == 'schedule' && github.event.schedule == '0 1 * * 2-6') ||
+      (github.event_name == 'workflow_dispatch' && contains(github.event.inputs.sweep_mode, '2008'))
     runs-on: ubuntu-latest
     timeout-minutes: 180
     env:
@@ -117,7 +155,7 @@ jobs:
           python-version: "3.11"
           cache: "pip"
       - run: pip install --no-cache-dir -r requirements.txt
-      - run: python train_pipeline.py --start-year 2008
+      - run: python train_pipeline.py --start-year 2008 --sweep-date $(date -u -d "-5 hours" +%Y%m%d 2>/dev/null || date -u +%Y%m%d)
       - if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -128,8 +166,8 @@ jobs:
   # ── Sweep 2014 ───────────────────────────────────────────────────────────────
   sweep_2014:
     if: >
-      github.event_name == 'workflow_dispatch' &&
-      contains(github.event.inputs.sweep_mode, '2014')
+      (github.event_name == 'schedule' && github.event.schedule == '0 1 * * 2-6') ||
+      (github.event_name == 'workflow_dispatch' && contains(github.event.inputs.sweep_mode, '2014'))
     runs-on: ubuntu-latest
     timeout-minutes: 180
     env:
@@ -142,7 +180,7 @@ jobs:
           python-version: "3.11"
           cache: "pip"
       - run: pip install --no-cache-dir -r requirements.txt
-      - run: python train_pipeline.py --start-year 2014
+      - run: python train_pipeline.py --start-year 2014 --sweep-date $(date -u -d "-5 hours" +%Y%m%d 2>/dev/null || date -u +%Y%m%d)
       - if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -153,8 +191,8 @@ jobs:
   # ── Sweep 2016 ───────────────────────────────────────────────────────────────
   sweep_2016:
     if: >
-      github.event_name == 'workflow_dispatch' &&
-      contains(github.event.inputs.sweep_mode, '2016')
+      (github.event_name == 'schedule' && github.event.schedule == '0 1 * * 2-6') ||
+      (github.event_name == 'workflow_dispatch' && contains(github.event.inputs.sweep_mode, '2016'))
     runs-on: ubuntu-latest
     timeout-minutes: 180
     env:
@@ -167,7 +205,7 @@ jobs:
           python-version: "3.11"
           cache: "pip"
       - run: pip install --no-cache-dir -r requirements.txt
-      - run: python train_pipeline.py --start-year 2016
+      - run: python train_pipeline.py --start-year 2016 --sweep-date $(date -u -d "-5 hours" +%Y%m%d 2>/dev/null || date -u +%Y%m%d)
       - if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -178,8 +216,8 @@ jobs:
   # ── Sweep 2019 ───────────────────────────────────────────────────────────────
   sweep_2019:
     if: >
-      github.event_name == 'workflow_dispatch' &&
-      contains(github.event.inputs.sweep_mode, '2019')
+      (github.event_name == 'schedule' && github.event.schedule == '0 1 * * 2-6') ||
+      (github.event_name == 'workflow_dispatch' && contains(github.event.inputs.sweep_mode, '2019'))
     runs-on: ubuntu-latest
     timeout-minutes: 180
     env:
@@ -192,7 +230,7 @@ jobs:
           python-version: "3.11"
           cache: "pip"
       - run: pip install --no-cache-dir -r requirements.txt
-      - run: python train_pipeline.py --start-year 2019
+      - run: python train_pipeline.py --start-year 2019 --sweep-date $(date -u -d "-5 hours" +%Y%m%d 2>/dev/null || date -u +%Y%m%d)
       - if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -203,8 +241,8 @@ jobs:
   # ── Sweep 2021 ───────────────────────────────────────────────────────────────
   sweep_2021:
     if: >
-      github.event_name == 'workflow_dispatch' &&
-      contains(github.event.inputs.sweep_mode, '2021')
+      (github.event_name == 'schedule' && github.event.schedule == '0 1 * * 2-6') ||
+      (github.event_name == 'workflow_dispatch' && contains(github.event.inputs.sweep_mode, '2021'))
     runs-on: ubuntu-latest
     timeout-minutes: 180
     env:
@@ -217,7 +255,7 @@ jobs:
           python-version: "3.11"
           cache: "pip"
       - run: pip install --no-cache-dir -r requirements.txt
-      - run: python train_pipeline.py --start-year 2021
+      - run: python train_pipeline.py --start-year 2021 --sweep-date $(date -u -d "-5 hours" +%Y%m%d 2>/dev/null || date -u +%Y%m%d)
       - if: always()
         uses: actions/upload-artifact@v4
         with:

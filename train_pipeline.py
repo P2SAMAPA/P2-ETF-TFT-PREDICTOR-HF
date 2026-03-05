@@ -99,7 +99,7 @@ def fetch_sofr():
     return 0.045, "fallback 4.5%"
 
 
-def main(force_refresh: bool = False):
+def main(force_refresh: bool = False, start_year: int = None, sweep_date: str = None):
     token = os.getenv("HF_TOKEN")
     if not token:
         raise RuntimeError("HF_TOKEN environment variable not set")
@@ -119,7 +119,8 @@ def main(force_refresh: bool = False):
 
     # ── 2. Load dataset (reads P2SAMAPA/my-etf-data, never writes it) ────────
     log.info("Loading dataset from HF...")
-    df = get_data(start_year=2008, force_refresh=force_refresh,
+    _eff_start = start_year if start_year else 2008
+    df = get_data(start_year=_eff_start, force_refresh=force_refresh,
                   clean_hf_dataset=False)
     if df is None or df.empty:
         raise RuntimeError("Dataset is empty — aborting")
@@ -335,6 +336,39 @@ def main(force_refresh: bool = False):
         "run_timestamp_utc": datetime.now(timezone.utc).isoformat(),
     }
 
+    # ── Write date-stamped sweep JSON to HF Dataset ──────────────────────────
+    SWEEP_YEARS = [2008, 2014, 2016, 2019, 2021]
+    if _eff_start in SWEEP_YEARS:
+        try:
+            from huggingface_hub import HfApi, CommitOperationAdd
+            _date_tag    = sweep_date or (datetime.now(timezone.utc) - timedelta(hours=5)).strftime("%Y%m%d")
+            _sweep_fname = f"signals_{_eff_start}_{_date_tag}.json"
+            _sweep_data  = {
+                "next_signal":    next_signal,
+                "conviction_z":   round(float(conviction_z), 4),
+                "ann_return":     signals_payload.get("ann_return", 0.0),
+                "sharpe":         signals_payload.get("sharpe", 0.0),
+                "max_dd":         signals_payload.get("max_dd", 0.0),
+                "start_year":     _eff_start,
+                "sweep_date":     _date_tag,
+                "etf_scores":     signals_payload.get("etf_scores", {}),
+            }
+            _api = HfApi()
+            _op  = CommitOperationAdd(
+                path_in_repo=_sweep_fname,
+                path_or_fileobj=json.dumps(_sweep_data, indent=2).encode(),
+            )
+            _api.create_commit(
+                repo_id="P2SAMAPA/p2-etf-tft-outputs",
+                repo_type="dataset",
+                operations=[_op],
+                token=token,
+                commit_message=f"[sweep] {_eff_start} {_date_tag} → {next_signal}",
+            )
+            log.info(f"✅ Sweep cache pushed: {_sweep_fname}  signal={next_signal}  z={conviction_z:.3f}")
+        except Exception as _e:
+            log.warning(f"  Sweep JSON push failed (non-fatal): {_e}")
+
     # ── 14. Push all outputs to HF Space repo ────────────────────────────────
     run_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
@@ -366,5 +400,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--force-refresh", action="store_true",
                         help="Force full dataset rebuild")
+    parser.add_argument("--start-year", type=int, default=None,
+                        help="Override training start year (e.g. 2008, 2014, 2016)")
+    parser.add_argument("--sweep-date", default=None,
+                        help="Date tag for sweep cache file (YYYYMMDD)")
     args = parser.parse_args()
-    main(force_refresh=args.force_refresh)
+    main(force_refresh=args.force_refresh,
+         start_year=args.start_year,
+         sweep_date=args.sweep_date)

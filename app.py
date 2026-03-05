@@ -639,38 +639,42 @@ with tab2:
     st.divider()
 
     # ── Sweep button ──────────────────────────────────────────────────────────
+    force_rerun   = st.checkbox("🔄 Force re-run all years", value=False,
+                                help="Re-trains even if today\'s results already exist")
+    trigger_years = SWEEP_YEARS if force_rerun else years_needing_run
+
     col_btn, col_info = st.columns([1, 3])
     with col_btn:
         sweep_btn = st.button(
             "🚀 Run Consensus Sweep",
             type="primary",
             use_container_width=True,
-            disabled=(is_training or sweep_complete),
-            help="Only runs years missing today's fresh results"
+            disabled=(is_training or (sweep_complete and not force_rerun)),
+            help="Only runs years missing today\'s fresh results"
         )
     with col_info:
-        if sweep_complete:
+        if sweep_complete and not force_rerun:
             st.success(f"✅ Today's sweep complete ({today_str}) — {len(SWEEP_YEARS)}/{len(SWEEP_YEARS)} years fresh")
         elif is_training:
             st.warning(f"⏳ Training in progress... ({len(sweep_cache)}/{len(SWEEP_YEARS)} fresh today)")
         else:
             st.info(
                 f"**{len(sweep_cache)}/{len(SWEEP_YEARS)}** years fresh for today ({today_str}).  \n"
-                f"Will trigger **{len(years_needing_run)}** jobs: "
-                f"{', '.join(str(y) for y in years_needing_run)}"
+                f"Will trigger **{len(trigger_years)}** jobs: "
+                f"{', '.join(str(y) for y in trigger_years)}"
             )
 
-    if sweep_btn and years_needing_run:
-        sweep_mode_str = ",".join(str(y) for y in years_needing_run)
+    if sweep_btn and trigger_years:
+        sweep_mode_str = ",".join(str(y) for y in trigger_years)
         with st.spinner(f"🚀 Triggering parallel training for: {sweep_mode_str}..."):
             ok = trigger_github_training(
-                start_year=years_needing_run[0],
+                start_year=trigger_years[0],
                 sweep_mode=sweep_mode_str,
                 force_refresh=False
             )
         if ok:
             st.success(
-                f"✅ Triggered **{len(years_needing_run)}** parallel jobs for: {sweep_mode_str}. "
+                f"✅ Triggered **{len(trigger_years)}** parallel jobs for: {sweep_mode_str}. "
                 f"Each takes ~90 mins. Refresh this tab when complete."
             )
             time.sleep(2)

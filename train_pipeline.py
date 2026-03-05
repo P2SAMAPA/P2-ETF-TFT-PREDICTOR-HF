@@ -20,7 +20,7 @@ import logging
 import argparse
 import numpy as np
 import pandas as pd
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from io import StringIO
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -37,8 +37,8 @@ log = logging.getLogger(__name__)
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 os.environ["PYTHONHASHSEED"] = "42"
 
-HF_OUTPUT_REPO  = "P2SAMAPA/p2-etf-tft-outputs"   # dedicated dataset repo — never overwritten by sync.yml
-HF_DATASET_REPO = "P2SAMAPA/my-etf-data"           # READ ONLY — never written by this script
+HF_SPACE_REPO = "P2SAMAPA/P2-ETF-TFT-PREDICTOR"
+HF_DATASET_REPO = "P2SAMAPA/my-etf-data"   # READ ONLY — never written by this script
 
 # Hardcoded split
 TRAIN_PCT = 0.80
@@ -67,21 +67,21 @@ def _make_st_mock():
 sys.modules["streamlit"] = _make_st_mock()
 
 
-def push_file_to_hf_output(filename: str, content_bytes: bytes,
-                            commit_msg: str, token: str):
-    """Push a file to the dedicated HF output dataset repo."""
+def push_file_to_hf_space(filename: str, content_bytes: bytes,
+                           commit_msg: str, token: str):
+    """Push a file to the HF Space repo root."""
     from huggingface_hub import HfApi, CommitOperationAdd
     api = HfApi()
     ops = [CommitOperationAdd(path_in_repo=filename,
                                path_or_fileobj=content_bytes)]
     api.create_commit(
-        repo_id=HF_OUTPUT_REPO,
-        repo_type="dataset",
+        repo_id=HF_SPACE_REPO,
+        repo_type="space",
         token=token,
         commit_message=commit_msg,
         operations=ops,
     )
-    log.info(f"✅ Pushed {filename} → {HF_OUTPUT_REPO} ({len(content_bytes):,} bytes)")
+    log.info(f"✅ Pushed {filename} → {HF_SPACE_REPO} ({len(content_bytes):,} bytes)")
 
 
 def fetch_sofr():
@@ -99,7 +99,7 @@ def fetch_sofr():
     return 0.045, "fallback 4.5%"
 
 
-def main(force_refresh: bool = False, start_year: int = 2016, sweep_date: str = None):
+def main(force_refresh: bool = False):
     token = os.getenv("HF_TOKEN")
     if not token:
         raise RuntimeError("HF_TOKEN environment variable not set")
@@ -119,7 +119,7 @@ def main(force_refresh: bool = False, start_year: int = 2016, sweep_date: str = 
 
     # ── 2. Load dataset (reads P2SAMAPA/my-etf-data, never writes it) ────────
     log.info("Loading dataset from HF...")
-    df = get_data(start_year=start_year, force_refresh=force_refresh,
+    df = get_data(start_year=2008, force_refresh=force_refresh,
                   clean_hf_dataset=False)
     if df is None or df.empty:
         raise RuntimeError("Dataset is empty — aborting")
@@ -260,22 +260,7 @@ def main(force_refresh: bool = False, start_year: int = 2016, sweep_date: str = 
         acc_per_etf[name] = round(float(np.mean(preds_j == y_bin_test[:, j])), 4)
     log.info(f"Binary accuracy: {acc_per_etf}")
 
-    # ── 11. Extend test_dates with extra dates beyond fwd-return window ──────
-    # df has dates up to today, but df_model ends FORWARD_DAYS earlier due to
-    # shift(-FORWARD_DAYS). Pad proba/returns with last prediction so audit
-    # trail shows all recent trading days.
-    extra_dates = df.index[df.index > df_model.index[-1]]
-    if len(extra_dates) > 0:
-        log.info(f"Padding {len(extra_dates)} extra dates: "
-                 f"{extra_dates[0].date()} → {extra_dates[-1].date()}")
-        # Repeat last prediction for extra dates
-        last_proba   = proba[-1:].repeat(len(extra_dates), axis=0)
-        proba        = np.vstack([proba, last_proba])
-        last_fwd     = y_fwd_test[-1:].repeat(len(extra_dates), axis=0)
-        y_fwd_test   = np.vstack([y_fwd_test, last_fwd])
-        test_dates   = test_dates.append(pd.DatetimeIndex(extra_dates))
-
-    # ── 12. Daily returns on test set (for live strategy replay in app) ───────
+    # ── 11. Daily returns on test set (for live strategy replay in app) ───────
     daily_ret_test = df.reindex(test_dates)[target_etfs].fillna(0.0).values
     # Also save full benchmark returns on test period
     spy_ret_test = df.reindex(test_dates)['SPY_Ret'].fillna(0.0).values \
@@ -283,7 +268,7 @@ def main(force_refresh: bool = False, start_year: int = 2016, sweep_date: str = 
     agg_ret_test = df.reindex(test_dates)['AGG_Ret'].fillna(0.0).values \
                    if 'AGG_Ret' in df.columns else np.zeros(len(test_dates))
 
-    # ── 13. Compute next-day signal (from last row of proba after padding) ────
+    # ── 12. Compute next-day signal (from last row of proba) ──────────────────
     from strategy import compute_signal_conviction
     from utils import get_next_trading_day
     last_scores = proba[-1]
@@ -291,7 +276,7 @@ def main(force_refresh: bool = False, start_year: int = 2016, sweep_date: str = 
     next_signal = etf_names[best_idx]
     next_date   = get_next_trading_day(test_dates[-1])
 
-    # ── 14. Save outputs ──────────────────────────────────────────────────────
+    # ── 13. Save outputs ──────────────────────────────────────────────────────
     log.info("Saving outputs...")
 
     # --- model_outputs.npz ---
@@ -316,7 +301,6 @@ def main(force_refresh: bool = False, start_year: int = 2016, sweep_date: str = 
 
     # --- signals.json ---
     signals_payload = {
-        "start_year":        start_year,
         "next_signal":       next_signal,
         "next_date":         str(next_date),
         "conviction_z":      round(float(conviction_z), 4),
@@ -351,61 +335,29 @@ def main(force_refresh: bool = False, start_year: int = 2016, sweep_date: str = 
         "run_timestamp_utc": datetime.now(timezone.utc).isoformat(),
     }
 
-    # ── 14. Push all outputs to HF output repo ───────────────────────────────
+    # ── 14. Push all outputs to HF Space repo ────────────────────────────────
     run_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    is_sweep_year = start_year in [2008, 2014, 2016, 2019, 2021]
 
-    push_file_to_hf_output(
+    push_file_to_hf_space(
         "model_outputs.npz",
         npz_bytes,
         f"Update model outputs {run_date}",
         token
     )
-    push_file_to_hf_output(
+    push_file_to_hf_space(
         "signals.json",
         json.dumps(signals_payload, indent=2).encode(),
         f"Update signals {run_date} → {next_signal}",
         token
     )
-    push_file_to_hf_output(
+    push_file_to_hf_space(
         "training_meta.json",
         json.dumps(meta_payload, indent=2).encode(),
         f"Update training meta {run_date}",
         token
     )
 
-    # Also push sweep cache files (never wiped by midnight cleanup)
-    if is_sweep_year:
-        # Compute backtest metrics for sweep scoring
-        from strategy import execute_strategy, calculate_metrics
-        strat_rets_sweep, _, _, _, _, _, _ = execute_strategy(
-            proba, y_fwd_test, test_dates, target_etfs,
-            fee_bps=15, stop_loss_pct=-0.12, z_reentry=1.0,
-            sofr=sofr, z_min_entry=0.5,
-            daily_ret_override=daily_ret_test
-        )
-        sweep_metrics = calculate_metrics(strat_rets_sweep, sofr)
-
-        sweep_payload = {
-            **signals_payload,
-            "ann_return":   round(float(sweep_metrics['ann_return']), 6),
-            "sharpe":       round(float(sweep_metrics['sharpe']), 4),
-            "max_dd":       round(float(sweep_metrics['max_dd']), 6),
-            "is_sweep":     True,
-        }
-        # Date-stamp: signals_2008_20260304.json
-        from datetime import timezone as _tz
-        _date_tag = sweep_date or (datetime.now(_tz.utc) - timedelta(hours=5)).strftime("%Y%m%d")
-        sweep_fname = f"signals_{start_year}_{_date_tag}.json"
-        push_file_to_hf_output(
-            sweep_fname,
-            json.dumps(sweep_payload, indent=2).encode(),
-            f"Sweep cache {start_year} {_date_tag} → {next_signal}",
-            token
-        )
-        log.info(f"✅ Sweep cache pushed: {sweep_fname}")
-
-    log.info(f"✅ All outputs pushed to {HF_OUTPUT_REPO}")
+    log.info(f"✅ All outputs pushed to {HF_SPACE_REPO}")
     log.info(f"📡 Next signal: {next_signal} on {next_date} "
              f"(conviction: {conviction_label}, Z={conviction_z:.2f})")
 
@@ -414,9 +366,5 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--force-refresh", action="store_true",
                         help="Force full dataset rebuild")
-    parser.add_argument("--start-year", type=int, default=2016,
-                        help="Start year for training data (default: 2016)")
-    parser.add_argument("--sweep-date", type=str, default=None,
-                        help="Date stamp for sweep file e.g. 20260304 (default: today EST)")
     args = parser.parse_args()
-    main(force_refresh=args.force_refresh, start_year=args.start_year, sweep_date=args.sweep_date)
+    main(force_refresh=args.force_refresh)

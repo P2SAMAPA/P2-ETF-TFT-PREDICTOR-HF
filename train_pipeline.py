@@ -4,7 +4,7 @@ train_pipeline.py — Headless daily training script for GitHub Actions.
 Flow:
   1. Load latest data from HF Dataset (P2SAMAPA/my-etf-data) — READ ONLY, never writes
   2. Feature engineer + train 7 Binary TFT models (80/10/10 split, hardcoded)
-  3. Save outputs to root of HF Space repo (P2SAMAPA/P2-ETF-TFT-PREDICTOR):
+  3. Save outputs to HF Dataset repo (P2SAMAPA/p2-etf-tft-outputs):
        - model_outputs.npz   — proba scores, daily returns, dates, target_etfs
        - signals.json        — next signal, conviction, ETF scores, sofr, data range
        - training_meta.json  — lookback used, epochs, accuracy per ETF, run timestamp
@@ -37,13 +37,13 @@ log = logging.getLogger(__name__)
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 os.environ["PYTHONHASHSEED"] = "42"
 
-HF_SPACE_REPO = "P2SAMAPA/P2-ETF-TFT-PREDICTOR"
-HF_DATASET_REPO = "P2SAMAPA/my-etf-data"   # READ ONLY — never written by this script
+HF_OUTPUT_REPO  = "P2SAMAPA/p2-etf-tft-outputs"   # dataset repo — all outputs go here
+HF_DATASET_REPO = "P2SAMAPA/my-etf-data"           # READ ONLY — never written by this script
 
 # Hardcoded split
-TRAIN_PCT = 0.80
-VAL_PCT   = 0.10
-TEST_PCT  = 0.10
+TRAIN_PCT    = 0.80
+VAL_PCT      = 0.10
+TEST_PCT     = 0.10
 FORWARD_DAYS = 5
 
 
@@ -67,21 +67,21 @@ def _make_st_mock():
 sys.modules["streamlit"] = _make_st_mock()
 
 
-def push_file_to_hf_space(filename: str, content_bytes: bytes,
-                           commit_msg: str, token: str):
-    """Push a file to the HF Space repo root."""
+def push_file_to_hf_dataset(filename: str, content_bytes: bytes,
+                              commit_msg: str, token: str):
+    """Push a file to the HF Dataset repo (p2-etf-tft-outputs)."""
     from huggingface_hub import HfApi, CommitOperationAdd
     api = HfApi()
     ops = [CommitOperationAdd(path_in_repo=filename,
                                path_or_fileobj=content_bytes)]
     api.create_commit(
-        repo_id=HF_SPACE_REPO,
-        repo_type="space",
+        repo_id=HF_OUTPUT_REPO,
+        repo_type="dataset",
         token=token,
         commit_message=commit_msg,
         operations=ops,
     )
-    log.info(f"✅ Pushed {filename} → {HF_SPACE_REPO} ({len(content_bytes):,} bytes)")
+    log.info(f"✅ Pushed {filename} → {HF_OUTPUT_REPO} ({len(content_bytes):,} bytes)")
 
 
 def fetch_sofr():
@@ -263,7 +263,6 @@ def main(force_refresh: bool = False, start_year: int = None, sweep_date: str = 
 
     # ── 11. Daily returns on test set (for live strategy replay in app) ───────
     daily_ret_test = df.reindex(test_dates)[target_etfs].fillna(0.0).values
-    # Also save full benchmark returns on test period
     spy_ret_test = df.reindex(test_dates)['SPY_Ret'].fillna(0.0).values \
                    if 'SPY_Ret' in df.columns else np.zeros(len(test_dates))
     agg_ret_test = df.reindex(test_dates)['AGG_Ret'].fillna(0.0).values \
@@ -277,21 +276,19 @@ def main(force_refresh: bool = False, start_year: int = None, sweep_date: str = 
     next_signal = etf_names[best_idx]
     next_date   = get_next_trading_day(test_dates[-1])
 
-    # ── 13. Save outputs ──────────────────────────────────────────────────────
-    log.info("Saving outputs...")
+    # ── 13. Build output payloads ─────────────────────────────────────────────
+    log.info("Building output payloads...")
 
     # --- model_outputs.npz ---
-    # Contains everything app.py needs to replay execute_strategy() live
     npz_buf = {}
-    npz_buf['proba']          = proba.astype(np.float32)       # (N, 7)
-    npz_buf['daily_ret_test'] = daily_ret_test.astype(np.float32)  # (N, 7)
-    npz_buf['y_fwd_test']     = y_fwd_test.astype(np.float32)  # (N, 7)
-    npz_buf['spy_ret_test']   = spy_ret_test.astype(np.float32)  # (N,)
-    npz_buf['agg_ret_test']   = agg_ret_test.astype(np.float32)  # (N,)
+    npz_buf['proba']          = proba.astype(np.float32)
+    npz_buf['daily_ret_test'] = daily_ret_test.astype(np.float32)
+    npz_buf['y_fwd_test']     = y_fwd_test.astype(np.float32)
+    npz_buf['spy_ret_test']   = spy_ret_test.astype(np.float32)
+    npz_buf['agg_ret_test']   = agg_ret_test.astype(np.float32)
     npz_buf['test_dates']     = np.array([str(d.date()) for d in test_dates])
     npz_buf['target_etfs']    = np.array(target_etfs)
     npz_buf['sofr']           = np.array([sofr])
-    # Full date range info for start_year filter
     npz_buf['all_test_start'] = np.array([str(test_dates[0].date())])
     npz_buf['all_test_end']   = np.array([str(test_dates[-1].date())])
 
@@ -316,6 +313,7 @@ def main(force_refresh: bool = False, start_year: int = None, sweep_date: str = 
         "test_end":          str(test_dates[-1].date()),
         "n_test_days":       int(len(test_dates)),
         "lookback_days":     int(lookback),
+        "start_year":        int(_eff_start),
         "run_timestamp_utc": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -336,16 +334,16 @@ def main(force_refresh: bool = False, start_year: int = None, sweep_date: str = 
         "run_timestamp_utc": datetime.now(timezone.utc).isoformat(),
     }
 
-    # ── Write date-stamped sweep JSON to HF Dataset ──────────────────────────
+    # ── 14. Push sweep JSON to HF Dataset (sweep runs only) ──────────────────
     SWEEP_YEARS = [2008, 2014, 2016, 2019, 2021]
     if _eff_start in SWEEP_YEARS:
         try:
-            from huggingface_hub import HfApi, CommitOperationAdd
             _date_tag    = sweep_date or (datetime.now(timezone.utc) - timedelta(hours=5)).strftime("%Y%m%d")
             _sweep_fname = f"signals_{_eff_start}_{_date_tag}.json"
             _sweep_data  = {
                 "next_signal":    next_signal,
                 "conviction_z":   round(float(conviction_z), 4),
+                "conviction_label": conviction_label,
                 "ann_return":     signals_payload.get("ann_return", 0.0),
                 "sharpe":         signals_payload.get("sharpe", 0.0),
                 "max_dd":         signals_payload.get("max_dd", 0.0),
@@ -353,45 +351,39 @@ def main(force_refresh: bool = False, start_year: int = None, sweep_date: str = 
                 "sweep_date":     _date_tag,
                 "etf_scores":     signals_payload.get("etf_scores", {}),
             }
-            _api = HfApi()
-            _op  = CommitOperationAdd(
-                path_in_repo=_sweep_fname,
-                path_or_fileobj=json.dumps(_sweep_data, indent=2).encode(),
-            )
-            _api.create_commit(
-                repo_id="P2SAMAPA/p2-etf-tft-outputs",
-                repo_type="dataset",
-                operations=[_op],
-                token=token,
-                commit_message=f"[sweep] {_eff_start} {_date_tag} → {next_signal}",
+            push_file_to_hf_dataset(
+                _sweep_fname,
+                json.dumps(_sweep_data, indent=2).encode(),
+                f"[sweep] {_eff_start} {_date_tag} → {next_signal}",
+                token,
             )
             log.info(f"✅ Sweep cache pushed: {_sweep_fname}  signal={next_signal}  z={conviction_z:.3f}")
         except Exception as _e:
             log.warning(f"  Sweep JSON push failed (non-fatal): {_e}")
 
-    # ── 14. Push all outputs to HF Space repo ────────────────────────────────
+    # ── 15. Push main outputs to HF Dataset repo ─────────────────────────────
     run_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
-    push_file_to_hf_space(
+    push_file_to_hf_dataset(
         "model_outputs.npz",
         npz_bytes,
-        f"Update model outputs {run_date}",
-        token
+        f"Update model outputs {run_date} start_year={_eff_start}",
+        token,
     )
-    push_file_to_hf_space(
+    push_file_to_hf_dataset(
         "signals.json",
         json.dumps(signals_payload, indent=2).encode(),
         f"Update signals {run_date} → {next_signal}",
-        token
+        token,
     )
-    push_file_to_hf_space(
+    push_file_to_hf_dataset(
         "training_meta.json",
         json.dumps(meta_payload, indent=2).encode(),
         f"Update training meta {run_date}",
-        token
+        token,
     )
 
-    log.info(f"✅ All outputs pushed to {HF_SPACE_REPO}")
+    log.info(f"✅ All outputs pushed to {HF_OUTPUT_REPO}")
     log.info(f"📡 Next signal: {next_signal} on {next_date} "
              f"(conviction: {conviction_label}, Z={conviction_z:.2f})")
 

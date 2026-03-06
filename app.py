@@ -21,7 +21,7 @@ from strategy import execute_strategy, calculate_metrics, calculate_benchmark_me
 st.set_page_config(page_title="P2-ETF-Predictor | TFT", layout="wide")
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-HF_OUTPUT_REPO  = "P2SAMAPA/p2-etf-tft-outputs"
+HF_OUTPUT_REPO  = "P2SAMAPA/p2-etf-tft-outputs"   # dataset repo — single source of truth
 GITHUB_REPO     = "P2SAMAPA/P2-ETF-TFT-PREDICTOR-HF-DATASET"
 GITHUB_WORKFLOW = "train_and_push.yml"
 GITHUB_API_BASE = "https://api.github.com"
@@ -165,8 +165,7 @@ def compute_consensus(sweep_data: dict) -> dict:
     Formula: 40% Ann.Return + 20% Z-Score + 20% Sharpe + 20% (-MaxDD)
     All metrics min-max normalised across years before weighting.
     """
-    etf_scores = {}   # etf → {score, years, signals}
-    per_year   = []
+    per_year = []
 
     for year, sig in sweep_data.items():
         signal     = sig['next_signal']
@@ -225,14 +224,14 @@ def compute_consensus(sweep_data: dict) -> dict:
     for etf, v in etf_agg.items():
         cum_score = sum(v['scores'])
         etf_summary[etf] = {
-            'cum_score':  round(cum_score, 4),
+            'cum_score':   round(cum_score, 4),
             'score_share': round(cum_score / total_score, 3),
-            'n_years':    len(v['years']),
-            'years':      v['years'],
-            'avg_return': round(np.mean(v['returns']), 4),
-            'avg_z':      round(np.mean(v['z_scores']), 3),
-            'avg_sharpe': round(np.mean(v['sharpes']), 3),
-            'avg_max_dd': round(np.mean(v['max_dds']), 4),
+            'n_years':     len(v['years']),
+            'years':       v['years'],
+            'avg_return':  round(np.mean(v['returns']), 4),
+            'avg_z':       round(np.mean(v['z_scores']), 3),
+            'avg_sharpe':  round(np.mean(v['sharpes']), 3),
+            'avg_max_dd':  round(np.mean(v['max_dds']), 4),
         }
 
     winner = max(etf_summary, key=lambda e: etf_summary[e]['cum_score'])
@@ -585,11 +584,11 @@ with tab2:
     )
 
     # ── Date-aware sweep cache loading ───────────────────────────────────────
-    today_str   = str(_today_est())
-    sweep_cache = {}       # today's results
-    prev_cache  = {}       # yesterday's results (fallback)
-    stale_years = []       # years where only yesterday's data exists
-    missing_years = []     # years with no data at all
+    today_str     = str(_today_est())
+    sweep_cache   = {}    # today's results
+    prev_cache    = {}    # yesterday's results (fallback)
+    stale_years   = []    # years where only yesterday's data exists
+    missing_years = []    # years with no data at all
 
     for yr in SWEEP_YEARS:
         data, is_today = load_sweep_signals(yr, today_str)
@@ -602,7 +601,7 @@ with tab2:
             missing_years.append(yr)
 
     # Display cache = today's where available, yesterday's as fallback
-    display_cache = {**prev_cache, **sweep_cache}  # today overrides yesterday
+    display_cache = {**prev_cache, **sweep_cache}
     years_needing_run = [yr for yr in SWEEP_YEARS if yr not in sweep_cache]
     sweep_complete = len(sweep_cache) == len(SWEEP_YEARS)
 
@@ -640,7 +639,7 @@ with tab2:
 
     # ── Sweep button ──────────────────────────────────────────────────────────
     force_rerun   = st.checkbox("🔄 Force re-run all years", value=False,
-                                help="Re-trains even if today\'s results already exist")
+                                help="Re-trains even if today's results already exist")
     trigger_years = SWEEP_YEARS if force_rerun else years_needing_run
 
     col_btn, col_info = st.columns([1, 3])
@@ -650,7 +649,7 @@ with tab2:
             type="primary",
             use_container_width=True,
             disabled=(is_training or (sweep_complete and not force_rerun)),
-            help="Only runs years missing today\'s fresh results"
+            help="Only runs years missing today's fresh results"
         )
     with col_info:
         if sweep_complete and not force_rerun:
@@ -800,7 +799,6 @@ with tab2:
                               f"Z: {row['z_score']:.2f}σ<br>"
                               f"Return: {row['ann_return']*100:.1f}%<extra></extra>"
             ))
-        # Add neutral line
         fig_scatter.add_hline(y=0, line_dash="dot",
                               line_color="rgba(255,255,255,0.3)",
                               annotation_text="Neutral")
@@ -821,12 +819,9 @@ with tab2:
 
     table_rows = []
     for row in sorted(consensus['per_year'], key=lambda r: r['year']):
-        etf    = row['signal']
-        col    = ETF_COLORS.get(etf, "#888")
-        _in_today = row['year'] in sweep_cache
         table_rows.append({
             'Start Year':   row['year'],
-            'Signal':       etf,
+            'Signal':       row['signal'],
             'Wtd Score':    round(row['wtd_score'], 3),
             'Conviction':   row['conviction'],
             'Z-Score':      f"{row['z_score']:.2f}σ",
@@ -852,9 +847,8 @@ with tab2:
 
     def style_wtd(val):
         try:
-            v = float(val)
-            intensity = min(int(v * 200), 200)
-            return f'color:#00d1b2;font-weight:700'
+            float(val)
+            return 'color:#00d1b2;font-weight:700'
         except Exception:
             return ''
 

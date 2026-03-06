@@ -110,7 +110,8 @@ def main(force_refresh: bool = False, start_year: int = None, sweep_date: str = 
         build_binary_tft, train_all_binary_tfts,
         predict_binary_tfts, SEED
     )
-    from strategy import execute_strategy
+    from strategy import execute_strategy, calculate_metrics, compute_signal_conviction
+    from utils import get_next_trading_day
     from sklearn.preprocessing import RobustScaler
     import tensorflow as tf
     import random
@@ -268,13 +269,30 @@ def main(force_refresh: bool = False, start_year: int = None, sweep_date: str = 
     agg_ret_test = df.reindex(test_dates)['AGG_Ret'].fillna(0.0).values \
                    if 'AGG_Ret' in df.columns else np.zeros(len(test_dates))
 
-    # ── 12. Compute next-day signal (from last row of proba) ──────────────────
-    from strategy import compute_signal_conviction
-    from utils import get_next_trading_day
+    # ── 12. Compute next-day signal and strategy metrics ──────────────────────
     last_scores = proba[-1]
     best_idx, conviction_z, conviction_label = compute_signal_conviction(last_scores)
     next_signal = etf_names[best_idx]
     next_date   = get_next_trading_day(test_dates[-1])
+
+    # Run strategy replay with standard fixed params so all sweep years
+    # are scored on equal footing for consensus comparison.
+    log.info("Computing strategy metrics for sweep cache...")
+    (strat_rets, _, _, _, _, _, _) = execute_strategy(
+        proba, y_fwd_test, test_dates, target_etfs,
+        fee_bps=15,
+        stop_loss_pct=-0.12,
+        z_reentry=1.0,
+        sofr=sofr,
+        z_min_entry=0.5,
+        daily_ret_override=daily_ret_test,
+    )
+    strat_metrics  = calculate_metrics(strat_rets, sofr)
+    ann_return_val = round(float(strat_metrics['ann_return']), 6)
+    sharpe_val     = round(float(strat_metrics['sharpe']),     6)
+    max_dd_val     = round(float(strat_metrics['max_dd']),     6)
+    log.info(f"Strategy metrics → Ann.Return={ann_return_val*100:.2f}%  "
+             f"Sharpe={sharpe_val:.2f}  MaxDD={max_dd_val*100:.2f}%")
 
     # ── 13. Build output payloads ─────────────────────────────────────────────
     log.info("Building output payloads...")
@@ -314,6 +332,9 @@ def main(force_refresh: bool = False, start_year: int = None, sweep_date: str = 
         "n_test_days":       int(len(test_dates)),
         "lookback_days":     int(lookback),
         "start_year":        int(_eff_start),
+        "ann_return":        ann_return_val,
+        "sharpe":            sharpe_val,
+        "max_dd":            max_dd_val,
         "run_timestamp_utc": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -341,15 +362,16 @@ def main(force_refresh: bool = False, start_year: int = None, sweep_date: str = 
             _date_tag    = sweep_date or (datetime.now(timezone.utc) - timedelta(hours=5)).strftime("%Y%m%d")
             _sweep_fname = f"signals_{_eff_start}_{_date_tag}.json"
             _sweep_data  = {
-                "next_signal":    next_signal,
-                "conviction_z":   round(float(conviction_z), 4),
+                "next_signal":      next_signal,
+                "conviction_z":     round(float(conviction_z), 4),
                 "conviction_label": conviction_label,
-                "ann_return":     signals_payload.get("ann_return", 0.0),
-                "sharpe":         signals_payload.get("sharpe", 0.0),
-                "max_dd":         signals_payload.get("max_dd", 0.0),
-                "start_year":     _eff_start,
-                "sweep_date":     _date_tag,
-                "etf_scores":     signals_payload.get("etf_scores", {}),
+                "ann_return":       ann_return_val,   # ✅ real computed value
+                "sharpe":           sharpe_val,        # ✅ real computed value
+                "max_dd":           max_dd_val,        # ✅ real computed value
+                "lookback_days":    int(lookback),     # ✅ fixes "?d" in table
+                "start_year":       _eff_start,
+                "sweep_date":       _date_tag,
+                "etf_scores":       signals_payload["etf_scores"],
             }
             push_file_to_hf_dataset(
                 _sweep_fname,
@@ -357,7 +379,10 @@ def main(force_refresh: bool = False, start_year: int = None, sweep_date: str = 
                 f"[sweep] {_eff_start} {_date_tag} → {next_signal}",
                 token,
             )
-            log.info(f"✅ Sweep cache pushed: {_sweep_fname}  signal={next_signal}  z={conviction_z:.3f}")
+            log.info(f"✅ Sweep cache pushed: {_sweep_fname}  "
+                     f"signal={next_signal}  z={conviction_z:.3f}  "
+                     f"ann_ret={ann_return_val*100:.2f}%  sharpe={sharpe_val:.2f}  "
+                     f"max_dd={max_dd_val*100:.2f}%  lookback={lookback}d")
         except Exception as _e:
             log.warning(f"  Sweep JSON push failed (non-fatal): {_e}")
 

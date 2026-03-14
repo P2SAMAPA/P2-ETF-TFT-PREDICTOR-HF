@@ -1,0 +1,149 @@
+# .github/workflows/consensus_sweep.yml
+# Triggered ONLY by the "Run Consensus Sweep" button in the HF Space.
+# Runs all 5 sweep years as parallel jobs — independently of single-year training.
+# Also has a nightly scheduled run at 8pm EST (01:00 UTC Tue–Sat).
+
+name: Consensus Sweep
+
+on:
+  schedule:
+    - cron: "0 1 * * 2-6"    # 01:00 UTC = 8pm EST Mon–Fri (nightly auto-sweep)
+  workflow_dispatch:
+    inputs:
+      sweep_years:
+        description: "Comma-separated years to run e.g. 2008,2014,2016,2019,2021"
+        required: false
+        default: "2008,2014,2016,2019,2021"
+        type: string
+      force_refresh:
+        description: "Force full dataset rebuild"
+        required: false
+        default: "false"
+        type: boolean
+
+jobs:
+
+  # ── Sweep 2008 ───────────────────────────────────────────────────────────────
+  sweep_2008:
+    if: >
+      github.event_name == 'schedule' ||
+      contains(github.event.inputs.sweep_years, '2008')
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      HF_TOKEN:     ${{ secrets.HF_TOKEN }}
+      FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+      - run: pip install --no-cache-dir -r requirements.txt
+      - run: python train_pipeline.py --start-year 2008 --sweep-date $(date -u -d "-5 hours" +%Y%m%d 2>/dev/null || date -u +%Y%m%d)
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-sweep-2008-${{ github.run_id }}
+          path: "*.log"
+          retention-days: 7
+
+  # ── Sweep 2014 ───────────────────────────────────────────────────────────────
+  sweep_2014:
+    if: >
+      github.event_name == 'schedule' ||
+      contains(github.event.inputs.sweep_years, '2014')
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      HF_TOKEN:     ${{ secrets.HF_TOKEN }}
+      FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+      - run: pip install --no-cache-dir -r requirements.txt
+      - run: python train_pipeline.py --start-year 2014 --sweep-date $(date -u -d "-5 hours" +%Y%m%d 2>/dev/null || date -u +%Y%m%d)
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-sweep-2014-${{ github.run_id }}
+          path: "*.log"
+          retention-days: 7
+
+  # ── Sweep 2016 ───────────────────────────────────────────────────────────────
+  sweep_2016:
+    if: >
+      github.event_name == 'schedule' ||
+      contains(github.event.inputs.sweep_years, '2016')
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      HF_TOKEN:     ${{ secrets.HF_TOKEN }}
+      FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+      - run: pip install --no-cache-dir -r requirements.txt
+      - run: python train_pipeline.py --start-year 2016 --sweep-date $(date -u -d "-5 hours" +%Y%m%d 2>/dev/null || date -u +%Y%m%d)
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-sweep-2016-${{ github.run_id }}
+          path: "*.log"
+          retention-days: 7
+
+  # ── Sweep 2019 ───────────────────────────────────────────────────────────────
+  sweep_2019:
+    if: >
+      github.event_name == 'schedule' ||
+      contains(github.event.inputs.sweep_years, '2019')
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      HF_TOKEN:     ${{ secrets.HF_TOKEN }}
+      FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+      - run: pip install --no-cache-dir -r requirements.txt
+      - run: python train_pipeline.py --start-year 2019 --sweep-date $(date -u -d "-5 hours" +%Y%m%d 2>/dev/null || date -u +%Y%m%d)
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-sweep-2019-${{ github.run_id }}
+          path: "*.log"
+          retention-days: 7
+
+  # ── Sweep 2021 ───────────────────────────────────────────────────────────────
+  sweep_2021:
+    if: >
+      github.event_name == 'schedule' ||
+      contains(github.event.inputs.sweep_years, '2021')
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      HF_TOKEN:     ${{ secrets.HF_TOKEN }}
+      FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+      - run: pip install --no-cache-dir -r requirements.txt
+      - run: python train_pipeline.py --start-year 2021 --sweep-date $(date -u -d "-5 hours" +%Y%m%d 2>/dev/null || date -u +%Y%m%d)
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-sweep-2021-${{ github.run_id }}
+          path: "*.log"
+          retention-days: 7

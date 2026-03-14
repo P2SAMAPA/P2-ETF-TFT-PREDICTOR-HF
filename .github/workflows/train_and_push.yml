@@ -1,8 +1,9 @@
 # .github/workflows/train_and_push.yml
-# Three triggers:
-#   1. train        — daily 7am EST (start_year=2016) + manual single-year
-#   2. sweep_YYYY   — manual consensus sweep (parallel jobs, missing years only)
-#   3. cleanup      — daily midnight EST, wipes single-year outputs only
+# Two triggers:
+#   1. train   — daily 7am EST (start_year=2016) + manual single-year
+#   2. cleanup — daily midnight EST, wipes single-year outputs only
+#
+# Consensus sweep is now in consensus_sweep.yml — do NOT add sweep jobs here.
 
 name: Daily TFT Training
 
@@ -10,7 +11,6 @@ on:
   schedule:
     - cron: "0 12 * * 1-5"   # 12:00 UTC = 7am EST Mon-Fri (single-year default)
     - cron: "0 5 * * *"       # 05:00 UTC = midnight EST daily cleanup
-    - cron: "0 1 * * 2-6"    # 01:00 UTC = 8pm EST Mon-Fri (daily consensus sweep)
     - cron: "0 0 * * 2-6"    # 00:00 UTC = 7pm EST Mon-Fri (wipe previous day's sweep)
   workflow_dispatch:
     inputs:
@@ -18,11 +18,6 @@ on:
         description: "Start year for single-year run"
         required: false
         default: "2016"
-        type: string
-      sweep_mode:
-        description: "Comma-separated sweep years e.g. 2008,2014,2016,2019,2021 (leave blank for single-year)"
-        required: false
-        default: ""
         type: string
       force_refresh:
         description: "Force full dataset rebuild"
@@ -102,13 +97,12 @@ jobs:
           print("Cleanup done")
           PYEOF
 
-  # ── Single-year train — daily default + manual (no sweep_mode) ──────────────
+  # ── Single-year train — daily default + manual ───────────────────────────────
   train:
     if: >
       (github.event_name == 'schedule' &&
        github.event.schedule == '0 12 * * 1-5') ||
-      (github.event_name == 'workflow_dispatch' &&
-       (github.event.inputs.sweep_mode == '' || github.event.inputs.sweep_mode == null))
+      github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 180
     env:
@@ -135,130 +129,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: logs-single-${{ github.run_id }}
-          path: "*.log"
-          retention-days: 7
-
-  # ── Sweep 2008 ───────────────────────────────────────────────────────────────
-  sweep_2008:
-    if: >
-      (github.event_name == 'schedule' && github.event.schedule == '0 1 * * 2-6') ||
-      (github.event_name == 'workflow_dispatch' && contains(github.event.inputs.sweep_mode, '2008'))
-    runs-on: ubuntu-latest
-    timeout-minutes: 180
-    env:
-      HF_TOKEN:     ${{ secrets.HF_TOKEN }}
-      FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-          cache: "pip"
-      - run: pip install --no-cache-dir -r requirements.txt
-      - run: python train_pipeline.py --start-year 2008 --sweep-date $(date -u -d "-5 hours" +%Y%m%d 2>/dev/null || date -u +%Y%m%d)
-      - if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: logs-sweep-2008-${{ github.run_id }}
-          path: "*.log"
-          retention-days: 7
-
-  # ── Sweep 2014 ───────────────────────────────────────────────────────────────
-  sweep_2014:
-    if: >
-      (github.event_name == 'schedule' && github.event.schedule == '0 1 * * 2-6') ||
-      (github.event_name == 'workflow_dispatch' && contains(github.event.inputs.sweep_mode, '2014'))
-    runs-on: ubuntu-latest
-    timeout-minutes: 180
-    env:
-      HF_TOKEN:     ${{ secrets.HF_TOKEN }}
-      FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-          cache: "pip"
-      - run: pip install --no-cache-dir -r requirements.txt
-      - run: python train_pipeline.py --start-year 2014 --sweep-date $(date -u -d "-5 hours" +%Y%m%d 2>/dev/null || date -u +%Y%m%d)
-      - if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: logs-sweep-2014-${{ github.run_id }}
-          path: "*.log"
-          retention-days: 7
-
-  # ── Sweep 2016 ───────────────────────────────────────────────────────────────
-  sweep_2016:
-    if: >
-      (github.event_name == 'schedule' && github.event.schedule == '0 1 * * 2-6') ||
-      (github.event_name == 'workflow_dispatch' && contains(github.event.inputs.sweep_mode, '2016'))
-    runs-on: ubuntu-latest
-    timeout-minutes: 180
-    env:
-      HF_TOKEN:     ${{ secrets.HF_TOKEN }}
-      FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-          cache: "pip"
-      - run: pip install --no-cache-dir -r requirements.txt
-      - run: python train_pipeline.py --start-year 2016 --sweep-date $(date -u -d "-5 hours" +%Y%m%d 2>/dev/null || date -u +%Y%m%d)
-      - if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: logs-sweep-2016-${{ github.run_id }}
-          path: "*.log"
-          retention-days: 7
-
-  # ── Sweep 2019 ───────────────────────────────────────────────────────────────
-  sweep_2019:
-    if: >
-      (github.event_name == 'schedule' && github.event.schedule == '0 1 * * 2-6') ||
-      (github.event_name == 'workflow_dispatch' && contains(github.event.inputs.sweep_mode, '2019'))
-    runs-on: ubuntu-latest
-    timeout-minutes: 180
-    env:
-      HF_TOKEN:     ${{ secrets.HF_TOKEN }}
-      FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-          cache: "pip"
-      - run: pip install --no-cache-dir -r requirements.txt
-      - run: python train_pipeline.py --start-year 2019 --sweep-date $(date -u -d "-5 hours" +%Y%m%d 2>/dev/null || date -u +%Y%m%d)
-      - if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: logs-sweep-2019-${{ github.run_id }}
-          path: "*.log"
-          retention-days: 7
-
-  # ── Sweep 2021 ───────────────────────────────────────────────────────────────
-  sweep_2021:
-    if: >
-      (github.event_name == 'schedule' && github.event.schedule == '0 1 * * 2-6') ||
-      (github.event_name == 'workflow_dispatch' && contains(github.event.inputs.sweep_mode, '2021'))
-    runs-on: ubuntu-latest
-    timeout-minutes: 180
-    env:
-      HF_TOKEN:     ${{ secrets.HF_TOKEN }}
-      FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-          cache: "pip"
-      - run: pip install --no-cache-dir -r requirements.txt
-      - run: python train_pipeline.py --start-year 2021 --sweep-date $(date -u -d "-5 hours" +%Y%m%d 2>/dev/null || date -u +%Y%m%d)
-      - if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: logs-sweep-2021-${{ github.run_id }}
           path: "*.log"
           retention-days: 7

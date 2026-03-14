@@ -21,11 +21,12 @@ from strategy import execute_strategy, calculate_metrics, calculate_benchmark_me
 st.set_page_config(page_title="P2-ETF-Predictor | TFT", layout="wide")
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-HF_OUTPUT_REPO  = "P2SAMAPA/p2-etf-tft-outputs"   # dataset repo — single source of truth
-GITHUB_REPO     = "P2SAMAPA/P2-ETF-TFT-PREDICTOR-HF-DATASET"
-GITHUB_WORKFLOW = "train_and_push.yml"
-GITHUB_API_BASE = "https://api.github.com"
-SWEEP_YEARS     = [2008, 2014, 2016, 2019, 2021]
+HF_OUTPUT_REPO         = "P2SAMAPA/p2-etf-tft-outputs"   # dataset repo — single source of truth
+GITHUB_REPO            = "P2SAMAPA/P2-ETF-TFT-PREDICTOR-HF-DATASET"
+GITHUB_WORKFLOW        = "train_and_push.yml"             # single-year runs only
+GITHUB_SWEEP_WORKFLOW  = "consensus_sweep.yml"            # sweep runs only
+GITHUB_API_BASE        = "https://api.github.com"
+SWEEP_YEARS            = [2008, 2014, 2016, 2019, 2021]
 
 ETF_COLORS = {
     "TLT": "#4e79a7", "VCIT": "#f28e2b", "LQD": "#59a14f",
@@ -110,8 +111,8 @@ def load_sweep_signals(year: int, for_date: str):
 
 # ── GitHub Actions helpers ────────────────────────────────────────────────────
 
-def trigger_github_training(start_year: int, force_refresh: bool = False,
-                             sweep_mode: str = "") -> bool:
+def trigger_github_training(start_year: int, force_refresh: bool = False) -> bool:
+    """Trigger a single-year training run via train_and_push.yml."""
     pat = os.getenv("GITHUB_PAT")
     if not pat:
         st.error("❌ GITHUB_PAT secret not found in HF Space secrets.")
@@ -122,7 +123,6 @@ def trigger_github_training(start_year: int, force_refresh: bool = False,
         "ref": "main",
         "inputs": {
             "start_year":    str(start_year),
-            "sweep_mode":    sweep_mode,
             "force_refresh": str(force_refresh).lower(),
         }
     }
@@ -139,22 +139,56 @@ def trigger_github_training(start_year: int, force_refresh: bool = False,
         return False
 
 
+def trigger_consensus_sweep(sweep_years: list, force_refresh: bool = False) -> bool:
+    """Trigger parallel sweep jobs via the dedicated consensus_sweep.yml workflow."""
+    pat = os.getenv("GITHUB_PAT")
+    if not pat:
+        st.error("❌ GITHUB_PAT secret not found in HF Space secrets.")
+        return False
+    url = (f"{GITHUB_API_BASE}/repos/{GITHUB_REPO}/actions/workflows/"
+           f"{GITHUB_SWEEP_WORKFLOW}/dispatches")
+    payload = {
+        "ref": "main",
+        "inputs": {
+            "sweep_years":   ",".join(str(y) for y in sweep_years),
+            "force_refresh": str(force_refresh).lower(),
+        }
+    }
+    headers = {
+        "Authorization": f"Bearer {pat}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    try:
+        r = req.post(url, json=payload, headers=headers, timeout=15)
+        return r.status_code == 204
+    except Exception as e:
+        st.error(f"❌ Failed to trigger consensus sweep: {e}")
+        return False
+
+
 def get_latest_workflow_run() -> dict:
+    """Check both workflows and return the most recent run (for training banner)."""
     pat = os.getenv("GITHUB_PAT")
     if not pat:
         return {}
-    url = (f"{GITHUB_API_BASE}/repos/{GITHUB_REPO}/actions/workflows/"
-           f"{GITHUB_WORKFLOW}/runs?per_page=1")
     headers = {"Authorization": f"Bearer {pat}",
                "Accept": "application/vnd.github+json"}
-    try:
-        r = req.get(url, headers=headers, timeout=10)
-        if r.status_code == 200:
-            runs = r.json().get("workflow_runs", [])
-            return runs[0] if runs else {}
-    except Exception:
-        pass
-    return {}
+    candidates = []
+    for wf in [GITHUB_WORKFLOW, GITHUB_SWEEP_WORKFLOW]:
+        url = (f"{GITHUB_API_BASE}/repos/{GITHUB_REPO}/actions/workflows/"
+               f"{wf}/runs?per_page=1")
+        try:
+            r = req.get(url, headers=headers, timeout=10)
+            if r.status_code == 200:
+                runs = r.json().get("workflow_runs", [])
+                if runs:
+                    candidates.append(runs[0])
+        except Exception:
+            pass
+    if not candidates:
+        return {}
+    return max(candidates, key=lambda x: x.get("created_at", ""))
 
 
 # ── Consensus scoring ─────────────────────────────────────────────────────────
@@ -324,8 +358,7 @@ if refresh_only_button:
 # ── Handle run button ─────────────────────────────────────────────────────────
 if run_button:
     with st.spinner(f"🚀 Triggering training for start_year={start_yr}..."):
-        ok = trigger_github_training(start_year=start_yr,
-                                     force_refresh=force_refresh, sweep_mode="")
+        ok = trigger_github_training(start_year=start_yr, force_refresh=force_refresh)
     if ok:
         st.success(f"✅ Training triggered for **start_year={start_yr}**! "
                    f"Results will appear in ~90 minutes.")
@@ -664,22 +697,21 @@ with tab2:
             )
 
     if sweep_btn and trigger_years:
-        sweep_mode_str = ",".join(str(y) for y in trigger_years)
-        with st.spinner(f"🚀 Triggering parallel training for: {sweep_mode_str}..."):
-            ok = trigger_github_training(
-                start_year=trigger_years[0],
-                sweep_mode=sweep_mode_str,
-                force_refresh=False
+        with st.spinner(f"🚀 Triggering parallel sweep for: {', '.join(str(y) for y in trigger_years)}..."):
+            ok = trigger_consensus_sweep(
+                sweep_years=trigger_years,
+                force_refresh=force_rerun,
             )
         if ok:
             st.success(
-                f"✅ Triggered **{len(trigger_years)}** parallel jobs for: {sweep_mode_str}. "
+                f"✅ Triggered **{len(trigger_years)}** parallel jobs via `consensus_sweep.yml` "
+                f"for: {', '.join(str(y) for y in trigger_years)}. "
                 f"Each takes ~90 mins. Refresh this tab when complete."
             )
             time.sleep(2)
             st.rerun()
         else:
-            st.error("❌ Failed to trigger GitHub Actions sweep.")
+            st.error("❌ Failed to trigger consensus sweep workflow.")
 
     # ── Consensus results ─────────────────────────────────────────────────────
     if len(display_cache) == 0:

@@ -26,8 +26,6 @@ OPTION_A_ETFS = ["TLT", "IEF", "SHY", "LQD", "HYG", "GLD", "DBC"]
 OPTION_B_ETFS = ["SPY", "QQQ", "IWM", "EEM", "EFA", "XLF", "XLK", "XLE", "XLV", "XLI"]
 
 # Session state
-if 'hf_token' not in st.session_state:
-    st.session_state.hf_token = None
 if 'approach' not in st.session_state:
     st.session_state.approach = "Per-Year Models"
 
@@ -62,7 +60,7 @@ def get_latest_sweep_files(option_key, approach):
 def load_sweep_json(file_path):
     try:
         local_path = hf_hub_download(repo_id=HF_OUTPUT_REPO, repo_type="dataset",
-                                     filename=file_path, token=st.session_state.hf_token)
+                                     filename=file_path, token=None)  # no token needed for public read
         with open(local_path, 'r') as f:
             return json.load(f)
     except Exception as e:
@@ -200,11 +198,6 @@ with st.sidebar:
     # Refresh button moved to sidebar
     if st.button("🔄 Refresh Sweep Data", help="Reload all sweep data from Hugging Face"):
         st.rerun()
-
-    st.markdown("---")
-    token = st.text_input("Hugging Face Token (for workflow triggers)", type="password")
-    if token:
-        st.session_state.hf_token = token
 
     st.markdown("---")
     st.markdown("**Data Sources**")

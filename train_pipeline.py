@@ -190,7 +190,7 @@ def save_global_model(models, scaler, lookback, lookback_results, target_etfs, i
 def load_global_model(option, token):
     import tensorflow as tf, pickle
     from models import build_binary_tft
-    meta_path = download_file_from_hf_dataset("global_model/meta.json", token)
+    meta_path = download_file_from_hf_dataset(f"global_model/meta.json", token)
     with open(meta_path) as f:
         meta = json.load(f)
     lookback = meta['lookback']
@@ -199,14 +199,14 @@ def load_global_model(option, token):
     models = []
     for etf in target_etfs:
         try:
-            w_path = download_file_from_hf_dataset("global_model/{etf}.weights.h5", token)
+            w_path = download_file_from_hf_dataset(f"global_model/{etf}.weights.h5", token)
             model = build_binary_tft(seq_len=lookback, num_features=num_features)
             model.load_weights(w_path)
         except:
-            full_path = download_file_from_hf_dataset("global_model/{etf}.h5", token)
+            full_path = download_file_from_hf_dataset(f"global_model/{etf}.h5", token)
             model = tf.keras.models.load_model(full_path)
         models.append(model)
-    scaler_path = download_file_from_hf_dataset("global_model/scaler.pkl", token)
+    scaler_path = download_file_from_hf_dataset(f"global_model/scaler.pkl", token)
     with open(scaler_path, 'rb') as f:
         scaler = pickle.load(f)
     return models, scaler, meta

@@ -1,0 +1,54 @@
+name: Seed Dataset (Full History)
+
+on:
+  workflow_dispatch:  # manual trigger only
+
+jobs:
+  seed:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run full dataset seed
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          python - <<'EOF'
+          import os
+          import pandas as pd
+          from data_manager import fetch_etf_data, fetch_macro_data_robust, smart_update_hf_dataset
+          from config import ALL_TICKERS
+
+          token = os.getenv("HF_TOKEN")
+          if not token:
+              raise RuntimeError("HF_TOKEN not set")
+
+          print("Fetching full ETF data (2008-today)...")
+          etf_data = fetch_etf_data(ALL_TICKERS, start_date="2008-01-01")
+          print(f"ETF data: {etf_data.shape}")
+
+          print("Fetching macro data (2008-today)...")
+          macro_data = fetch_macro_data_robust(start_date="2008-01-01")
+          print(f"Macro data: {macro_data.shape}")
+
+          print("Merging and uploading...")
+          new_df = pd.concat([etf_data, macro_data], axis=1)
+          df = smart_update_hf_dataset(new_df, token, force_upload=True)
+
+          print(f"Seeding complete. Dataset now has {len(df)} rows.")
+          EOF
+
+      - name: Done
+        run: echo "✅ Seeding complete"

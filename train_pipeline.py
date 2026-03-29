@@ -333,7 +333,11 @@ def load_global_model(option, token):
         meta = json.load(f)
 
     lookback = meta['lookback']
-    num_features = meta['num_features']
+    # Backward compatibility: if 'num_features' is missing, derive from input_features
+    if 'num_features' in meta:
+        num_features = meta['num_features']
+    else:
+        num_features = len(meta['input_features'])
     target_etfs = meta['target_etfs']
 
     # Rebuild models

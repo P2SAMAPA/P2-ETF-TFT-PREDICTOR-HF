@@ -56,19 +56,15 @@ def load_sweep_json(file_path):
         st.warning(f"Could not load {file_path}: {e}")
         return None
 
-def compute_weighted_consensus(year_files):
+def compute_combined_consensus(year_files, decay_alpha=0.9, perf_weight=0.7, freq_weight=0.3):
     """
-    Compute weighted consensus using ONLY years with positive annual return.
-    For those years, weight = 0.6*norm_ret + 0.2*norm_conv + 0.1*norm_sharpe + 0.1*norm_dd
-    Years with ann_return <= 0 get weight = 0.
+    Consensus using:
+      - Recency‑weighted performance score (positive‑return years only, with exponential decay)
+      - Frequency of being top pick across positive‑return years
+    Returns (final_scores_dict, df_weights)
     """
-    years_data = []
-    all_returns = []
-    all_conv = []
-    all_sharpe = []
-    all_dd = []
-
     # First, collect data for all years
+    years_data = []
     for year, (file_path, _) in year_files.items():
         data = load_sweep_json(file_path)
         if data and 'etf_scores' in data:
@@ -86,17 +82,17 @@ def compute_weighted_consensus(year_files):
                     'etf_scores': data['etf_scores'],
                     'next_signal': data.get('next_signal', 'N/A')
                 })
-                # Only collect metrics for positive return years (for normalisation)
-                if ann_ret > 0:
-                    all_returns.append(ann_ret)
-                    all_conv.append(conv_z)
-                    all_sharpe.append(sharpe)
-                    all_dd.append(max_dd)
 
     if not years_data:
         return None, None
 
-    # Normalisation functions
+    # Identify years with positive return (for performance weighting)
+    pos_years = [yd for yd in years_data if yd['ann_return'] > 0]
+    if not pos_years:
+        # No positive years – fall back to all years
+        pos_years = years_data
+
+    # Normalisation function
     def min_max_normalize(values):
         if not values:
             return []
@@ -105,60 +101,82 @@ def compute_weighted_consensus(year_files):
             return [0.5] * len(values)
         return [(x - vmin) / (vmax - vmin) for x in values]
 
-    # Pre‑compute normalised values for positive‑return years
-    norm_ret_all = min_max_normalize(all_returns)
-    norm_conv_all = min_max_normalize(all_conv)
-    norm_sharpe_all = min_max_normalize(all_sharpe)
-    dd_scores = [1 / (1 + abs(dd)) for dd in all_dd]
-    norm_dd_all = min_max_normalize(dd_scores)
+    # Compute recency‑weighted performance score for each ETF
+    # Step 1: compute year weight without decay (based on positive years only)
+    all_returns = [yd['ann_return'] for yd in pos_years]
+    all_conv = [yd['conviction_z'] for yd in pos_years]
+    all_sharpe = [yd['sharpe'] for yd in pos_years]
+    all_dd = [yd['max_dd'] for yd in pos_years]
 
-    # Map normalised values back to each year (only for positive return years)
-    norm_map = {}
-    pos_idx = 0
-    for i, yd in enumerate(years_data):
-        if yd['ann_return'] > 0:
-            norm_map[i] = {
-                'norm_ret': norm_ret_all[pos_idx],
-                'norm_conv': norm_conv_all[pos_idx],
-                'norm_sharpe': norm_sharpe_all[pos_idx],
-                'norm_dd': norm_dd_all[pos_idx]
-            }
-            pos_idx += 1
+    norm_ret = min_max_normalize(all_returns)
+    norm_conv = min_max_normalize(all_conv)
+    norm_sharpe = min_max_normalize(all_sharpe)
+    dd_scores = [1/(1+abs(dd)) for dd in all_dd]
+    norm_dd = min_max_normalize(dd_scores)
 
-    # Compute weights and build DataFrame
-    weights = []
-    for i, yd in enumerate(years_data):
-        if yd['ann_return'] > 0 and i in norm_map:
-            w = (0.6 * norm_map[i]['norm_ret'] +
-                 0.2 * norm_map[i]['norm_conv'] +
-                 0.1 * norm_map[i]['norm_sharpe'] +
-                 0.1 * norm_map[i]['norm_dd'])
-        else:
-            w = 0.0
-        weights.append(w)
-        yd['weight'] = w
+    # For each positive year, base weight (without decay)
+    base_weights = []
+    for i in range(len(pos_years)):
+        w = 0.6*norm_ret[i] + 0.2*norm_conv[i] + 0.1*norm_sharpe[i] + 0.1*norm_dd[i]
+        base_weights.append(w)
 
-    # DataFrame for display
-    df_weights = pd.DataFrame(years_data)[['year', 'next_signal', 'ann_return', 'conviction_z', 'sharpe', 'max_dd', 'weight']]
-    df_weights = df_weights.sort_values('year')
-    df_weights.rename(columns={'next_signal': 'Top ETF'}, inplace=True)
+    # Apply exponential decay based on recency: decay = alpha^(current_year - year)
+    # Use the latest year as reference
+    latest_year = max(yd['year'] for yd in pos_years)
+    decay_factors = [decay_alpha ** (latest_year - yd['year']) for yd in pos_years]
+    # Normalise decay factors to sum to number of years? Not necessary; we'll multiply.
+    year_weights = [base_weights[i] * decay_factors[i] for i in range(len(pos_years))]
 
-    # Weighted average of ETF conviction scores (using only years with weight > 0)
-    etf_names = list(years_data[0]['etf_scores'].keys())
-    weighted_scores = {etf: 0.0 for etf in etf_names}
-    total_weight = sum(weights)
-    for i, yd in enumerate(years_data):
-        w = weights[i]
-        if w <= 0:
-            continue
+    # Compute weighted average of ETF conviction scores using these year_weights
+    etf_names = list(pos_years[0]['etf_scores'].keys())
+    perf_scores = {etf: 0.0 for etf in etf_names}
+    total_weight = sum(year_weights)
+    for i, yd in enumerate(pos_years):
+        w = year_weights[i]
         scores = yd['etf_scores']
         for etf in etf_names:
-            weighted_scores[etf] += w * scores.get(etf, 0.0)
+            perf_scores[etf] += w * scores.get(etf, 0.0)
     if total_weight > 0:
-        for etf in weighted_scores:
-            weighted_scores[etf] /= total_weight
+        for etf in perf_scores:
+            perf_scores[etf] /= total_weight
 
-    return weighted_scores, df_weights
+    # Frequency of being top pick among positive years
+    top_counts = {etf: 0 for etf in etf_names}
+    for yd in pos_years:
+        top_etf = yd['next_signal']
+        if top_etf in top_counts:
+            top_counts[top_etf] += 1
+    # Normalise frequencies to [0,1] (min‑max)
+    freq_values = list(top_counts.values())
+    if max(freq_values) > min(freq_values):
+        norm_freq = {etf: (cnt - min(freq_values)) / (max(freq_values) - min(freq_values))
+                     for etf, cnt in top_counts.items()}
+    else:
+        norm_freq = {etf: 0.5 for etf in etf_names}
+
+    # Combine performance score and frequency
+    final_scores = {}
+    for etf in etf_names:
+        final_scores[etf] = perf_weight * perf_scores.get(etf, 0) + freq_weight * norm_freq.get(etf, 0)
+
+    # Prepare year‑by‑year DataFrame for display (include all years, with weight = base weight * decay)
+    df_weights = pd.DataFrame([{
+        'year': yd['year'],
+        'Top ETF': yd['next_signal'],
+        'ann_return': yd['ann_return'],
+        'conviction_z': yd['conviction_z'],
+        'sharpe': yd['sharpe'],
+        'max_dd': yd['max_dd'],
+        'base_weight': None,  # we don't have base weight for non‑positive years in this loop; simplify
+    } for yd in years_data])
+    # Add a column for the weight used (only for positive years, with decay)
+    weight_map = {}
+    for i, yd in enumerate(pos_years):
+        weight_map[yd['year']] = year_weights[i]
+    df_weights['weight'] = df_weights['year'].map(weight_map).fillna(0)
+    df_weights = df_weights.sort_values('year')
+
+    return final_scores, df_weights
 
 # ------------------------------------------------------------------------------
 # Sidebar (unchanged)
@@ -240,33 +258,35 @@ with tab1:
     else:
         st.info(f"No sweep data available for {selected_year}")
 
-# Tab 2: Consensus Sweep (updated weighting)
+# Tab 2: Consensus Sweep (new combined method)
 with tab2:
     st.subheader("Weighted Consensus Across All Years")
-    st.markdown("**Only years with positive annual return contribute.**")
-    st.markdown("Consensus weights: 60% Annual Return, 20% Conviction Z, 10% Sharpe, 10% Inverse Max Drawdown")
+    st.markdown("**Combined method:**")
+    st.markdown("- Performance weighting (60% return, 20% conviction, 10% Sharpe, 10% inverse drawdown) with **exponential decay for recency** (α=0.9)")
+    st.markdown("- Frequency of being top pick across profitable years")
+    st.markdown("- Final score = 70% performance score + 30% frequency score")
 
     year_files = get_latest_sweep_files(option_key, st.session_state.approach)
     if not year_files:
         st.warning("No sweep files found. Please run the consensus sweep workflow first.")
     else:
-        weighted_scores, df_weights = compute_weighted_consensus(year_files)
-        if weighted_scores:
-            top_etf = max(weighted_scores, key=weighted_scores.get)
-            top_score = weighted_scores[top_etf]
+        final_scores, df_weights = compute_combined_consensus(year_files, decay_alpha=0.9, perf_weight=0.7, freq_weight=0.3)
+        if final_scores:
+            top_etf = max(final_scores, key=final_scores.get)
+            top_score = final_scores[top_etf]
             col1, col2 = st.columns(2)
             with col1:
                 st.metric("🏆 Top Consensus Pick", top_etf)
             with col2:
-                st.metric("Weighted Score", f"{top_score:.3f}")
+                st.metric("Combined Score", f"{top_score:.3f}")
             st.markdown("---")
-            # Bar chart of all weighted consensus ETF scores
-            df_consensus = pd.DataFrame(list(weighted_scores.items()), columns=['ETF', 'Weighted Score'])
-            df_consensus = df_consensus.sort_values('Weighted Score', ascending=True)
-            fig = px.bar(df_consensus, x='Weighted Score', y='ETF', orientation='h',
-                         title="Weighted Consensus ETF Scores")
+            # Bar chart of all final scores
+            df_consensus = pd.DataFrame(list(final_scores.items()), columns=['ETF', 'Combined Score'])
+            df_consensus = df_consensus.sort_values('Combined Score', ascending=True)
+            fig = px.bar(df_consensus, x='Combined Score', y='ETF', orientation='h',
+                         title="ETF Combined Consensus Scores")
             st.plotly_chart(fig, use_container_width=True)
-            # Year‑by‑year table with ETF column
+            # Year‑by‑year table
             with st.expander("Show year‑by‑year metrics and weights"):
                 st.dataframe(df_weights.style.format({
                     'ann_return': '{:.2%}',
@@ -275,6 +295,6 @@ with tab2:
                     'max_dd': '{:.2%}',
                     'weight': '{:.3f}'
                 }))
-                st.caption("Weight = 0.6*Norm(AnnRet) + 0.2*Norm(ConvZ) + 0.1*Norm(Sharpe) + 0.1*Norm(InvDD); zero for negative return years.")
+                st.caption("Weight = base performance weight (positive years only) × decay factor (α^(latest_year - year)). Zero for negative return years.")
         else:
-            st.error("Could not compute consensus – missing metrics or no positive‑return years.")
+            st.error("Could not compute consensus – missing data.")

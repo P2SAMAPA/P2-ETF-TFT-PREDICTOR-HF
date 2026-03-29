@@ -1,9 +1,7 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import plotly.express as px
 from huggingface_hub import HfApi, hf_hub_download
-from datetime import datetime
 import json
 
 # Hardcoded strategy parameters (display only)
@@ -25,7 +23,6 @@ GITHUB_REPO = "P2SAMAPA/P2-ETF-TFT-PREDICTOR-HF"
 OPTION_A_ETFS = ["TLT", "IEF", "SHY", "LQD", "HYG", "GLD", "DBC"]
 OPTION_B_ETFS = ["SPY", "QQQ", "IWM", "EEM", "EFA", "XLF", "XLK", "XLE", "XLV", "XLI"]
 
-# Session state
 if 'approach' not in st.session_state:
     st.session_state.approach = "Per-Year Models"
 
@@ -60,38 +57,24 @@ def get_latest_sweep_files(option_key, approach):
 def load_sweep_json(file_path):
     try:
         local_path = hf_hub_download(repo_id=HF_OUTPUT_REPO, repo_type="dataset",
-                                     filename=file_path, token=None)  # no token needed for public read
+                                     filename=file_path, token=None)
         with open(local_path, 'r') as f:
             return json.load(f)
     except Exception as e:
         st.warning(f"Could not load {file_path}: {e}")
         return None
 
-def get_latest_signal(option_key, approach):
-    """Return (next_signal, conviction_z, conviction_label, next_date) from most recent year."""
-    year_files = get_latest_sweep_files(option_key, approach)
-    if not year_files:
-        return None, None, None, None
-    latest_year = max(year_files.keys())
-    file_path, _ = year_files[latest_year]
-    data = load_sweep_json(file_path)
-    if data:
-        return (data.get('next_signal'), data.get('conviction_z'),
-                data.get('conviction_label'), data.get('next_date'))
-    return None, None, None, None
-
 def compute_weighted_consensus(year_files):
     """
-    For each year, load metrics: ann_return, conviction_z, sharpe, max_dd.
-    Compute year weight = 0.6*norm_ret + 0.2*norm_conv + 0.1*norm_sharpe + 0.1*norm_dd
-    Then weighted average of ETF scores across years.
-    Returns (weighted_scores_dict, years_weights_df)
+    Compute weighted consensus across years based on:
+    60% annual return, 20% conviction Z, 10% Sharpe, 10% inverse max drawdown.
+    Returns (top_etf, top_score, df_weights) or (None, None, None).
     """
     years_data = []
     all_returns = []
     all_conv = []
     all_sharpe = []
-    all_dd = []   # raw max_dd (negative)
+    all_dd = []
 
     for year, (file_path, _) in year_files.items():
         data = load_sweep_json(file_path)
@@ -115,9 +98,8 @@ def compute_weighted_consensus(year_files):
                 all_dd.append(max_dd)
 
     if not years_data:
-        return None, None
+        return None, None, None
 
-    # Normalise each metric (min-max)
     def min_max_normalize(values):
         vmin, vmax = min(values), max(values)
         if vmax == vmin:
@@ -127,13 +109,9 @@ def compute_weighted_consensus(year_files):
     norm_ret = min_max_normalize(all_returns)
     norm_conv = min_max_normalize(all_conv)
     norm_sharpe = min_max_normalize(all_sharpe)
-
-    # For max_dd (negative), lower drawdown (closer to zero) is better.
-    # Compute a score = 1 / (1 + abs(max_dd)) then normalise.
     dd_scores = [1 / (1 + abs(dd)) for dd in all_dd]
     norm_dd = min_max_normalize(dd_scores)
 
-    # Compute year weights
     weights = []
     for i, year_data in enumerate(years_data):
         w = (0.6 * norm_ret[i] +
@@ -143,11 +121,10 @@ def compute_weighted_consensus(year_files):
         weights.append(w)
         year_data['weight'] = w
 
-    # Create DataFrame for display
     df_weights = pd.DataFrame(years_data)[['year', 'ann_return', 'conviction_z', 'sharpe', 'max_dd', 'weight']]
     df_weights = df_weights.sort_values('year')
 
-    # Weighted average of ETF scores across years
+    # Weighted average of ETF scores
     etf_names = list(years_data[0]['etf_scores'].keys())
     weighted_scores = {etf: 0.0 for etf in etf_names}
     total_weight = sum(weights)
@@ -160,7 +137,9 @@ def compute_weighted_consensus(year_files):
         for etf in weighted_scores:
             weighted_scores[etf] /= total_weight
 
-    return weighted_scores, df_weights
+    top_etf = max(weighted_scores, key=weighted_scores.get)
+    top_score = weighted_scores[top_etf]
+    return top_etf, top_score, df_weights
 
 # ------------------------------------------------------------------------------
 # Sidebar
@@ -183,10 +162,8 @@ with st.sidebar:
     )
     if option == "FI (Fixed Income)":
         option_key = "a"
-        etf_list = OPTION_A_ETFS
     else:
         option_key = "b"
-        etf_list = OPTION_B_ETFS
 
     st.markdown("---")
     st.subheader("Strategy Parameters (Fixed)")
@@ -195,7 +172,6 @@ with st.sidebar:
     st.markdown(f"**Re‑entry Conviction (σ)**: {RE_ENTRY_CONVICTION:.2f}")
     st.markdown(f"**Min Entry Conviction (σ)**: {MIN_ENTRY_CONVICTION:.2f}")
 
-    # Refresh button moved to sidebar
     if st.button("🔄 Refresh Sweep Data", help="Reload all sweep data from Hugging Face"):
         st.rerun()
 
@@ -211,55 +187,44 @@ with st.sidebar:
     st.markdown(f"Outputs: [{HF_OUTPUT_REPO}](https://huggingface.co/datasets/{HF_OUTPUT_REPO})")
 
 # ------------------------------------------------------------------------------
-# Main area
+# Main area: two tabs
 # ------------------------------------------------------------------------------
 st.title("ETF Temporal Fusion Transformer Predictor")
 
-# Hero box: Next signal for next trading day
-next_signal, conv_z, conv_label, next_date = get_latest_signal(option_key, st.session_state.approach)
-if next_signal:
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.metric("📈 Next Trading Day Signal", next_signal)
-    with col2:
-        st.metric("Conviction Z‑score", f"{conv_z:.2f}" if conv_z else "N/A")
-    with col3:
-        st.metric("Conviction Label", conv_label if conv_label else "N/A")
-    st.caption(f"*For trading date: {next_date if next_date else 'Not available'}*")
-    st.markdown("---")
-else:
-    st.info("No sweep data available yet. Please run the consensus sweep workflow.")
-    st.markdown("---")
-
-# Tabs
 tab1, tab2 = st.tabs(["Single Year", "Consensus Sweep"])
 
 # ------------------------------------------------------------------------------
 # Tab 1: Single Year
 # ------------------------------------------------------------------------------
 with tab1:
-    st.subheader("Single‑Year Sweep Results")
-    col1, col2 = st.columns([1, 2])
-    with col1:
-        years = list(range(2008, 2026))
-        selected_year = st.selectbox("Select Year", years, index=len(years)-1)
-    with col2:
-        st.markdown("**Sweep data from the most recent run**")
+    st.subheader("Single‑Year Prediction")
+    years = list(range(2008, 2026))
+    selected_year = st.selectbox("Select Year", years, index=len(years)-1)
 
     year_files = get_latest_sweep_files(option_key, st.session_state.approach)
     if selected_year in year_files:
         file_path, date_tag = year_files[selected_year]
         data = load_sweep_json(file_path)
         if data:
-            st.success(f"Loaded sweep for {selected_year} (run {date_tag})")
+            st.success(f"Data for {selected_year} (run {date_tag})")
+
+            # Hero box for this year
+            next_signal = data.get('next_signal', 'N/A')
+            conv_z = data.get('conviction_z', 'N/A')
+            conv_label = data.get('conviction_label', 'N/A')
+            next_date = data.get('next_date', 'Not available')
+
             col1, col2, col3 = st.columns(3)
             with col1:
-                st.metric("Next Signal", data.get('next_signal', 'N/A'))
+                st.metric("📈 Next Trading Day Signal", next_signal)
             with col2:
-                st.metric("Conviction Z", data.get('conviction_z', 'N/A'))
+                st.metric("Conviction Z‑score", f"{conv_z:.2f}" if isinstance(conv_z, (int, float)) else conv_z)
             with col3:
-                st.metric("Conviction Label", data.get('conviction_label', 'N/A'))
+                st.metric("Conviction Label", conv_label)
+            st.caption(f"*For trading date: {next_date}*")
+            st.markdown("---")
 
+            # Optional: show ETF conviction scores as a bar chart
             scores = data.get('etf_scores', {})
             if scores:
                 df_scores = pd.DataFrame(list(scores.items()), columns=['ETF', 'Score'])
@@ -267,7 +232,7 @@ with tab1:
                 fig = px.bar(df_scores, x='Score', y='ETF', orientation='h', title="ETF Conviction Scores")
                 st.plotly_chart(fig, use_container_width=True)
 
-            st.subheader("Strategy Metrics")
+            st.subheader("Strategy Metrics for this Year")
             col1, col2, col3 = st.columns(3)
             with col1:
                 st.metric("Annual Return", f"{data.get('ann_return', 0)*100:.2f}%")
@@ -281,32 +246,27 @@ with tab1:
         st.info(f"No sweep data available for {selected_year}. Run the consensus sweep workflow.")
 
 # ------------------------------------------------------------------------------
-# Tab 2: Consensus Sweep (all years, weighted by strategy metrics)
+# Tab 2: Consensus Sweep
 # ------------------------------------------------------------------------------
 with tab2:
-    st.subheader(f"Consensus Sweep – {st.session_state.approach}")
-    st.markdown("Weighted consensus across all years based on **strategy performance**:")
-    st.markdown("- 60% Annual Return, 20% Conviction Z, 10% Sharpe Ratio, 10% Inverse Max Drawdown")
+    st.subheader("Weighted Consensus Across All Years")
+    st.markdown("Consensus weights: 60% Annual Return, 20% Conviction Z, 10% Sharpe, 10% Inverse Max Drawdown")
 
     year_files = get_latest_sweep_files(option_key, st.session_state.approach)
     if not year_files:
         st.warning("No sweep files found. Please run the consensus sweep workflow first.")
     else:
-        weighted_scores, df_weights = compute_weighted_consensus(year_files)
-        if weighted_scores:
-            # Show top ETF
-            top_etf = max(weighted_scores, key=weighted_scores.get)
-            top_score = weighted_scores[top_etf]
-            st.metric("🏆 Top Consensus Pick", top_etf, f"{top_score:.3f}")
+        top_etf, top_score, df_weights = compute_weighted_consensus(year_files)
+        if top_etf is not None:
+            # Hero box for consensus
+            col1, col2, col3 = st.columns([1,2,1])
+            with col1:
+                st.metric("🏆 Top Consensus Pick", top_etf)
+            with col2:
+                st.metric("Weighted Score", f"{top_score:.3f}")
+            st.markdown("---")
 
-            # Bar chart of consensus ETF scores
-            df_consensus = pd.DataFrame(list(weighted_scores.items()), columns=['ETF', 'Weighted Score'])
-            df_consensus = df_consensus.sort_values('Weighted Score', ascending=True)
-            fig = px.bar(df_consensus, x='Weighted Score', y='ETF', orientation='h',
-                         title="Weighted Consensus ETF Scores")
-            st.plotly_chart(fig, use_container_width=True)
-
-            # Show detailed year weights
+            # Optional: show year-by-year metrics
             with st.expander("Show year‑by‑year metrics and weights"):
                 st.dataframe(df_weights.style.format({
                     'ann_return': '{:.2%}',
@@ -315,6 +275,5 @@ with tab2:
                     'max_dd': '{:.2%}',
                     'weight': '{:.3f}'
                 }))
-                st.caption("Weight = 0.6*Norm(AnnRet) + 0.2*Norm(ConvZ) + 0.1*Norm(Sharpe) + 0.1*Norm(InvDD)")
         else:
             st.error("Could not compute consensus – missing metrics in sweep files.")

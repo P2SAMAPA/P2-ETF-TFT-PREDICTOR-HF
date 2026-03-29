@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
+import plotly.express as px
 from huggingface_hub import HfApi, hf_hub_download
 import json
 
@@ -30,7 +31,6 @@ if 'approach' not in st.session_state:
 # Helper functions
 # ------------------------------------------------------------------------------
 def get_latest_sweep_files(option_key, approach):
-    """Return dict {year: (file_path, date_tag)} for the latest sweep files."""
     api = HfApi()
     try:
         prefix = "sweep" if approach == "Per-Year Models" else "global_sweep"
@@ -65,11 +65,6 @@ def load_sweep_json(file_path):
         return None
 
 def compute_weighted_consensus(year_files):
-    """
-    Compute weighted consensus across years based on:
-    60% annual return, 20% conviction Z, 10% Sharpe, 10% inverse max drawdown.
-    Returns (top_etf, top_score, df_weights) or (None, None, None).
-    """
     years_data = []
     all_returns = []
     all_conv = []
@@ -98,7 +93,7 @@ def compute_weighted_consensus(year_files):
                 all_dd.append(max_dd)
 
     if not years_data:
-        return None, None, None
+        return None, None
 
     def min_max_normalize(values):
         vmin, vmax = min(values), max(values)
@@ -124,7 +119,6 @@ def compute_weighted_consensus(year_files):
     df_weights = pd.DataFrame(years_data)[['year', 'ann_return', 'conviction_z', 'sharpe', 'max_dd', 'weight']]
     df_weights = df_weights.sort_values('year')
 
-    # Weighted average of ETF scores
     etf_names = list(years_data[0]['etf_scores'].keys())
     weighted_scores = {etf: 0.0 for etf in etf_names}
     total_weight = sum(weights)
@@ -137,9 +131,7 @@ def compute_weighted_consensus(year_files):
         for etf in weighted_scores:
             weighted_scores[etf] /= total_weight
 
-    top_etf = max(weighted_scores, key=weighted_scores.get)
-    top_score = weighted_scores[top_etf]
-    return top_etf, top_score, df_weights
+    return weighted_scores, df_weights
 
 # ------------------------------------------------------------------------------
 # Sidebar
@@ -224,7 +216,7 @@ with tab1:
             st.caption(f"*For trading date: {next_date}*")
             st.markdown("---")
 
-            # Optional: show ETF conviction scores as a bar chart
+            # Bar chart of ETF conviction scores for this year
             scores = data.get('etf_scores', {})
             if scores:
                 df_scores = pd.DataFrame(list(scores.items()), columns=['ETF', 'Score'])
@@ -256,17 +248,27 @@ with tab2:
     if not year_files:
         st.warning("No sweep files found. Please run the consensus sweep workflow first.")
     else:
-        top_etf, top_score, df_weights = compute_weighted_consensus(year_files)
-        if top_etf is not None:
-            # Hero box for consensus
-            col1, col2, col3 = st.columns([1,2,1])
+        weighted_scores, df_weights = compute_weighted_consensus(year_files)
+        if weighted_scores:
+            # Hero box: top consensus ETF
+            top_etf = max(weighted_scores, key=weighted_scores.get)
+            top_score = weighted_scores[top_etf]
+
+            col1, col2 = st.columns(2)
             with col1:
                 st.metric("🏆 Top Consensus Pick", top_etf)
             with col2:
                 st.metric("Weighted Score", f"{top_score:.3f}")
             st.markdown("---")
 
-            # Optional: show year-by-year metrics
+            # Bar chart of all weighted consensus ETF scores
+            df_consensus = pd.DataFrame(list(weighted_scores.items()), columns=['ETF', 'Weighted Score'])
+            df_consensus = df_consensus.sort_values('Weighted Score', ascending=True)
+            fig = px.bar(df_consensus, x='Weighted Score', y='ETF', orientation='h',
+                         title="Weighted Consensus ETF Scores")
+            st.plotly_chart(fig, use_container_width=True)
+
+            # Optional: year‑by‑year metrics table
             with st.expander("Show year‑by‑year metrics and weights"):
                 st.dataframe(df_weights.style.format({
                     'ann_return': '{:.2%}',

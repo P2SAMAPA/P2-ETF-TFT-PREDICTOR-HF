@@ -9,7 +9,7 @@ Supports:
 Outputs:
 - Per-year model: saved to option_{option}/model_outputs.npz, signals.json, training_meta.json
   and sweep files in sweep/option_{option}/signals_{year}_{date}.json
-- Global model: saved to option_{option}/global_model/ (model.h5, scaler.pkl, meta.json)
+- Global model: saved to option_{option}/global_model/ (weights and metadata)
 - Global predictions: saved to global_sweep/option_{option}/signals_{year}_{date}.json
 """
 
@@ -286,22 +286,23 @@ def save_global_model(models, scaler, lookback, lookback_results, target_etfs, i
         local_root = os.path.join(tmpdir, f"option_{option}", "global_model")
         os.makedirs(local_root, exist_ok=True)
 
-        # Save each model as .h5
+        # Save each model's weights
         for etf, model in zip(target_etfs, models):
-            model_path = os.path.join(local_root, f"{etf}.h5")
-            model.save(model_path)  # Keras 3 uses extension to determine format
+            weights_path = os.path.join(local_root, f"{etf}.weights.h5")
+            model.save_weights(weights_path)
 
         # Save scaler
         scaler_path = os.path.join(local_root, "scaler.pkl")
         with open(scaler_path, "wb") as f:
             pickle.dump(scaler, f)
 
-        # Save meta
+        # Save meta (includes architecture info)
         meta = {
             "lookback": lookback,
             "lookback_results": lookback_results,
             "target_etfs": target_etfs,
             "input_features": input_features,
+            "num_features": len(input_features),   # for rebuilding
             "run_timestamp_utc": datetime.now(timezone.utc).isoformat(),
         }
         meta_path = os.path.join(local_root, "meta.json")
@@ -324,18 +325,24 @@ def load_global_model(option, token):
     import tensorflow as tf
     import pickle
     from huggingface_hub import hf_hub_download
-    # Download meta first to know ETFs and lookback
+    from models import build_binary_tft
+
+    # Download meta first to know architecture
     meta_path = download_file_from_hf_dataset(f"option_{option}/global_model/meta.json", token)
     with open(meta_path, 'r') as f:
         meta = json.load(f)
-    target_etfs = meta['target_etfs']
-    lookback = meta['lookback']
 
-    # Download and load each model
+    lookback = meta['lookback']
+    num_features = meta['num_features']
+    target_etfs = meta['target_etfs']
+
+    # Rebuild models
     models = []
     for etf in target_etfs:
-        model_path = download_file_from_hf_dataset(f"option_{option}/global_model/{etf}.h5", token)
-        model = tf.keras.models.load_model(model_path)
+        model = build_binary_tft(seq_len=lookback, num_features=num_features)
+        # Download weights
+        weights_path = download_file_from_hf_dataset(f"option_{option}/global_model/{etf}.weights.h5", token)
+        model.load_weights(weights_path)
         models.append(model)
 
     # Download scaler

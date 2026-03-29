@@ -190,7 +190,7 @@ def save_global_model(models, scaler, lookback, lookback_results, target_etfs, i
 def load_global_model(option, token):
     import tensorflow as tf, pickle
     from models import build_binary_tft
-    meta_path = download_file_from_hf_dataset(f"option_{option}/global_model/meta.json", token)
+    meta_path = download_file_from_hf_dataset(global_model/meta.json", token)
     with open(meta_path) as f:
         meta = json.load(f)
     lookback = meta['lookback']

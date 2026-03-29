@@ -55,17 +55,14 @@ def _today_est():
 def _load_sweep_file(option: str, year: int) -> dict:
     """Load the most recent sweep file for a given option and year."""
     try:
-        from huggingface_hub import hf_hub_download
+        from huggingface_hub import hf_hub_download, HfApi
         repo_id = HF_OUTPUT_REPO
-        # We'll list files to find the latest date for that year
-        from huggingface_hub import HfApi
         api = HfApi()
         prefix = f"sweep/option_{option}/signals_{year}_"
-        files = api.list_repo_files(repo_id=repo_id, repo_type="dataset")
+        files = list(api.list_repo_files(repo_id=repo_id, repo_type="dataset"))
         matches = [f for f in files if f.startswith(prefix) and f.endswith(".json")]
         if not matches:
             return None
-        # Sort by date (the part after the underscore)
         matches.sort(reverse=True)
         latest = matches[0]
         path = hf_hub_download(repo_id=repo_id, filename=latest,
@@ -88,7 +85,6 @@ def load_sweep_cache_for_date(option: str, for_date: str) -> dict:
         for f in files:
             if f.startswith(prefix) and f.endswith(".json"):
                 parts = f.replace(".json", "").split("_")
-                # parts: ['sweep/option_{option}/signals', year, date]
                 if len(parts) == 4:
                     yr = int(parts[2])
                     dt = parts[3]
@@ -223,6 +219,7 @@ def trigger_github_training(start_year: int, force_refresh: bool = False) -> boo
 
 
 def trigger_consensus_sweep(force_refresh: bool = False) -> bool:
+    """Trigger the consensus sweep workflow (runs all years 2008-2025)."""
     pat = os.getenv("GITHUB_PAT")
     if not pat:
         st.error("❌ GITHUB_PAT secret not found in HF Space secrets.")
@@ -306,7 +303,6 @@ with st.sidebar:
     st.divider()
     st.caption("🤖 Split: 80/10/10 · Trained on GitHub Actions")
 
-    # Display training status
     latest_run = get_latest_workflow_run()
     is_training = latest_run.get("status") in ("queued", "in_progress")
     run_started = latest_run.get("created_at", "")[:16].replace("T", " ") if latest_run else ""
@@ -340,21 +336,18 @@ tab1, tab2 = st.tabs(["📊 Single-Year Results", "🔄 Multi-Year Consensus Swe
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# TAB 1 — Single-Year Results (loads pre‑computed sweep file for chosen year)
+# TAB 1 — Single-Year Results
 # ═════════════════════════════════════════════════════════════════════════════
 with tab1:
     st.subheader(f"Single‑Year Results — {option_choice}")
 
-    # Year selector
     year_options = list(range(2008, 2026))
     selected_year = st.selectbox("Select start year to view:", year_options, index=len(year_options)-1)
 
-    # Load the sweep file for that year and option
     year_data = _load_sweep_file(option, selected_year)
     if not year_data:
         st.info(f"No sweep results found for year {selected_year}. Run the consensus sweep first.")
     else:
-        # Extract data
         signal = year_data.get('next_signal', '?')
         ann_return = year_data.get('ann_return', 0.0)
         z_score = year_data.get('conviction_z', 0.0)
@@ -366,7 +359,6 @@ with tab1:
         if isinstance(sweep_date, str):
             sweep_date = sweep_date[:4] + "-" + sweep_date[4:6] + "-" + sweep_date[6:]
 
-        # Display hero banner
         st.markdown(f"""
         <div style="background:linear-gradient(135deg,#1a1a2e,#16213e);
                     border:2px solid #00d1b2;border-radius:16px;
@@ -403,7 +395,6 @@ with tab1:
         </div>
         """, unsafe_allow_html=True)
 
-        # Show per‑ETF scores if available
         etf_scores = year_data.get('etf_scores', {})
         if etf_scores:
             st.subheader("ETF Scores (Probability)")
@@ -432,7 +423,7 @@ with tab1:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# TAB 2 — Multi-Year Consensus Sweep (loads all years for selected option)
+# TAB 2 — Multi-Year Consensus Sweep
 # ═════════════════════════════════════════════════════════════════════════════
 with tab2:
     st.subheader(f"🔄 Multi-Year Consensus Sweep — {option_choice}")
@@ -442,15 +433,22 @@ with tab2:
         f"**Weighted score** = 40% Ann. Return + 20% Z-Score + 20% Sharpe + 20% (–MaxDD), min‑max normalised."
     )
 
-    # Load the most recent full set of sweep files
     sweep_data, sweep_date = load_sweep_cache_any(option)
     if not sweep_data:
         st.info("No sweep results found. They will be generated after the next daily run.")
+        if st.button("🚀 Run Consensus Sweep", type="primary", use_container_width=True):
+            with st.spinner("Triggering sweep workflow..."):
+                ok = trigger_consensus_sweep(force_refresh=force_refresh)
+            if ok:
+                st.success("✅ Sweep triggered! Results will appear in ~90 minutes.")
+                time.sleep(2)
+                st.rerun()
+            else:
+                st.error("❌ Failed to trigger sweep.")
         st.stop()
 
     st.caption(f"Results date: {sweep_date}")
 
-    # Compute consensus
     consensus = compute_consensus(sweep_data)
     if not consensus:
         st.warning("Could not compute consensus from sweep data.")
@@ -464,7 +462,6 @@ with tab2:
     sig_label = "⚠️ Split Signal" if split_signal else "✅ Clear Signal"
     note = f"Score share {score_share:.0f}% · {w_info['n_years']} years · avg score {w_info['cum_score']:.4f}"
 
-    # Winner banner
     st.markdown(f"""
     <div style="background:linear-gradient(135deg,#1a1a2e,#16213e);
                 border:2px solid {win_color};border-radius:16px;
@@ -500,7 +497,6 @@ with tab2:
     </div>
     """, unsafe_allow_html=True)
 
-    # Also‑ranked
     others = sorted([(e, v) for e, v in consensus['etf_summary'].items() if e != winner],
                     key=lambda x: -x[1]['cum_score'])
     also_parts = []
@@ -519,7 +515,6 @@ with tab2:
 
     st.divider()
 
-    # Charts
     chart_col1, chart_col2 = st.columns(2)
 
     with chart_col1:
@@ -572,7 +567,6 @@ with tab2:
         )
         st.plotly_chart(fig_scatter, use_container_width=True)
 
-    # Per‑year breakdown table
     st.subheader("📋 Full Per-Year Breakdown")
     st.caption(
         "**Wtd Score** = 40% Ann. Return + 20% Z-Score + 20% Sharpe + 20% (–Max DD), "
@@ -628,7 +622,6 @@ with tab2:
                   ]))
     st.dataframe(styled_tbl, use_container_width=True, height=300)
 
-    # How to read
     st.divider()
     st.subheader("📖 How to Read These Results")
     st.markdown("""

@@ -30,7 +30,7 @@ jobs:
         with:
           python-version: "3.11"
           cache: "pip"
-      - run: pip install --no-cache-dir -r requirements.txt
+      - run: pip install --no-cache-dir -r requirements-training.txt
       - name: Predict for ${{ matrix.option }} year ${{ matrix.year }}
         run: |
           SWEEP_DATE=$(date -u -d "-5 hours" +%Y%m%d 2>/dev/null || date -u +%Y%m%d)

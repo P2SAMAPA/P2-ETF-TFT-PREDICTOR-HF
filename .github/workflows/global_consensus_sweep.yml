@@ -1,0 +1,47 @@
+name: Global Consensus Sweep
+
+on:
+  schedule:
+    - cron: "0 7 * * 1-5"   # 7 AM UTC (after global training)
+  workflow_dispatch:
+    inputs:
+      force_refresh:
+        description: "Force refresh sweep files"
+        required: false
+        default: "false"
+        type: boolean
+
+jobs:
+  global_sweep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      max-parallel: 10
+      matrix:
+        year: [2008,2009,2010,2011,2012,2013,2014,2015,2016,2017,2018,2019,2020,2021,2022,2023,2024,2025]
+        option: [a, b]
+    env:
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+      - run: pip install --no-cache-dir -r requirements.txt
+      - name: Predict for ${{ matrix.option }} year ${{ matrix.year }}
+        run: |
+          SWEEP_DATE=$(date -u -d "-5 hours" +%Y%m%d 2>/dev/null || date -u +%Y%m%d)
+          ARGS="--option ${{ matrix.option }} --mode predict-global --year ${{ matrix.year }} --sweep-date $SWEEP_DATE"
+          if [ "${{ github.event.inputs.force_refresh }}" = "true" ]; then
+            ARGS="$ARGS --force-refresh"
+          fi
+          python train_pipeline.py $ARGS
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-global-${{ matrix.option }}-${{ matrix.year }}-${{ github.run_id }}
+          path: "*.log"
+          retention-days: 7

@@ -18,7 +18,7 @@ jobs:
         with:
           python-version: "3.11"
           cache: "pip"
-      - run: pip install --no-cache-dir -r requirements.txt
+      - run: pip install --no-cache-dir -r requirements-training.txt
       - name: Train global model for Option A
         run: python train_pipeline.py --option a --mode train-global
   train_global_b:
@@ -33,6 +33,6 @@ jobs:
         with:
           python-version: "3.11"
           cache: "pip"
-      - run: pip install --no-cache-dir -r requirements.txt
+      - run: pip install --no-cache-dir -r requirements-training.txt
       - name: Train global model for Option B
         run: python train_pipeline.py --option b --mode train-global

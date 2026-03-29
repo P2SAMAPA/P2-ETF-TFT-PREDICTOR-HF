@@ -70,17 +70,20 @@ sys.modules["streamlit"] = _make_st_mock()
 # ── HF utilities ──────────────────────────────────────────────────────────────
 def push_file_to_hf_dataset(filename: str, content_bytes: bytes,
                             commit_msg: str, token: str):
-    from huggingface_hub import HfApi, CommitOperationAdd
-    api = HfApi()
-    ops = [CommitOperationAdd(path_in_repo=filename,
-                               path_or_fileobj=content_bytes)]
-    api.create_commit(
-        repo_id=HF_OUTPUT_REPO,
-        repo_type="dataset",
-        token=token,
-        commit_message=commit_msg,
-        operations=ops,
-    )
+    """Upload a single file to the dataset repo using upload_file (resolves conflicts)."""
+    from huggingface_hub import HfApi
+    with tempfile.NamedTemporaryFile(delete=True) as tmp:
+        tmp.write(content_bytes)
+        tmp.flush()
+        api = HfApi()
+        api.upload_file(
+            path_or_fileobj=tmp.name,
+            path_in_repo=filename,
+            repo_id=HF_OUTPUT_REPO,
+            repo_type="dataset",
+            token=token,
+            commit_message=commit_msg,
+        )
     log.info(f"✅ Pushed {filename} → {HF_OUTPUT_REPO} ({len(content_bytes):,} bytes)")
 
 def download_file_from_hf_dataset(filename: str, token: str):

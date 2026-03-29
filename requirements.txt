@@ -10,7 +10,5 @@ pytz
 pandas_market_calendars
 datasets
 pandas-datareader==0.10.0
-pandas>=1.5.0,<2.0.0
 pillow>=10.0.0
-scikit-learn
 h5py

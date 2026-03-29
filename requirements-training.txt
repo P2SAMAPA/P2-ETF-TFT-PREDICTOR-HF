@@ -1,0 +1,15 @@
+streamlit
+pandas
+numpy<2.0.0
+yfinance
+scikit-learn
+plotly
+huggingface_hub
+pyarrow
+pytz
+pandas_market_calendars
+datasets
+pandas-datareader==0.10.0
+pillow>=10.0.0
+h5py
+tensorflow

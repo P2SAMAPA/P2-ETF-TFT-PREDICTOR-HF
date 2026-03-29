@@ -4,7 +4,7 @@ import numpy as np
 import plotly.express as px
 from huggingface_hub import HfApi, hf_hub_download
 from datetime import datetime
-import json   # <-- MISSING IMPORT ADDED
+import json
 
 # Hardcoded strategy parameters (display only)
 TRANSACTION_FEE_BPS = 12
@@ -94,7 +94,7 @@ def compute_weighted_consensus(year_files):
     all_conv = []
     all_sharpe = []
     all_dd = []   # raw max_dd (negative)
-    # First pass: collect raw values
+
     for year, (file_path, _) in year_files.items():
         data = load_sweep_json(file_path)
         if data and 'etf_scores' in data:
@@ -129,8 +129,9 @@ def compute_weighted_consensus(year_files):
     norm_ret = min_max_normalize(all_returns)
     norm_conv = min_max_normalize(all_conv)
     norm_sharpe = min_max_normalize(all_sharpe)
+
     # For max_dd (negative), lower drawdown (closer to zero) is better.
-    # We compute a score = 1 / (1 + abs(max_dd)) then normalise.
+    # Compute a score = 1 / (1 + abs(max_dd)) then normalise.
     dd_scores = [1 / (1 + abs(dd)) for dd in all_dd]
     norm_dd = min_max_normalize(dd_scores)
 

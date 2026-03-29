@@ -199,14 +199,14 @@ def load_global_model(option, token):
     models = []
     for etf in target_etfs:
         try:
-            w_path = download_file_from_hf_dataset(f"option_{option}/global_model/{etf}.weights.h5", token)
+            w_path = download_file_from_hf_dataset(global_model/{etf}.weights.h5", token)
             model = build_binary_tft(seq_len=lookback, num_features=num_features)
             model.load_weights(w_path)
         except:
-            full_path = download_file_from_hf_dataset(f"option_{option}/global_model/{etf}.h5", token)
+            full_path = download_file_from_hf_dataset(global_model/{etf}.h5", token)
             model = tf.keras.models.load_model(full_path)
         models.append(model)
-    scaler_path = download_file_from_hf_dataset(f"option_{option}/global_model/scaler.pkl", token)
+    scaler_path = download_file_from_hf_dataset(global_model/scaler.pkl", token)
     with open(scaler_path, 'rb') as f:
         scaler = pickle.load(f)
     return models, scaler, meta

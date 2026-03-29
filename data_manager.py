@@ -5,22 +5,56 @@ Data fetching, processing, and feature engineering
 import pandas as pd
 import numpy as np
 import yfinance as yf
-import streamlit as st
 from datetime import datetime
 from huggingface_hub import HfApi
 import os
 import requests
 import time
+import logging
+
+# Try to import streamlit; if not available, use logging
+try:
+    import streamlit as st
+    HAS_STREAMLIT = True
+except ImportError:
+    HAS_STREAMLIT = False
+    logging.basicConfig(level=logging.INFO)
+    log = logging.getLogger(__name__)
 
 from utils import get_est_time
+from config import ALL_TICKERS, OPTION_A_ETFS, BENCHMARKS
 
 
 REPO_ID = "P2SAMAPA/my-etf-data"
 
-# ── ETF universe ──────────────────────────────────────────────────────────────
-# TBT removed (leveraged decay). Added: VCIT, LQD, HYG (investment grade + HY credit)
-ETF_LIST     = ["TLT", "VCIT", "LQD", "HYG", "VNQ", "SLV", "GLD", "AGG", "SPY"]
-TARGET_ETFS  = ["TLT", "VCIT", "LQD", "HYG", "VNQ", "SLV", "GLD"]   # excludes benchmarks
+# For backward compatibility, keep ETF_LIST and TARGET_ETFS pointing to Option A
+# (used by train_pipeline.py and other modules)
+ETF_LIST    = OPTION_A_ETFS + BENCHMARKS
+TARGET_ETFS = OPTION_A_ETFS
+
+
+def _log(msg, level="info"):
+    """Log message using streamlit or logging."""
+    if HAS_STREAMLIT:
+        if level == "info":
+            st.info(msg)
+        elif level == "warning":
+            st.warning(msg)
+        elif level == "error":
+            st.error(msg)
+        elif level == "success":
+            st.success(msg)
+        else:
+            st.write(msg)
+    else:
+        if level == "info":
+            log.info(msg)
+        elif level == "warning":
+            log.warning(msg)
+        elif level == "error":
+            log.error(msg)
+        else:
+            log.info(msg)
 
 
 # ── FRED fetch (no pandas_datareader dependency) ──────────────────────────────
@@ -40,7 +74,7 @@ def _fetch_fred_series(series_id: str, start_date: str = "2008-01-01") -> pd.Ser
         s.name = series_id
         return s
     except Exception as e:
-        log_warn(f"FRED fetch failed for {series_id}: {e}")
+        _log(f"FRED fetch failed for {series_id}: {e}", "warning")
         return pd.Series(name=series_id, dtype=float)
 
 
@@ -64,23 +98,6 @@ def _fetch_fred_multi(series_map: dict, start_date: str = "2008-01-01") -> pd.Da
     return df.sort_index().ffill(limit=5)
 
 
-def log_warn(msg):
-    """Warning that works both in Streamlit and headless mode."""
-    try:
-        st.warning(msg)
-    except Exception:
-        import logging
-        logging.getLogger(__name__).warning(msg)
-
-
-def log_error(msg):
-    try:
-        st.error(msg)
-    except Exception:
-        import logging
-        logging.getLogger(__name__).error(msg)
-
-
 def fetch_macro_data_robust(start_date="2008-01-01"):
     """Fetch macro signals from FRED (direct CSV) and Yahoo Finance"""
     all_data = []
@@ -99,9 +116,9 @@ def fetch_macro_data_robust(start_date="2008-01-01"):
         if not fred_data.empty:
             all_data.append(fred_data)
         else:
-            log_warn("⚠️ FRED returned empty data")
+            _log("⚠️ FRED returned empty data", "warning")
     except Exception as e:
-        log_warn(f"⚠️ FRED fetch failed: {e}")
+        _log(f"⚠️ FRED fetch failed: {e}", "warning")
 
     # 2. Yahoo Finance — gold, copper, VIX
     try:
@@ -116,7 +133,7 @@ def fetch_macro_data_robust(start_date="2008-01-01"):
             yf_data.index = yf_data.index.tz_localize(None)
         all_data.append(yf_data)
     except Exception as e:
-        log_warn(f"⚠️ Yahoo Finance failed: {e}")
+        _log(f"⚠️ Yahoo Finance failed: {e}", "warning")
 
     # 3. VIX term structure
     try:
@@ -132,7 +149,7 @@ def fetch_macro_data_robust(start_date="2008-01-01"):
                 vix_term.index = vix_term.index.tz_localize(None)
             all_data.append(vix_term)
     except Exception as e:
-        log_warn(f"⚠️ VIX Term Structure failed: {e}")
+        _log(f"⚠️ VIX Term Structure failed: {e}", "warning")
 
     if all_data:
         combined = pd.concat(all_data, axis=1, join="outer")
@@ -140,11 +157,11 @@ def fetch_macro_data_robust(start_date="2008-01-01"):
         combined = combined.ffill(limit=5)
         return combined
     else:
-        log_error("❌ Failed to fetch any macro data!")
+        _log("❌ Failed to fetch any macro data!", "error")
         return pd.DataFrame()
 
 
-def fetch_etf_data(etfs, start_date="2008-01-01"):
+def fetch_etf_data(etfs, start_date="2008-01-01", end_date=None):
     """
     Fetch ETF price data and calculate features.
 
@@ -154,8 +171,10 @@ def fetch_etf_data(etfs, start_date="2008-01-01"):
         {ETF}_Vol   — 20-day annualised realised volatility
     """
     try:
+        if end_date is None:
+            end_date = datetime.now().strftime("%Y-%m-%d")
         etf_data = yf.download(
-            etfs, start=start_date, progress=False, auto_adjust=True
+            etfs, start=start_date, end=end_date, progress=False, auto_adjust=True
         )["Close"]
 
         if isinstance(etf_data, pd.Series):
@@ -182,7 +201,7 @@ def fetch_etf_data(etfs, start_date="2008-01-01"):
         return result
 
     except Exception as e:
-        log_error(f"❌ ETF fetch failed: {e}")
+        _log(f"❌ ETF fetch failed: {e}", "error")
         return pd.DataFrame()
 
 
@@ -196,7 +215,7 @@ def smart_update_hf_dataset(new_data, token, force_upload=False):
     2008, and backfills before uploading.
     """
     if not token:
-        log_warn("⚠️ No HF_TOKEN found. Skipping dataset update.")
+        _log("⚠️ No HF_TOKEN found. Skipping dataset update.", "warning")
         return new_data
 
     raw_url = f"https://huggingface.co/datasets/{REPO_ID}/resolve/main/etf_data.csv"
@@ -216,28 +235,29 @@ def smart_update_hf_dataset(new_data, token, force_upload=False):
             existing_df.index = existing_df.index.tz_localize(None)
 
         # ── Step 1: fetch FULL ETF history from 2008 ───────────────────────
-        full_etf = fetch_etf_data(ETF_LIST, start_date="2008-01-01")
+        # Use ALL_TICKERS from config to get both FI and Equity ETFs
+        from config import ALL_TICKERS
+        full_etf = fetch_etf_data(ALL_TICKERS, start_date="2008-01-01")
         if full_etf.index.tz is not None:
             full_etf.index = full_etf.index.tz_localize(None)
 
-        # Detect new ETFs for reporting
+        # Detect new ETFs for reporting (using ALL_TICKERS, but only those that are tradeable)
+        # We'll report any ETF that is in ALL_TICKERS but not in existing columns
         new_etf_cols = [
-            etf for etf in ETF_LIST
+            etf for etf in ALL_TICKERS
             if f"{etf}_Ret" not in existing_df.columns
             or existing_df[f"{etf}_Ret"].isna().mean() > 0.9
         ]
 
         # ── Step 2: extract macro columns from existing_df ───────────────────
         etf_col_names = [c for c in existing_df.columns
-                         if any(c.startswith(f"{e}_") for e in
-                                ["TLT","TBT","VCIT","LQD","HYG","VNQ","SLV","GLD","AGG","SPY"])]
+                         if any(c.startswith(f"{e}_") for e in ALL_TICKERS)]
         macro_col_names = [c for c in existing_df.columns if c not in etf_col_names]
         macro_existing  = existing_df[macro_col_names].copy()
 
         # ── Step 3: build combined from scratch using pd.concat ──────────────
         macro_new_cols = [c for c in new_data.columns
-                          if not any(c.startswith(f"{e}_") for e in
-                                     ["TLT","TBT","VCIT","LQD","HYG","VNQ","SLV","GLD","AGG","SPY"])]
+                          if not any(c.startswith(f"{e}_") for e in ALL_TICKERS)]
         macro_new = new_data[macro_new_cols].copy() if macro_new_cols else pd.DataFrame()
 
         if not macro_new.empty:
@@ -261,15 +281,7 @@ def smart_update_hf_dataset(new_data, token, force_upload=False):
 
         if needs_update:
             combined.index.name = "Date"
-            missing = [e for e in ["VCIT","LQD","HYG"] if f"{e}_Ret" not in combined.columns]
-            present = [e for e in ["VCIT","LQD","HYG"] if f"{e}_Ret" in combined.columns]
-            try:
-                st.info(f"📋 Pre-upload check — new ETFs present: {present} | missing: {missing}")
-                if present:
-                    sample = combined[[f"{e}_Ret" for e in present]].dropna().head(3)
-                    st.info(f"📋 Sample data:\n{sample.to_string()}")
-            except Exception:
-                pass
+            _log(f"Pre-upload check — new ETFs: {new_etf_cols}", "info")
 
             out_df = combined.reset_index()
             csv_filename = f"etf_data_{int(time.time())}.csv"
@@ -285,10 +297,7 @@ def smart_update_hf_dataset(new_data, token, force_upload=False):
             from huggingface_hub import CommitOperationAdd
             with open(csv_filename, "rb") as f:
                 file_bytes = f.read()
-            try:
-                st.info(f"📤 Uploading {len(file_bytes):,} bytes to HF...")
-            except Exception:
-                pass
+            _log(f"Uploading {len(file_bytes):,} bytes to HF...", "info")
             operations = [CommitOperationAdd(
                 path_in_repo="etf_data.csv",
                 path_or_fileobj=file_bytes,
@@ -300,21 +309,15 @@ def smart_update_hf_dataset(new_data, token, force_upload=False):
                 commit_message=commit_msg,
                 operations=operations,
             )
-            try:
-                st.success(f"✅ Dataset updated: +{new_rows} rows, filled {filled_gaps} gaps"
-                           + (f", backfilled {new_etf_cols}" if new_etf_cols else ""))
-            except Exception:
-                pass
+            _log(f"✅ Dataset updated: +{new_rows} rows, filled {filled_gaps} gaps"
+                 + (f", backfilled {new_etf_cols}" if new_etf_cols else ""), "success")
             return combined
         else:
-            try:
-                st.info("📊 Dataset already up-to-date. No upload needed.")
-            except Exception:
-                pass
+            _log("📊 Dataset already up-to-date. No upload needed.", "info")
             return existing_df
 
     except Exception as e:
-        log_warn(f"⚠️ Dataset update failed: {e}. Using new data only.")
+        _log(f"⚠️ Dataset update failed: {e}. Using new data only.", "warning")
         return new_data
 
 
@@ -395,10 +398,7 @@ def get_data(start_year, force_refresh=False, clean_hf_dataset=False):
 
         # Optional: clean >30% NaN columns
         if clean_hf_dataset:
-            try:
-                st.warning("🧹 **Cleaning HF Dataset Mode Active**")
-            except Exception:
-                pass
+            _log("🧹 **Cleaning HF Dataset Mode Active**", "warning")
             original_cols = len(df.columns)
             nan_pct  = (df.isna().sum() / len(df)) * 100
             bad_cols = nan_pct[nan_pct > 30].index.tolist()
@@ -424,13 +424,10 @@ def get_data(start_year, force_refresh=False, clean_hf_dataset=False):
                             path_or_fileobj=file_bytes,
                         )],
                     )
-                    try:
-                        st.success("✅ HF dataset updated!")
-                    except Exception:
-                        pass
+                    _log("✅ HF dataset updated!", "success")
 
     except Exception as e:
-        log_warn(f"⚠️ Could not load from HuggingFace: {e}")
+        _log(f"⚠️ Could not load from HuggingFace: {e}", "warning")
 
     # ── Sync / force refresh ──────────────────────────────────────────────────
     from utils import is_sync_window
@@ -438,23 +435,21 @@ def get_data(start_year, force_refresh=False, clean_hf_dataset=False):
 
     if should_sync:
         sync_reason = "🔄 Manual Refresh" if force_refresh else "🔄 Sync Window Active"
-        try:
-            ctx = st.status(f"{sync_reason} - Updating Dataset...", expanded=False)
-        except Exception:
-            from contextlib import nullcontext
-            ctx = nullcontext()
-        with ctx:
-            etf_data   = fetch_etf_data(ETF_LIST)
-            macro_data = fetch_macro_data_robust()
-            if not etf_data.empty and not macro_data.empty:
-                new_df = pd.concat([etf_data, macro_data], axis=1)
-                token  = os.getenv("HF_TOKEN")
-                df     = smart_update_hf_dataset(new_df, token, force_upload=force_refresh)
+        _log(f"{sync_reason} - Updating Dataset...", "info")
+        # Fetch using ALL_TICKERS from config
+        from config import ALL_TICKERS
+        etf_data   = fetch_etf_data(ALL_TICKERS)
+        macro_data = fetch_macro_data_robust()
+        if not etf_data.empty and not macro_data.empty:
+            new_df = pd.concat([etf_data, macro_data], axis=1)
+            token  = os.getenv("HF_TOKEN")
+            df     = smart_update_hf_dataset(new_df, token, force_upload=force_refresh)
 
     # ── Fallback: fetch fresh if still empty ──────────────────────────────────
     if df.empty:
-        log_warn("📊 Fetching fresh data...")
-        etf_data   = fetch_etf_data(ETF_LIST)
+        _log("📊 Fetching fresh data...", "warning")
+        from config import ALL_TICKERS
+        etf_data   = fetch_etf_data(ALL_TICKERS)
         macro_data = fetch_macro_data_robust()
         if not etf_data.empty and not macro_data.empty:
             df = pd.concat([etf_data, macro_data], axis=1)
@@ -471,18 +466,12 @@ def get_data(start_year, force_refresh=False, clean_hf_dataset=False):
             df[f"{col}_Z"] = (df[col] - roll_mean) / (roll_std + 1e-9)
 
     # ── Regime features ───────────────────────────────────────────────────────
-    try:
-        st.write("🎯 **Adding Regime Detection Features...**")
-    except Exception:
-        pass
+    _log("🎯 **Adding Regime Detection Features...**", "info")
     df = add_regime_features(df)
 
     # ── Filter by start year ──────────────────────────────────────────────────
     df = df[df.index.year >= start_year]
-    try:
-        st.info(f"📅 After year filter ({start_year}+): {len(df)} samples")
-    except Exception:
-        pass
+    _log(f"📅 After year filter ({start_year}+): {len(df)} samples", "info")
 
     # ── Drop columns with >50% NaNs ───────────────────────────────────────────
     nan_pct      = df.isna().sum() / len(df)
@@ -495,12 +484,10 @@ def get_data(start_year, force_refresh=False, clean_hf_dataset=False):
     df = df.dropna()
 
     if len(df) > 0:
-        try:
-            st.success(
-                f"✅ Final dataset: {len(df)} samples from "
-                f"{df.index[0].strftime('%Y-%m-%d')} to {df.index[-1].strftime('%Y-%m-%d')}"
-            )
-        except Exception:
-            pass
+        _log(
+            f"✅ Final dataset: {len(df)} samples from "
+            f"{df.index[0].strftime('%Y-%m-%d')} to {df.index[-1].strftime('%Y-%m-%d')}",
+            "success"
+        )
 
     return df

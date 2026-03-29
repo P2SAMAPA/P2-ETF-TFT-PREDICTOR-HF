@@ -1,8 +1,9 @@
 """
 P2-ETF-PREDICTOR — TFT Edition
 ================================
-Tab 1: Single-Year Results    — user picks start year, triggers training
-Tab 2: Multi-Year Consensus   — sweeps 2008/2014/2016/2019/2021, cached results
+Two options: Option A (FI/Commodities) and Option B (Equity Sectors)
+Tab 1: Single-Year Results    — loads pre‑computed sweep results for selected year
+Tab 2: Multi-Year Consensus   — aggregates all sweep years
 """
 
 import streamlit as st
@@ -17,6 +18,7 @@ import requests as req
 from utils import get_est_time, is_sync_window
 from data_manager import get_data, fetch_etf_data, fetch_macro_data_robust, smart_update_hf_dataset
 from strategy import execute_strategy, calculate_metrics, calculate_benchmark_metrics
+from config import OPTION_A_ETFS, OPTION_B_ETFS, BENCHMARKS
 
 st.set_page_config(page_title="P2-ETF-Predictor | TFT", layout="wide")
 
@@ -28,20 +30,41 @@ GITHUB_SWEEP_WORKFLOW  = "consensus_sweep.yml"            # sweep runs only
 GITHUB_API_BASE        = "https://api.github.com"
 SWEEP_YEARS            = [2008, 2014, 2016, 2019, 2021]
 
-ETF_COLORS = {
+# Colour maps for both universes
+FI_COLOURS = {
     "TLT": "#4e79a7", "VCIT": "#f28e2b", "LQD": "#59a14f",
     "HYG": "#e15759", "VNQ": "#76b7b2", "SLV": "#edc948",
     "GLD": "#b07aa1",
 }
+EQ_COLOURS = {
+    "QQQ": "#f28e2b", "XLK": "#59a14f", "XLF": "#e15759",
+    "XLE": "#76b7b2", "XLV": "#edc948", "XLI": "#b07aa1",
+    "XLY": "#ff9da7", "XLP": "#9c755f", "XLU": "#86b875",
+    "GDX": "#bab0ac", "XME": "#f1ce63",
+}
+def get_colour_map(option: str) -> dict:
+    return FI_COLOURS if option == 'a' else EQ_COLOURS
 
 
-# ── HF helpers ────────────────────────────────────────────────────────────────
+# ── Session state for option selection ──────────────────────────────────────
+if "option" not in st.session_state:
+    st.session_state.option = "a"
+option = st.session_state.option
+
+
+# ── HF helpers (option‑aware) ────────────────────────────────────────────────
+
+def _option_subdir(option: str) -> str:
+    return "option_a" if option == 'a' else "option_b"
+
 
 @st.cache_data(ttl=300)
-def load_model_outputs():
+def load_model_outputs(option: str):
     try:
         from huggingface_hub import hf_hub_download
-        path = hf_hub_download(repo_id=HF_OUTPUT_REPO, filename="model_outputs.npz",
+        sub = _option_subdir(option)
+        path = hf_hub_download(repo_id=HF_OUTPUT_REPO,
+                               filename=f"{sub}/model_outputs.npz",
                                repo_type="dataset", force_download=True)
         npz = np.load(path, allow_pickle=True)
         return {k: npz[k] for k in npz.files}, None
@@ -50,10 +73,12 @@ def load_model_outputs():
 
 
 @st.cache_data(ttl=300)
-def load_signals():
+def load_signals(option: str):
     try:
         from huggingface_hub import hf_hub_download
-        path = hf_hub_download(repo_id=HF_OUTPUT_REPO, filename="signals.json",
+        sub = _option_subdir(option)
+        path = hf_hub_download(repo_id=HF_OUTPUT_REPO,
+                               filename=f"{sub}/signals.json",
                                repo_type="dataset", force_download=True)
         with open(path) as f:
             return json.load(f), None
@@ -62,10 +87,12 @@ def load_signals():
 
 
 @st.cache_data(ttl=300)
-def load_training_meta():
+def load_training_meta(option: str):
     try:
         from huggingface_hub import hf_hub_download
-        path = hf_hub_download(repo_id=HF_OUTPUT_REPO, filename="training_meta.json",
+        sub = _option_subdir(option)
+        path = hf_hub_download(repo_id=HF_OUTPUT_REPO,
+                               filename=f"{sub}/training_meta.json",
                                repo_type="dataset", force_download=True)
         with open(path) as f:
             return json.load(f)
@@ -79,15 +106,15 @@ def _today_est():
 
 
 @st.cache_data(ttl=60)
-def load_sweep_signals(year: int, for_date: str):
-    """Load date-stamped sweep signals. Returns (data, is_today)."""
+def load_sweep_signals(option: str, year: int, for_date: str):
+    """Load date-stamped sweep signals for a given option."""
     from huggingface_hub import hf_hub_download
     date_tag = for_date.replace("-", "")
-
+    sub = "option_a" if option == 'a' else "option_b"
     # Try today's file
     try:
         path = hf_hub_download(repo_id=HF_OUTPUT_REPO,
-                               filename=f"signals_{year}_{date_tag}.json",
+                               filename=f"sweep/{sub}/signals_{year}_{date_tag}.json",
                                repo_type="dataset", force_download=True)
         with open(path) as f:
             return json.load(f), True
@@ -99,7 +126,7 @@ def load_sweep_signals(year: int, for_date: str):
         from datetime import date as _date, timedelta as _td
         yesterday = (_date.fromisoformat(for_date) - _td(days=1)).strftime("%Y%m%d")
         path = hf_hub_download(repo_id=HF_OUTPUT_REPO,
-                               filename=f"signals_{year}_{yesterday}.json",
+                               filename=f"sweep/{sub}/signals_{year}_{yesterday}.json",
                                repo_type="dataset", force_download=True)
         with open(path) as f:
             return json.load(f), False
@@ -109,10 +136,10 @@ def load_sweep_signals(year: int, for_date: str):
     return None, False
 
 
-# ── GitHub Actions helpers ────────────────────────────────────────────────────
+# ── GitHub Actions helpers (unchanged) ────────────────────────────────────────
+# (same as before, but they don't depend on option)
 
 def trigger_github_training(start_year: int, force_refresh: bool = False) -> bool:
-    """Trigger a single-year training run via train_and_push.yml."""
     pat = os.getenv("GITHUB_PAT")
     if not pat:
         st.error("❌ GITHUB_PAT secret not found in HF Space secrets.")
@@ -140,7 +167,6 @@ def trigger_github_training(start_year: int, force_refresh: bool = False) -> boo
 
 
 def trigger_consensus_sweep(sweep_years: list, force_refresh: bool = False) -> bool:
-    """Trigger parallel sweep jobs via the dedicated consensus_sweep.yml workflow."""
     pat = os.getenv("GITHUB_PAT")
     if not pat:
         st.error("❌ GITHUB_PAT secret not found in HF Space secrets.")
@@ -168,7 +194,6 @@ def trigger_consensus_sweep(sweep_years: list, force_refresh: bool = False) -> b
 
 
 def get_latest_workflow_run() -> dict:
-    """Check both workflows and return the most recent run (for training banner)."""
     pat = os.getenv("GITHUB_PAT")
     if not pat:
         return {}
@@ -191,16 +216,10 @@ def get_latest_workflow_run() -> dict:
     return max(candidates, key=lambda x: x.get("created_at", ""))
 
 
-# ── Consensus scoring ─────────────────────────────────────────────────────────
+# ── Consensus scoring (unchanged) ────────────────────────────────────────────
 
 def compute_consensus(sweep_data: dict) -> dict:
-    """
-    Weighted score per ETF across all available sweep years.
-    Formula: 40% Ann.Return + 20% Z-Score + 20% Sharpe + 20% (-MaxDD)
-    All metrics min-max normalised across years before weighting.
-    """
     per_year = []
-
     for year, sig in sweep_data.items():
         signal     = sig['next_signal']
         ann_ret    = sig.get('ann_return', 0.0)
@@ -221,10 +240,8 @@ def compute_consensus(sweep_data: dict) -> dict:
 
     if not per_year:
         return {}
-
     df = pd.DataFrame(per_year)
 
-    # Min-max normalise each metric
     def minmax(s):
         mn, mx = s.min(), s.max()
         return (s - mn) / (mx - mn + 1e-9)
@@ -232,14 +249,12 @@ def compute_consensus(sweep_data: dict) -> dict:
     df['n_return'] = minmax(df['ann_return'])
     df['n_z']      = minmax(df['z_score'])
     df['n_sharpe'] = minmax(df['sharpe'])
-    df['n_negdd']  = minmax(-df['max_dd'])   # higher = less drawdown = better
-
+    df['n_negdd']  = minmax(-df['max_dd'])
     df['wtd_score'] = (0.40 * df['n_return'] +
                        0.20 * df['n_z']      +
                        0.20 * df['n_sharpe'] +
                        0.20 * df['n_negdd'])
 
-    # Aggregate by ETF across years
     etf_agg = {}
     for _, row in df.iterrows():
         etf = row['signal']
@@ -267,7 +282,6 @@ def compute_consensus(sweep_data: dict) -> dict:
             'avg_sharpe':  round(np.mean(v['sharpes']), 3),
             'avg_max_dd':  round(np.mean(v['max_dds']), 4),
         }
-
     winner = max(etf_summary, key=lambda e: etf_summary[e]['cum_score'])
     return {
         'winner':      winner,
@@ -277,12 +291,13 @@ def compute_consensus(sweep_data: dict) -> dict:
     }
 
 
-# ── Load outputs at top (needed for sidebar) ──────────────────────────────────
-with st.spinner("📦 Loading outputs..."):
-    outputs, load_err = load_model_outputs()
-    signals, sig_err  = load_signals()
-    meta              = load_training_meta()
+# ── Load initial data for sidebar (need to know option) ───────────────────────
+# We'll load after option is selected, but we need something for initial run.
+# For now, load default Option A. The radio button will change later.
 
+outputs, load_err = load_model_outputs(option)
+signals, sig_err  = load_signals(option)
+meta              = load_training_meta(option)
 _trained_start_yr = int(signals.get('start_year', 2016)) if signals else 2016
 
 latest_run  = get_latest_workflow_run()
@@ -294,6 +309,21 @@ run_started = latest_run.get("created_at", "")[:16].replace("T", " ") if latest_
 # ─────────────────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.header("⚙️ Configuration")
+
+    # Option selector
+    selected_option = st.radio(
+        "Select Option",
+        ["Option A (FI/Commodities)", "Option B (Equity Sectors)"],
+        index=0,
+        horizontal=True,
+        key="opt_radio"
+    )
+    new_option = 'a' if "Option A" in selected_option else 'b'
+    if new_option != st.session_state.option:
+        st.session_state.option = new_option
+        st.rerun()  # force reload of data for new option
+    option = st.session_state.option
+
     st.write(f"🕒 **EST:** {get_est_time().strftime('%H:%M:%S')}")
     st.divider()
 
@@ -332,16 +362,11 @@ with st.sidebar:
         st.caption(f"📅 Current: start_year={signals.get('start_year','?')} · "
                    f"trained {signals.get('run_timestamp_utc','')[:10]}")
 
-# ─────────────────────────────────────────────────────────────────────────────
-# HEADER
-# ─────────────────────────────────────────────────────────────────────────────
-st.title("🤖 P2-ETF-PREDICTOR")
-st.caption("Temporal Fusion Transformer — Fixed Income ETF Rotation")
-
 # ── Handle refresh dataset only ───────────────────────────────────────────────
 if refresh_only_button:
     with st.status("📡 Refreshing dataset...", expanded=True):
-        etf_data   = fetch_etf_data(["TLT", "TBT", "VNQ", "SLV", "GLD", "AGG", "SPY"])
+        # This fetches data for all tickers (combined from config)
+        etf_data   = fetch_etf_data(ALL_TICKERS)  # we need to import ALL_TICKERS
         macro_data = fetch_macro_data_robust()
         if not etf_data.empty and not macro_data.empty:
             token = os.getenv("HF_TOKEN")
@@ -380,13 +405,17 @@ if signals and signals.get('start_year') and \
 # ─────────────────────────────────────────────────────────────────────────────
 tab1, tab2 = st.tabs(["📊 Single-Year Results", "🔄 Multi-Year Consensus Sweep"])
 
+# Load data again after possible option change (to ensure fresh)
+outputs, load_err = load_model_outputs(option)
+signals, sig_err  = load_signals(option)
+meta              = load_training_meta(option)
 
-# ═════════════════════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────────────────────
 # TAB 1 — Single-Year Results
-# ═════════════════════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────────────────────
 with tab1:
     if not outputs:
-        st.error(f"❌ No model outputs available: {load_err}")
+        st.error(f"❌ No model outputs available for Option {option.upper()}: {load_err}")
         st.info("👈 Click **🚀 Run TFT Model** in the sidebar to trigger training.")
         st.stop()
 
@@ -489,6 +518,7 @@ with tab1:
     </div>
     """, unsafe_allow_html=True)
 
+    colour_map = get_colour_map(option)
     for i, (name, score) in enumerate(sorted_pairs):
         bar_w      = int(score / max_score * 100)
         is_winner  = (name == next_signal)
@@ -584,7 +614,7 @@ with tab1:
     st.markdown(f"""
     <div style="background:#1a1a2e;border:1px solid #2d2d4e;border-radius:12px;
                 padding:28px 32px;color:#e0e0e0;font-size:14px;line-height:1.8;">
-    <h4 style="color:#00d1b2;margin-top:0;">🏗️ Architecture — 7 Binary TFTs</h4>
+    <h4 style="color:#00d1b2;margin-top:0;">🏗️ Architecture — Binary TFTs</h4>
     <p>One binary TFT per ETF: <em>"Will this ETF beat 3M T-Bill over 5 days?"</em></p>
     <h4 style="color:#00d1b2;margin-top:16px;">📊 Training</h4>
     <ul>
@@ -607,16 +637,16 @@ with tab1:
 # TAB 2 — Multi-Year Consensus Sweep
 # ═════════════════════════════════════════════════════════════════════════════
 with tab2:
-    st.subheader("🔄 Multi-Year Consensus Sweep")
+    st.subheader(f"🔄 Multi-Year Consensus Sweep — {selected_option}")
     st.markdown(
-        "Runs the TFT model across **5 start years** and aggregates signals into a "
+        f"Runs the TFT model across **{len(SWEEP_YEARS)} start years** and aggregates signals into a "
         "consensus vote. Cached years load instantly — only untrained years trigger "
         "new GitHub Actions jobs (in parallel).\n\n"
         f"**Sweep years:** {', '.join(str(y) for y in SWEEP_YEARS)} &nbsp;·&nbsp; "
         "**Score:** 40% Return · 20% Z · 20% Sharpe · 20% (–MaxDD)"
     )
 
-    # ── Date-aware sweep cache loading ───────────────────────────────────────
+    # ── Date-aware sweep cache loading (option-aware) ────────────────────────
     today_str     = str(_today_est())
     sweep_cache   = {}    # today's results
     prev_cache    = {}    # yesterday's results (fallback)
@@ -624,7 +654,7 @@ with tab2:
     missing_years = []    # years with no data at all
 
     for yr in SWEEP_YEARS:
-        data, is_today = load_sweep_signals(yr, today_str)
+        data, is_today = load_sweep_signals(option, yr, today_str)
         if data and is_today:
             sweep_cache[yr] = data
         elif data and not is_today:
@@ -725,7 +755,8 @@ with tab2:
 
     winner      = consensus['winner']
     w_info      = consensus['etf_summary'][winner]
-    win_color   = ETF_COLORS.get(winner, "#00d1b2")
+    colour_map  = get_colour_map(option)
+    win_color   = colour_map.get(winner, "#00d1b2")
     score_share = w_info['score_share'] * 100
     n_cached    = len(display_cache)
 
@@ -774,7 +805,7 @@ with tab2:
                     key=lambda x: -x[1]['cum_score'])
     also_parts = []
     for etf, v in others:
-        col = ETF_COLORS.get(etf, "#888")
+        col = colour_map.get(etf, "#888")
         n_yrs = v['n_years']
         also_parts.append(
             f'<span style="color:{col};font-weight:600;">{etf}</span> '
@@ -795,7 +826,7 @@ with tab2:
         st.markdown("**Weighted Score per ETF** (40% Return · 20% Z · 20% Sharpe · 20% –MaxDD)")
         etf_sum = consensus['etf_summary']
         sorted_etfs = sorted(etf_sum.keys(), key=lambda e: -etf_sum[e]['cum_score'])
-        bar_colors  = [ETF_COLORS.get(e, "#888") for e in sorted_etfs]
+        bar_colors  = [colour_map.get(e, "#888") for e in sorted_etfs]
         bar_vals    = [etf_sum[e]['cum_score'] for e in sorted_etfs]
         bar_labels  = [
             f"{etf_sum[e]['n_years']} yr · {etf_sum[e]['score_share']*100:.0f}%<br>score {etf_sum[e]['cum_score']:.2f}"
@@ -819,7 +850,7 @@ with tab2:
         fig_scatter = go.Figure()
         for row in per_year:
             etf = row['signal']
-            col = ETF_COLORS.get(etf, "#888")
+            col = colour_map.get(etf, "#888")
             fig_scatter.add_trace(go.Scatter(
                 x=[row['year']], y=[row['z_score']],
                 mode='markers+text',
@@ -867,7 +898,7 @@ with tab2:
     tbl_df = pd.DataFrame(table_rows)
 
     def style_signal(val):
-        col = ETF_COLORS.get(val, "#888")
+        col = colour_map.get(val, "#888")
         return f"background-color:{col}22;color:{col};font-weight:700;"
 
     def style_return(val):

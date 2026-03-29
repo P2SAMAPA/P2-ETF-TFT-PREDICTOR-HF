@@ -1,8 +1,3 @@
-+150
--404
-Lines changed: 150 additions & 404 deletions
-Original file line number	Diff line number	Diff line change
-@@ -1,172 +1,97 @@
 """
 train_pipeline.py — Headless training script for GitHub Actions.
 Global model training: writes to option_{option}/global_model/

@@ -3,14 +3,13 @@ train_pipeline.py — Headless daily training script for GitHub Actions.
 
 Flow:
   1. Load latest data from HF Dataset (P2SAMAPA/my-etf-data) — READ ONLY, never writes
-  2. Feature engineer + train 7 Binary TFT models (80/10/10 split, hardcoded)
+  2. Feature engineer + train Binary TFT models (one per ETF in selected option)
   3. Save outputs to HF Dataset repo (P2SAMAPA/p2-etf-tft-outputs):
-       - model_outputs.npz   — proba scores, daily returns, dates, target_etfs
-       - signals.json        — next signal, conviction, ETF scores, sofr, data range
-       - training_meta.json  — lookback used, epochs, accuracy per ETF, run timestamp
-
-app.py reads these files and replays execute_strategy() live with user sliders.
-The HF dataset (my-etf-data) is NEVER touched by this script.
+       - option_{option}/model_outputs.npz
+       - option_{option}/signals.json
+       - option_{option}/training_meta.json
+       - sweep/option_{option}/signals_{year}_{date}.json  (for sweep years)
+  4. app.py reads these files and replays execute_strategy() live with user sliders.
 """
 
 import os
@@ -99,10 +98,26 @@ def fetch_sofr():
     return 0.045, "fallback 4.5%"
 
 
-def main(force_refresh: bool = False, start_year: int = None, sweep_date: str = None):
+def main(option: str = 'a', force_refresh: bool = False, start_year: int = None, sweep_date: str = None):
     token = os.getenv("HF_TOKEN")
     if not token:
         raise RuntimeError("HF_TOKEN environment variable not set")
+
+    # ── 0. Import config to get ETF lists ─────────────────────────────────────
+    from config import OPTION_A_ETFS, OPTION_B_ETFS
+
+    if option == 'a':
+        TARGET_ETF_LABELS = OPTION_A_ETFS
+        output_subdir = "option_a"
+        sweep_subdir  = "sweep/option_a"
+    elif option == 'b':
+        TARGET_ETF_LABELS = OPTION_B_ETFS
+        output_subdir = "option_b"
+        sweep_subdir  = "sweep/option_b"
+    else:
+        raise ValueError(f"Invalid option: {option}")
+
+    log.info(f"Training for Option {option.upper()}: ETFs = {TARGET_ETF_LABELS}")
 
     # ── 1. Import project modules (streamlit already mocked) ─────────────────
     from data_manager import get_data
@@ -129,7 +144,6 @@ def main(force_refresh: bool = False, start_year: int = None, sweep_date: str = 
              f"{df.index[0].date()} → {df.index[-1].date()}")
 
     # ── 3. Identify targets and features ─────────────────────────────────────
-    TARGET_ETF_LABELS = ['TLT', 'VCIT', 'LQD', 'HYG', 'VNQ', 'SLV', 'GLD']
     target_etfs = [c for c in df.columns
                    if c.endswith('_Ret') and any(e in c for e in TARGET_ETF_LABELS)]
     input_features = [c for c in df.columns
@@ -241,7 +255,7 @@ def main(force_refresh: bool = False, start_year: int = None, sweep_date: str = 
 
     log.info(f"Split → Train: {len(X_train)} | Val: {len(X_val)} | Test: {len(X_test)}")
 
-    # ── 9. Train 7 binary TFTs ────────────────────────────────────────────────
+    # ── 9. Train binary TFTs (one per ETF) ────────────────────────────────────
     etf_names = [e.replace('_Ret', '') for e in target_etfs]
     log.info(f"Training {len(target_etfs)} Binary TFTs...")
     models, histories = train_all_binary_tfts(
@@ -360,15 +374,15 @@ def main(force_refresh: bool = False, start_year: int = None, sweep_date: str = 
     if _eff_start in SWEEP_YEARS:
         try:
             _date_tag    = sweep_date or (datetime.now(timezone.utc) - timedelta(hours=5)).strftime("%Y%m%d")
-            _sweep_fname = f"signals_{_eff_start}_{_date_tag}.json"
+            _sweep_fname = f"{sweep_subdir}/signals_{_eff_start}_{_date_tag}.json"
             _sweep_data  = {
                 "next_signal":      next_signal,
                 "conviction_z":     round(float(conviction_z), 4),
                 "conviction_label": conviction_label,
-                "ann_return":       ann_return_val,   # ✅ real computed value
-                "sharpe":           sharpe_val,        # ✅ real computed value
-                "max_dd":           max_dd_val,        # ✅ real computed value
-                "lookback_days":    int(lookback),     # ✅ fixes "?d" in table
+                "ann_return":       ann_return_val,
+                "sharpe":           sharpe_val,
+                "max_dd":           max_dd_val,
+                "lookback_days":    int(lookback),
                 "start_year":       _eff_start,
                 "sweep_date":       _date_tag,
                 "etf_scores":       signals_payload["etf_scores"],
@@ -386,35 +400,37 @@ def main(force_refresh: bool = False, start_year: int = None, sweep_date: str = 
         except Exception as _e:
             log.warning(f"  Sweep JSON push failed (non-fatal): {_e}")
 
-    # ── 15. Push main outputs to HF Dataset repo ─────────────────────────────
+    # ── 15. Push main outputs to HF Dataset repo (option-specific subdir) ────
     run_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
     push_file_to_hf_dataset(
-        "model_outputs.npz",
+        f"{output_subdir}/model_outputs.npz",
         npz_bytes,
         f"Update model outputs {run_date} start_year={_eff_start}",
         token,
     )
     push_file_to_hf_dataset(
-        "signals.json",
+        f"{output_subdir}/signals.json",
         json.dumps(signals_payload, indent=2).encode(),
         f"Update signals {run_date} → {next_signal}",
         token,
     )
     push_file_to_hf_dataset(
-        "training_meta.json",
+        f"{output_subdir}/training_meta.json",
         json.dumps(meta_payload, indent=2).encode(),
         f"Update training meta {run_date}",
         token,
     )
 
-    log.info(f"✅ All outputs pushed to {HF_OUTPUT_REPO}")
+    log.info(f"✅ All outputs pushed to {HF_OUTPUT_REPO}/{output_subdir}")
     log.info(f"📡 Next signal: {next_signal} on {next_date} "
              f"(conviction: {conviction_label}, Z={conviction_z:.2f})")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
+    parser.add_argument("--option", choices=["a", "b"], default="a",
+                        help="Which ETF universe to train: a (FI/Commodities) or b (Equity)")
     parser.add_argument("--force-refresh", action="store_true",
                         help="Force full dataset rebuild")
     parser.add_argument("--start-year", type=int, default=None,
@@ -422,6 +438,7 @@ if __name__ == "__main__":
     parser.add_argument("--sweep-date", default=None,
                         help="Date tag for sweep cache file (YYYYMMDD)")
     args = parser.parse_args()
-    main(force_refresh=args.force_refresh,
+    main(option=args.option,
+         force_refresh=args.force_refresh,
          start_year=args.start_year,
          sweep_date=args.sweep_date)

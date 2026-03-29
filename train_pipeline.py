@@ -302,7 +302,7 @@ def save_global_model(models, scaler, lookback, lookback_results, target_etfs, i
             "lookback_results": lookback_results,
             "target_etfs": target_etfs,
             "input_features": input_features,
-            "num_features": len(input_features),   # for rebuilding
+            "num_features": len(input_features),
             "run_timestamp_utc": datetime.now(timezone.utc).isoformat(),
         }
         meta_path = os.path.join(local_root, "meta.json")
@@ -315,7 +315,7 @@ def save_global_model(models, scaler, lookback, lookback_results, target_etfs, i
             repo_id=HF_OUTPUT_REPO,
             repo_type="dataset",
             folder_path=os.path.join(tmpdir, f"option_{option}"),
-            path_in_repo="",   # upload to root of the dataset repo
+            path_in_repo="",
             commit_message=f"Global model {option} {datetime.now().strftime('%Y-%m-%d')}",
             token=token,
         )
@@ -333,21 +333,29 @@ def load_global_model(option, token):
         meta = json.load(f)
 
     lookback = meta['lookback']
-    # Backward compatibility: if 'num_features' is missing, derive from input_features
     if 'num_features' in meta:
         num_features = meta['num_features']
     else:
         num_features = len(meta['input_features'])
     target_etfs = meta['target_etfs']
 
-    # Rebuild models
     models = []
     for etf in target_etfs:
-        model = build_binary_tft(seq_len=lookback, num_features=num_features)
-        # Download weights
-        weights_path = download_file_from_hf_dataset(f"option_{option}/global_model/{etf}.weights.h5", token)
-        model.load_weights(weights_path)
-        models.append(model)
+        # Try to load weights-only file first (new format)
+        try:
+            weights_path = download_file_from_hf_dataset(f"option_{option}/global_model/{etf}.weights.h5", token)
+            model = build_binary_tft(seq_len=lookback, num_features=num_features)
+            model.load_weights(weights_path)
+            models.append(model)
+        except Exception as e:
+            # If weights file not found, try full model .h5 (old format)
+            log.warning(f"Could not load weights for {etf}, trying full model .h5: {e}")
+            try:
+                full_model_path = download_file_from_hf_dataset(f"option_{option}/global_model/{etf}.h5", token)
+                model = tf.keras.models.load_model(full_model_path)
+                models.append(model)
+            except Exception as e2:
+                raise RuntimeError(f"Failed to load model for {etf}: {e2}")
 
     # Download scaler
     scaler_path = download_file_from_hf_dataset(f"option_{option}/global_model/scaler.pkl", token)
@@ -459,7 +467,7 @@ def predict_global(option, year, sweep_date, force_refresh, token):
         log.warning(f"No data in df_model for year {year}")
         return
 
-    # Scale features for the whole df_model (already scaled globally? We'll rescale with the global scaler)
+    # Scale features for the whole df_model
     X_full_scaled = scaler.transform(df_model[input_features].values)
 
     # Create sequences for the entire df_model
@@ -468,7 +476,7 @@ def predict_global(option, year, sweep_date, force_refresh, token):
     seq_dates = []
     for i in range(lookback, len(X_full_scaled) - 1):
         X_seq.append(X_full_scaled[i - lookback:i])
-        seq_dates.append(dates[i + 1])  # the date of the prediction (T+1)
+        seq_dates.append(dates[i + 1])
     X_seq = np.array(X_seq, dtype=np.float32)
     seq_dates = pd.DatetimeIndex(seq_dates)
 
@@ -481,7 +489,7 @@ def predict_global(option, year, sweep_date, force_refresh, token):
         log.warning(f"No test sequences found for year {year}")
         return
 
-    # Get corresponding y_fwd and y_bin from binary_targets and fwd_model
+    # Get corresponding y_fwd and y_bin
     y_fwd_full = fwd_model[target_etfs].loc[seq_dates]
     y_bin_full = binary_targets[target_etfs].loc[seq_dates]
     y_fwd_test = y_fwd_full.loc[test_dates_year].values
@@ -511,7 +519,6 @@ def predict_global(option, year, sweep_date, force_refresh, token):
     last_scores = proba[-1]
     best_idx = np.argmax(last_scores)
     next_signal = target_etfs[best_idx]
-    next_date = get_next_trading_day(test_dates_year[-1])
     conviction_z = float((last_scores[best_idx] - 0.5) * 2)
     conviction_label = "High" if last_scores[best_idx] > 0.7 else "Medium" if last_scores[best_idx] > 0.55 else "Low"
 

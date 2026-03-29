@@ -70,27 +70,34 @@ sys.modules["streamlit"] = _make_st_mock()
 def push_file_to_hf_dataset(filename, content_bytes, commit_msg, token, max_retries=3):
     from huggingface_hub import HfApi
     from huggingface_hub.errors import HfHubHTTPError
+    import os
+
+    api = HfApi()
 
     for attempt in range(max_retries):
         try:
-            with tempfile.NamedTemporaryFile(delete=True) as tmp:
+            with tempfile.NamedTemporaryFile(delete=False) as tmp:
                 tmp.write(content_bytes)
                 tmp.flush()
+                tmp_path = tmp.name
 
-                HfApi().upload_file(
-                    path_or_fileobj=tmp.name,
-                    path_in_repo=filename,
-                    repo_id=HF_OUTPUT_REPO,
-                    repo_type="dataset",
-                    token=token,
-                    commit_message=commit_msg,
-                )
+            api.upload_file(
+                path_or_fileobj=tmp_path,
+                path_in_repo=filename,
+                repo_id=HF_OUTPUT_REPO,
+                repo_type="dataset",
+                token=token,
+                commit_message=commit_msg,
+            )
+
+            os.remove(tmp_path)
 
             log.info(f"✅ Uploaded {filename}")
             return
 
         except HfHubHTTPError as e:
-            if e.response.status_code in (412, 429):
+            status = getattr(e.response, "status_code", None)
+            if status in (412, 429):
                 wait = 2 ** attempt
                 log.warning(f"Retry {attempt+1}/{max_retries} in {wait}s")
                 time.sleep(wait)

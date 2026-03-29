@@ -274,35 +274,48 @@ def save_global_model(models, scaler, lookback, lookback_results, target_etfs, i
     import tensorflow as tf
     import pickle
     import tempfile
+    from huggingface_hub import HfApi
+    import os
 
-    for etf, model in zip(target_etfs, models):
-        # Save model to a temporary .h5 file
-        with tempfile.NamedTemporaryFile(suffix='.h5', delete=True) as tmp:
-            model.save(tmp.name)  # Keras 3 uses extension to determine format
-            with open(tmp.name, 'rb') as f:
-                buf = f.read()
-            model_path = f"option_{option}/global_model/{etf}.h5"
-            push_file_to_hf_dataset(model_path, buf,
-                                    f"Global model {etf} {datetime.now().strftime('%Y-%m-%d')}", token)
+    # Create a temporary directory
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # Build the local folder structure: option_{option}/global_model/
+        local_root = os.path.join(tmpdir, f"option_{option}", "global_model")
+        os.makedirs(local_root, exist_ok=True)
 
-    # Save scaler
-    scaler_path = f"option_{option}/global_model/scaler.pkl"
-    with io.BytesIO() as buf:
-        pickle.dump(scaler, buf)
-        push_file_to_hf_dataset(scaler_path, buf.getvalue(),
-                                f"Global scaler {datetime.now().strftime('%Y-%m-%d')}", token)
+        # Save each model as .h5
+        for etf, model in zip(target_etfs, models):
+            model_path = os.path.join(local_root, f"{etf}.h5")
+            model.save(model_path)  # Keras 3 uses extension to determine format
 
-    # Save meta
-    meta = {
-        "lookback": lookback,
-        "lookback_results": lookback_results,
-        "target_etfs": target_etfs,
-        "input_features": input_features,
-        "run_timestamp_utc": datetime.now(timezone.utc).isoformat(),
-    }
-    meta_path = f"option_{option}/global_model/meta.json"
-    push_file_to_hf_dataset(meta_path, json.dumps(meta, indent=2).encode(),
-                            f"Global meta {datetime.now().strftime('%Y-%m-%d')}", token)
+        # Save scaler
+        scaler_path = os.path.join(local_root, "scaler.pkl")
+        with open(scaler_path, "wb") as f:
+            pickle.dump(scaler, f)
+
+        # Save meta
+        meta = {
+            "lookback": lookback,
+            "lookback_results": lookback_results,
+            "target_etfs": target_etfs,
+            "input_features": input_features,
+            "run_timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        }
+        meta_path = os.path.join(local_root, "meta.json")
+        with open(meta_path, "w") as f:
+            json.dump(meta, f, indent=2)
+
+        # Upload the whole folder in a single commit
+        api = HfApi()
+        api.upload_folder(
+            repo_id=HF_OUTPUT_REPO,
+            repo_type="dataset",
+            folder_path=os.path.join(tmpdir, f"option_{option}"),
+            path_in_repo="",   # upload to root of the dataset repo
+            commit_message=f"Global model {option} {datetime.now().strftime('%Y-%m-%d')}",
+            token=token,
+        )
+        log.info(f"✅ Uploaded global model for option {option} in a single commit")
 
 def load_global_model(option, token):
     import tensorflow as tf

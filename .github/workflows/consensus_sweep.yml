@@ -1,12 +1,8 @@
-# .github/workflows/consensus_sweep.yml
-# Runs all years 2008–2025 for both Option A and Option B in parallel.
-# Triggered manually or nightly. Results are saved to sweep/option_{option}/signals_{year}_{date}.json.
-
 name: Consensus Sweep (All Years)
 
 on:
   schedule:
-    - cron: "0 1 * * 2-6"    # 01:00 UTC = 8pm EST Mon–Fri (nightly)
+    - cron: "0 1 * * 2-6"    # 01:00 UTC = 8pm EST Mon–Fri (nightly auto-sweep)
   workflow_dispatch:
     inputs:
       force_refresh:
@@ -21,6 +17,7 @@ jobs:
     timeout-minutes: 180
     strategy:
       fail-fast: false
+      max-parallel: 10           # stay within free tier limits
       matrix:
         year: [2008, 2009, 2010, 2011, 2012, 2013, 2014, 2015, 2016, 2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025]
         option: [a, b]
@@ -35,17 +32,17 @@ jobs:
           cache: "pip"
       - name: Install dependencies
         run: pip install --no-cache-dir -r requirements.txt
-      - name: Run sweep for year ${{ matrix.year }} option ${{ matrix.option }}
+      - name: Run sweep for ${{ matrix.option }} ${{ matrix.year }}
         run: |
           SWEEP_DATE=$(date -u -d "-5 hours" +%Y%m%d 2>/dev/null || date -u +%Y%m%d)
-          ARGS="--start-year ${{ matrix.year }} --sweep-date $SWEEP_DATE"
+          ARGS="--option ${{ matrix.option }} --start-year ${{ matrix.year }} --sweep-date $SWEEP_DATE"
           if [ "${{ github.event.inputs.force_refresh }}" = "true" ]; then
             ARGS="$ARGS --force-refresh"
           fi
-          python train_pipeline.py --option ${{ matrix.option }} $ARGS
+          python train_pipeline.py $ARGS
       - if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: logs-sweep-${{ matrix.option }}-${{ matrix.year }}-${{ github.run_id }}
+          name: logs-${{ matrix.option }}-${{ matrix.year }}-${{ github.run_id }}
           path: "*.log"
           retention-days: 7

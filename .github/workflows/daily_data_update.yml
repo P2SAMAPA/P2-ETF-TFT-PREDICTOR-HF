@@ -1,0 +1,76 @@
+name: Daily Data Update
+
+on:
+  schedule:
+    - cron: "30 21 * * 1-5"   # 21:30 UTC Mon-Fri (after US market close)
+  workflow_dispatch:
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run incremental data update
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          python - <<'EOF'
+          import os
+          import pandas as pd
+          from data_manager import fetch_etf_data, fetch_macro_data_robust, smart_update_hf_dataset
+          from config import ALL_TICKERS
+          from datetime import datetime, timedelta
+
+          token = os.getenv("HF_TOKEN")
+          if not token:
+              raise RuntimeError("HF_TOKEN not set")
+
+          # Load existing dataset to get last date
+          from huggingface_hub import hf_hub_download
+          import time
+
+          repo_id = "P2SAMAPA/my-etf-data"
+          raw_url = f"https://huggingface.co/datasets/{repo_id}/resolve/main/etf_data.csv?t={int(time.time())}"
+          existing = pd.read_csv(raw_url)
+          date_col = next((c for c in existing.columns if "date" in c.lower()), existing.columns[0])
+          existing[date_col] = pd.to_datetime(existing[date_col])
+          existing = existing.set_index(date_col).sort_index()
+          last_date = existing.index[-1]
+          today = datetime.now().date()
+
+          # Determine if new data is available (next trading day after last_date)
+          # Simple heuristic: if last_date is not today, fetch from last_date+1 to today+1
+          if last_date.date() >= today:
+              print("Data already up to date.")
+              exit(0)
+
+          start = (last_date + timedelta(days=1)).strftime("%Y-%m-%d")
+          end = (today + timedelta(days=1)).strftime("%Y-%m-%d")
+
+          print(f"Fetching incremental data from {start} to {end}...")
+          etf_data = fetch_etf_data(ALL_TICKERS, start_date=start, end_date=end)
+          macro_data = fetch_macro_data_robust(start_date=start)
+          if etf_data.empty and macro_data.empty:
+              print("No new data found.")
+              exit(0)
+
+          new_df = pd.concat([etf_data, macro_data], axis=1)
+          df = smart_update_hf_dataset(new_df, token, force_upload=False)
+          print(f"Update complete. Dataset now has {len(df)} rows.")
+          EOF
+
+      - name: Done
+        run: echo "✅ Daily data update complete"

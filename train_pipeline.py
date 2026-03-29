@@ -247,7 +247,11 @@ def train_models(X_train, y_bin_train, X_val, y_bin_val, etf_names, epochs=150, 
     epochs_per = {n: len(h.history['loss']) for n, h in zip(etf_names, histories)}
     return models, epochs_per
 
-def compute_strategy_metrics(models, X_test, y_bin_test, y_fwd_test, test_dates, target_etfs, sofr):
+# =============================================================================
+# FIX: compute_strategy_metrics now receives daily_ret (actual daily returns)
+# =============================================================================
+def compute_strategy_metrics(models, X_test, y_bin_test, y_fwd_test, test_dates,
+                             target_etfs, sofr, daily_ret):
     from models import predict_binary_tfts
     from strategy import execute_strategy, calculate_metrics
 
@@ -258,6 +262,7 @@ def compute_strategy_metrics(models, X_test, y_bin_test, y_fwd_test, test_dates,
         preds_j = (proba[:, j] > 0.5).astype(int)
         acc_per_etf[name] = round(float(np.mean(preds_j == y_bin_test[:, j])), 4)
 
+    # Pass actual daily returns to avoid look‑ahead bias
     (strat_rets, _, _, _, _, _, _) = execute_strategy(
         proba, y_fwd_test, test_dates, target_etfs,
         fee_bps=15,
@@ -265,7 +270,7 @@ def compute_strategy_metrics(models, X_test, y_bin_test, y_fwd_test, test_dates,
         z_reentry=1.0,
         sofr=sofr,
         z_min_entry=0.5,
-        daily_ret_override=None,
+        daily_ret_override=daily_ret,          # FIX: use actual daily returns
     )
     strat_metrics = calculate_metrics(strat_rets, sofr)
     ann_return_val = round(float(strat_metrics['ann_return']), 6)
@@ -386,8 +391,11 @@ def train_global(option, force_refresh, token):
 
     models, epochs_per = train_models(X_train, y_bin_train, X_val, y_bin_val, etf_names, epochs=150, seed=SEED)
 
+    # FIX: extract actual daily returns for the test period
+    daily_ret_test = df.loc[test_dates][target_etfs].fillna(0.0).values
+
     proba, acc_per_etf, ann_return, sharpe, max_dd, strat_rets = compute_strategy_metrics(
-        models, X_test, y_bin_test, y_fwd_test, test_dates, etf_names, sofr)
+        models, X_test, y_bin_test, y_fwd_test, test_dates, etf_names, sofr, daily_ret_test)
 
     log.info(f"Global model metrics: AnnReturn={ann_return*100:.2f}%, Sharpe={sharpe:.2f}, MaxDD={max_dd*100:.2f}%")
 
@@ -543,8 +551,11 @@ def train_year(option, force_refresh, start_year, sweep_date, token):
 
     models, epochs_per = train_models(X_train, y_bin_train, X_val, y_bin_val, etf_names, epochs=150, seed=SEED)
 
+    # FIX: extract actual daily returns for the test period
+    daily_ret_test = df.loc[test_dates][target_etfs].fillna(0.0).values
+
     proba, acc_per_etf, ann_return_val, sharpe_val, max_dd_val, strat_rets = compute_strategy_metrics(
-        models, X_test, y_bin_test, y_fwd_test, test_dates, etf_names, sofr)
+        models, X_test, y_bin_test, y_fwd_test, test_dates, etf_names, sofr, daily_ret_test)
 
     last_scores = proba[-1]
     best_idx, conviction_z, conviction_label = compute_signal_conviction(last_scores)

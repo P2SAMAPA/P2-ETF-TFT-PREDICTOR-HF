@@ -1,0 +1,38 @@
+name: Global Model Training
+
+on:
+  schedule:
+    - cron: "0 6 * * 1-5"   # 6 AM UTC Mon-Fri
+  workflow_dispatch:
+
+jobs:
+  train_global_a:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+      - run: pip install --no-cache-dir -r requirements.txt
+      - name: Train global model for Option A
+        run: python train_pipeline.py --option a --mode train-global
+  train_global_b:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+      - run: pip install --no-cache-dir -r requirements.txt
+      - name: Train global model for Option B
+        run: python train_pipeline.py --option b --mode train-global

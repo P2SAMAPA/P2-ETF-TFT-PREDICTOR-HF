@@ -4,6 +4,7 @@ import numpy as np
 import plotly.express as px
 from huggingface_hub import HfApi, hf_hub_download
 from datetime import datetime
+import json   # <-- MISSING IMPORT ADDED
 
 # Hardcoded strategy parameters (display only)
 TRANSACTION_FEE_BPS = 12

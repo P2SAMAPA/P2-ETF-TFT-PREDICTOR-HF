@@ -12,6 +12,14 @@ import tempfile
 import time
 import subprocess
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Hardcoded strategy parameters (no user sliders)
+TRANSACTION_FEE_BPS = 12          # 12 basis points
+STOP_LOSS_PCT = -0.12             # -12% cumulative 2-day loss
+RE_ENTRY_CONVICTION = 0.90        # 0.90 sigma
+MIN_ENTRY_CONVICTION = 0.50       # 0.50 sigma
+# ──────────────────────────────────────────────────────────────────────────────
+
 # Set page config
 st.set_page_config(
     page_title="ETF Predictor",
@@ -61,7 +69,16 @@ with st.sidebar:
         option_key = "b"
         etf_list = OPTION_B_ETFS
     
-    # HF Token input (for triggering workflows)
+    # Strategy parameters (static display)
+    st.markdown("---")
+    st.subheader("Strategy Parameters (Fixed)")
+    st.markdown(f"**Transaction Fee**: {TRANSACTION_FEE_BPS} bps")
+    st.markdown(f"**Stop Loss (2‑day cumulative)**: {abs(STOP_LOSS_PCT*100):.0f}%")
+    st.markdown(f"**Re‑entry Conviction (σ)**: {RE_ENTRY_CONVICTION:.2f}")
+    st.markdown(f"**Min Entry Conviction (σ)**: {MIN_ENTRY_CONVICTION:.2f}")
+    
+    # HF Token input (for workflow triggers)
+    st.markdown("---")
     token = st.text_input("Hugging Face Token (for workflow triggers)", type="password")
     if token:
         st.session_state.hf_token = token
@@ -233,16 +250,12 @@ with tab2:
             if not st.session_state.hf_token:
                 st.error("Please enter your Hugging Face token in the sidebar.")
             else:
-                # Trigger workflow via GitHub API
-                with st.spinner("Triggering workflow..."):
-                    # We'll use the GitHub API to dispatch the workflow
-                    # This requires a GitHub token. We'll ask the user to set it in secrets or just provide a link.
-                    # For simplicity, we'll just show a link.
-                    st.info(f"Manually trigger the [consensus sweep workflow](https://github.com/{GITHUB_REPO}/actions/workflows/consensus_sweep.yml) on GitHub.")
+                # Provide link to workflow (since we can't dispatch from UI without GitHub token)
+                st.info(f"Manually trigger the [consensus sweep workflow](https://github.com/{GITHUB_REPO}/actions/workflows/consensus_sweep.yml) on GitHub.")
     else:
         st.markdown("---")
         st.info("Global model consensus is updated nightly via GitHub Actions. To force a new run, visit the [global consensus sweep workflow](https://github.com/P2SAMAPA/P2-ETF-TFT-PREDICTOR-HF/actions/workflows/global_consensus_sweep.yml).")
 
 # Footer
 st.markdown("---")
-st.caption("Data updates daily. Model retrained weekly. Predictions are for informational purposes only.")
+st.caption(f"Strategy parameters: fee={TRANSACTION_FEE_BPS} bps, stop loss={abs(STOP_LOSS_PCT*100):.0f}%, re-entry σ={RE_ENTRY_CONVICTION:.2f}, min entry σ={MIN_ENTRY_CONVICTION:.2f}. Data updates daily. Predictions are for informational purposes only.")

@@ -24,6 +24,7 @@ from datetime import datetime, timezone, timedelta
 import io
 import pickle
 import random
+import tempfile
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -252,9 +253,6 @@ def compute_strategy_metrics(models, X_test, y_bin_test, y_fwd_test, test_dates,
         preds_j = (proba[:, j] > 0.5).astype(int)
         acc_per_etf[name] = round(float(np.mean(preds_j == y_bin_test[:, j])), 4)
 
-    # Daily returns for test period (we'll use override)
-    # We don't have daily returns here; we'll fetch from original df later
-
     # Strategy replay with fixed params
     (strat_rets, _, _, _, _, _, _) = execute_strategy(
         proba, y_fwd_test, test_dates, target_etfs,
@@ -263,7 +261,7 @@ def compute_strategy_metrics(models, X_test, y_bin_test, y_fwd_test, test_dates,
         z_reentry=1.0,
         sofr=sofr,
         z_min_entry=0.5,
-        daily_ret_override=None,  # we'll compute later
+        daily_ret_override=None,
     )
     strat_metrics = calculate_metrics(strat_rets, sofr)
     ann_return_val = round(float(strat_metrics['ann_return']), 6)
@@ -275,15 +273,16 @@ def compute_strategy_metrics(models, X_test, y_bin_test, y_fwd_test, test_dates,
 def save_global_model(models, scaler, lookback, lookback_results, target_etfs, input_features, option, token):
     import tensorflow as tf
     import pickle
-    # Save model (assuming models is list of tf.keras.Model)
-    # We'll save each model individually, but for simplicity we can save as list or save each separately.
-    # Since we need to load later, we can save them in a folder.
-    # We'll save as .h5 files for each ETF.
+    import tempfile
+
     for etf, model in zip(target_etfs, models):
-        model_path = f"option_{option}/global_model/{etf}.h5"
-        with io.BytesIO() as buf:
-            model.save(buf, save_format='h5')
-            push_file_to_hf_dataset(model_path, buf.getvalue(),
+        # Save model to a temporary .h5 file
+        with tempfile.NamedTemporaryFile(suffix='.h5', delete=True) as tmp:
+            model.save(tmp.name)  # Keras 3 uses extension to determine format
+            with open(tmp.name, 'rb') as f:
+                buf = f.read()
+            model_path = f"option_{option}/global_model/{etf}.h5"
+            push_file_to_hf_dataset(model_path, buf,
                                     f"Global model {etf} {datetime.now().strftime('%Y-%m-%d')}", token)
 
     # Save scaler
@@ -374,7 +373,6 @@ def train_global(option, force_refresh, token):
     save_global_model(models, scaler, best_lookback, lookback_results, etf_names, input_features, option, token)
 
     # Also save a signals.json for the latest (maybe useful)
-    # We'll compute last prediction
     last_scores = proba[-1]
     best_idx = np.argmax(last_scores)
     next_signal = etf_names[best_idx]
@@ -383,7 +381,7 @@ def train_global(option, force_refresh, token):
     signals_payload = {
         "next_signal": next_signal,
         "next_date": str(next_date),
-        "conviction_z": float((last_scores[best_idx] - 0.5) * 2),  # simple z approx
+        "conviction_z": float((last_scores[best_idx] - 0.5) * 2),
         "conviction_label": "High" if last_scores[best_idx] > 0.7 else "Medium" if last_scores[best_idx] > 0.55 else "Low",
         "etf_scores": {name: float(score) for name, score in zip(etf_names, last_scores)},
         "sofr": sofr,
@@ -424,29 +422,9 @@ def predict_global(option, year, sweep_date, force_refresh, token):
     target_etfs = meta['target_etfs']
     input_features = meta['input_features']
 
-    # Load data only up to the end of the target year (to avoid look-ahead in evaluation)
-    # We'll use the original df, but we need to limit to year <= year
-    df, _, fwd_model, binary_targets, _, _, sofr, rf_label = prepare_data(
-        option, start_year=2008, force_refresh=force_refresh)
-
-    # Filter data up to the end of the target year
+    # Load data only up to the end of the target year
     end_date = pd.Timestamp(f"{year}-12-31")
-    df_year = df[df.index <= end_date].copy()
-    if len(df_year) == 0:
-        log.error(f"No data for year {year}")
-        return
-
-    # Now we need to recreate features, scaling, etc. for this year's test period.
-    # We'll follow the same sequence creation as in training, but using the global scaler.
-    # First, we need to get the feature columns from the original df_year that match input_features.
-    # But note: some features may be derived; they are already in df.
-    # We'll use the same approach as in prepare_data but with limited data.
-
-    # Recompute forward returns, binary targets on the full df (we'll just use the already computed ones from prepare_data,
-    # but we need to align with df_year). Since fwd_model and binary_targets are aligned with df_model (which excludes NaNs),
-    # we need to intersect.
-    # For simplicity, we'll just use the df_model from prepare_data and then filter by year.
-    df_full, df_model, fwd_model, binary_targets, _, _, _, _ = prepare_data(
+    df_full, df_model, fwd_model, binary_targets, _, _, sofr, rf_label = prepare_data(
         option, start_year=2008, force_refresh=force_refresh)
     df_model_year = df_model[df_model.index <= end_date]
 
@@ -456,12 +434,6 @@ def predict_global(option, year, sweep_date, force_refresh, token):
 
     # Scale features for the whole df_model (already scaled globally? We'll rescale with the global scaler)
     X_full_scaled = scaler.transform(df_model[input_features].values)
-    # But we need to create sequences for the test period: we want to use all dates within the year as test dates.
-    # We need to have sequences that end on those dates. We'll create sequences using the full X_full_scaled and then slice.
-    # However, to avoid look-ahead, we should only use data up to the test date.
-    # We'll implement a rolling prediction: for each test date, we take the previous lookback days.
-    # But that's computationally heavy. Instead, we can use the same approach as training: we create sequences for all dates,
-    # then filter those where the date is in the target year. That's acceptable for a once-per-year inference.
 
     # Create sequences for the entire df_model
     dates = df_model.index
@@ -482,10 +454,8 @@ def predict_global(option, year, sweep_date, force_refresh, token):
         log.warning(f"No test sequences found for year {year}")
         return
 
-    # Get corresponding y_fwd and y_bin from binary_targets and fwd_model (aligned with seq_dates)
-    # We need to align y_fwd and y_bin with test_dates_year.
-    # binary_targets and fwd_model are indexed by df_model.index. We'll reindex to match seq_dates.
-    y_fwd_full = fwd_model[target_etfs].loc[seq_dates]  # align
+    # Get corresponding y_fwd and y_bin from binary_targets and fwd_model
+    y_fwd_full = fwd_model[target_etfs].loc[seq_dates]
     y_bin_full = binary_targets[target_etfs].loc[seq_dates]
     y_fwd_test = y_fwd_full.loc[test_dates_year].values
     y_bin_test = y_bin_full.loc[test_dates_year].values
@@ -494,7 +464,6 @@ def predict_global(option, year, sweep_date, force_refresh, token):
     proba = predict_binary_tfts(models, X_test_year)
 
     # Compute strategy metrics for the year
-    # We need daily returns for the test period. We'll use the original returns from df (the raw returns).
     daily_ret_test = df_full.loc[test_dates_year][target_etfs].fillna(0.0).values
 
     (strat_rets, _, _, _, _, _, _) = execute_strategy(
@@ -515,10 +484,7 @@ def predict_global(option, year, sweep_date, force_refresh, token):
     last_scores = proba[-1]
     best_idx = np.argmax(last_scores)
     next_signal = target_etfs[best_idx]
-    # Next trading day after last test date
-    from utils import get_next_trading_day
     next_date = get_next_trading_day(test_dates_year[-1])
-    # Conviction (simple)
     conviction_z = float((last_scores[best_idx] - 0.5) * 2)
     conviction_label = "High" if last_scores[best_idx] > 0.7 else "Medium" if last_scores[best_idx] > 0.55 else "Low"
 
@@ -550,8 +516,6 @@ def predict_global(option, year, sweep_date, force_refresh, token):
 
 def train_year(option, force_refresh, start_year, sweep_date, token):
     """Original per-year training and sweep."""
-    # This is the existing code, slightly refactored to use common functions.
-    # We'll keep the original logic but call the helper functions.
     import numpy as np
     import pandas as pd
     from sklearn.preprocessing import RobustScaler
@@ -592,21 +556,11 @@ def train_year(option, force_refresh, start_year, sweep_date, token):
 
     # Last signal
     last_scores = proba[-1]
-    best_idx, conviction_z, conviction_label = compute_signal_conviction(last_scores)  # uses original function
+    best_idx, conviction_z, conviction_label = compute_signal_conviction(last_scores)
     next_signal = etf_names[best_idx]
     next_date = get_next_trading_day(test_dates[-1])
 
     # Build outputs
-    # ... (we'll reuse the original logic but simplified)
-    # For brevity, I'll assume the original code is here, but we'll replace with calls to reusable functions.
-    # However, to keep this file manageable, I'll include the full original logic in the final version, but with refactored helpers.
-    # Since the original logic is already in the file, we can just keep it as is, but we need to ensure it uses the same helper functions.
-    # I'll copy the original body of main() and modify to use the helpers above.
-
-    # We'll assemble the outputs similarly to the original.
-    # For now, I'll produce a streamlined version that pushes the same artifacts.
-
-    # Build signals.json
     signals_payload = {
         "next_signal": next_signal,
         "next_date": str(next_date),
@@ -676,8 +630,8 @@ def train_year(option, force_refresh, start_year, sweep_date, token):
                             json.dumps(meta_payload, indent=2).encode(),
                             f"Update training meta {datetime.now().strftime('%Y-%m-%d')}", token)
 
-    # Sweep file if year is in SWEEP_YEARS (same as original)
-    SWEEP_YEARS = [2008, 2014, 2016, 2019, 2021]  # adjust as needed
+    # Sweep file if year is in SWEEP_YEARS (adjust as needed)
+    SWEEP_YEARS = [2008, 2014, 2016, 2019, 2021]
     if start_year in SWEEP_YEARS:
         sweep_subdir = f"sweep/option_{option}"
         sweep_fname = f"{sweep_subdir}/signals_{start_year}_{sweep_date}.json"
@@ -729,6 +683,6 @@ if __name__ == "__main__":
         predict_global(args.option, args.year, sweep_date, args.force_refresh, token)
     else:  # train-year
         if args.start_year is None:
-            args.start_year = 2008  # or use default from original
+            args.start_year = 2008
         sweep_date = args.sweep_date or (datetime.now(timezone.utc) - timedelta(hours=5)).strftime("%Y%m%d")
         train_year(args.option, args.force_refresh, args.start_year, sweep_date, token)

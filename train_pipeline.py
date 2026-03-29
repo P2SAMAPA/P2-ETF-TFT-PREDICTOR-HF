@@ -274,6 +274,8 @@ def predict_global(option, year, sweep_date, force_refresh, token):
     if len(X_test_year) == 0:
         log.warning(f"No test sequences found for year {year}")
         return
+    print("DEBUG columns:", list(fwd_model.columns))
+    print("DEBUG target_etfs:", target_etfs)
     y_fwd_full = fwd_model[target_etfs].loc[seq_dates]
     y_bin_full = binary_targets[target_etfs].loc[seq_dates]
     y_fwd_test = y_fwd_full.loc[test_dates_year].values

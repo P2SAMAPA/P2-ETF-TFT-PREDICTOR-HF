@@ -65,6 +65,11 @@ def load_sweep_json(file_path):
         return None
 
 def compute_weighted_consensus(year_files):
+    """
+    Compute weighted consensus across years based on:
+    60% annual return, 20% conviction Z, 10% Sharpe, 10% inverse max drawdown.
+    Returns (weighted_scores_dict, df_weights) where df_weights includes year, top_etf, ann_return, conviction_z, sharpe, max_dd, weight.
+    """
     years_data = []
     all_returns = []
     all_conv = []
@@ -78,9 +83,11 @@ def compute_weighted_consensus(year_files):
             conv_z = data.get('conviction_z')
             sharpe = data.get('sharpe')
             max_dd = data.get('max_dd')
-            if None not in (ann_ret, conv_z, sharpe, max_dd):
+            top_etf = data.get('next_signal')  # ETF for that year
+            if None not in (ann_ret, conv_z, sharpe, max_dd, top_etf):
                 years_data.append({
                     'year': year,
+                    'top_etf': top_etf,
                     'ann_return': ann_ret,
                     'conviction_z': conv_z,
                     'sharpe': sharpe,
@@ -116,9 +123,11 @@ def compute_weighted_consensus(year_files):
         weights.append(w)
         year_data['weight'] = w
 
-    df_weights = pd.DataFrame(years_data)[['year', 'ann_return', 'conviction_z', 'sharpe', 'max_dd', 'weight']]
+    # Create DataFrame for display
+    df_weights = pd.DataFrame(years_data)[['year', 'top_etf', 'ann_return', 'conviction_z', 'sharpe', 'max_dd', 'weight']]
     df_weights = df_weights.sort_values('year')
 
+    # Weighted average of ETF scores
     etf_names = list(years_data[0]['etf_scores'].keys())
     weighted_scores = {etf: 0.0 for etf in etf_names}
     total_weight = sum(weights)
@@ -134,7 +143,7 @@ def compute_weighted_consensus(year_files):
     return weighted_scores, df_weights
 
 # ------------------------------------------------------------------------------
-# Sidebar
+# Sidebar (unchanged)
 # ------------------------------------------------------------------------------
 with st.sidebar:
     st.title("🤖 ETF Predictor")
@@ -186,7 +195,7 @@ st.title("ETF Temporal Fusion Transformer Predictor")
 tab1, tab2 = st.tabs(["Single Year", "Consensus Sweep"])
 
 # ------------------------------------------------------------------------------
-# Tab 1: Single Year
+# Tab 1: Single Year (unchanged)
 # ------------------------------------------------------------------------------
 with tab1:
     st.subheader("Single‑Year Prediction")
@@ -238,7 +247,7 @@ with tab1:
         st.info(f"No sweep data available for {selected_year}. Run the consensus sweep workflow.")
 
 # ------------------------------------------------------------------------------
-# Tab 2: Consensus Sweep
+# Tab 2: Consensus Sweep (added top_etf column to year table)
 # ------------------------------------------------------------------------------
 with tab2:
     st.subheader("Weighted Consensus Across All Years")
@@ -268,14 +277,17 @@ with tab2:
                          title="Weighted Consensus ETF Scores")
             st.plotly_chart(fig, use_container_width=True)
 
-            # Optional: year‑by‑year metrics table
+            # Year‑by‑year metrics table including the top ETF for each year
             with st.expander("Show year‑by‑year metrics and weights"):
-                st.dataframe(df_weights.style.format({
+                # Rename 'top_etf' column to 'Top ETF' for display
+                display_df = df_weights.rename(columns={'top_etf': 'Top ETF'})
+                st.dataframe(display_df.style.format({
                     'ann_return': '{:.2%}',
                     'conviction_z': '{:.3f}',
                     'sharpe': '{:.2f}',
                     'max_dd': '{:.2%}',
                     'weight': '{:.3f}'
                 }))
+                st.caption("Weight = 0.6*Norm(AnnRet) + 0.2*Norm(ConvZ) + 0.1*Norm(Sharpe) + 0.1*Norm(InvDD)")
         else:
             st.error("Could not compute consensus – missing metrics in sweep files.")

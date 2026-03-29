@@ -2,15 +2,11 @@
 train_pipeline.py — Headless training script for GitHub Actions.
 
 Supports:
-- Per-year model training (existing, default)
-- Global model training (--mode train-global)
-- Global model prediction for a specific year (--mode predict-global --year YYYY)
+- Per-year model training (--mode train-year) – writes only sweep JSONs to `sweep/`
+- Global model training (--mode train-global) – writes full model folder to `option_{option}/global_model/`
+- Global model prediction (--mode predict-global) – writes sweep JSONs to `global_sweep/`
 
-Outputs:
-- Per-year model: saved to option_{option}/model_outputs.npz, signals.json, training_meta.json
-  and sweep files in sweep/option_{option}/signals_{year}_{date}.json
-- Global model: saved to option_{option}/global_model/ (weights and metadata)
-- Global predictions: saved to global_sweep/option_{option}/signals_{year}_{date}.json
+No other files are written to the HF dataset.
 """
 
 import os
@@ -25,6 +21,7 @@ import io
 import pickle
 import random
 import tempfile
+import time
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -40,15 +37,15 @@ log = logging.getLogger(__name__)
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 os.environ["PYTHONHASHSEED"] = "42"
 
-HF_OUTPUT_REPO  = "P2SAMAPA/p2-etf-tft-outputs"   # dataset repo — all outputs go here
-HF_DATASET_REPO = "P2SAMAPA/my-etf-data"           # READ ONLY — never written
+HF_OUTPUT_REPO  = "P2SAMAPA/p2-etf-tft-outputs"
+HF_DATASET_REPO = "P2SAMAPA/my-etf-data"
 
 TRAIN_PCT    = 0.80
 VAL_PCT      = 0.10
 TEST_PCT     = 0.10
 FORWARD_DAYS = 5
 
-# ── Streamlit mock — allows importing data_manager.py headlessly ──────────────
+# ── Streamlit mock ──────────────────────────────────────────────────────────────
 def _make_st_mock():
     import unittest.mock as mock
     st = mock.MagicMock()
@@ -67,24 +64,36 @@ def _make_st_mock():
 
 sys.modules["streamlit"] = _make_st_mock()
 
-# ── HF utilities ──────────────────────────────────────────────────────────────
+# ── HF utilities with retry ───────────────────────────────────────────────────
 def push_file_to_hf_dataset(filename: str, content_bytes: bytes,
-                            commit_msg: str, token: str):
-    """Upload a single file to the dataset repo using upload_file (resolves conflicts)."""
+                            commit_msg: str, token: str, max_retries=3):
     from huggingface_hub import HfApi
-    with tempfile.NamedTemporaryFile(delete=True) as tmp:
-        tmp.write(content_bytes)
-        tmp.flush()
-        api = HfApi()
-        api.upload_file(
-            path_or_fileobj=tmp.name,
-            path_in_repo=filename,
-            repo_id=HF_OUTPUT_REPO,
-            repo_type="dataset",
-            token=token,
-            commit_message=commit_msg,
-        )
-    log.info(f"✅ Pushed {filename} → {HF_OUTPUT_REPO} ({len(content_bytes):,} bytes)")
+    from huggingface_hub.errors import HfHubHTTPError
+
+    for attempt in range(max_retries):
+        try:
+            with tempfile.NamedTemporaryFile(delete=True) as tmp:
+                tmp.write(content_bytes)
+                tmp.flush()
+                api = HfApi()
+                api.upload_file(
+                    path_or_fileobj=tmp.name,
+                    path_in_repo=filename,
+                    repo_id=HF_OUTPUT_REPO,
+                    repo_type="dataset",
+                    token=token,
+                    commit_message=commit_msg,
+                )
+            log.info(f"✅ Pushed {filename} → {HF_OUTPUT_REPO} ({len(content_bytes):,} bytes)")
+            return
+        except HfHubHTTPError as e:
+            if e.response.status_code in (412, 429):
+                wait = 2 ** attempt
+                log.warning(f"Upload failed with {e.response.status_code}, retrying in {wait}s (attempt {attempt+1}/{max_retries})")
+                time.sleep(wait)
+            else:
+                raise
+    raise RuntimeError(f"Failed to upload {filename} after {max_retries} attempts")
 
 def download_file_from_hf_dataset(filename: str, token: str):
     from huggingface_hub import hf_hub_download
@@ -98,7 +107,7 @@ def download_file_from_hf_dataset(filename: str, token: str):
     log.info(f"Downloaded {filename} to {local_path}")
     return local_path
 
-# ── Data fetching and preparation (reused) ───────────────────────────────────
+# ── Data functions (unchanged) ────────────────────────────────────────────────
 def fetch_sofr():
     try:
         import pandas_datareader.data as web
@@ -129,7 +138,6 @@ def prepare_data(option: str, start_year: int, force_refresh: bool):
     log.info(f"Dataset: {len(df)} rows × {df.shape[1]} cols | "
              f"{df.index[0].date()} → {df.index[-1].date()}")
 
-    # Identify targets and features
     target_etfs = [c for c in df.columns
                    if c.endswith('_Ret') and any(e in c for e in TARGET_ETF_LABELS)]
     input_features = [c for c in df.columns
@@ -144,13 +152,11 @@ def prepare_data(option: str, start_year: int, force_refresh: bool):
                            f"features ({len(input_features)})")
     log.info(f"Targets: {len(target_etfs)} | Features: {len(input_features)}")
 
-    # Risk-free rate
     sofr, rf_label = fetch_sofr()
     if 'DTB3' in df.columns and 'fallback' in rf_label:
         sofr = float(df['DTB3'].dropna().iloc[-1]) / 100
         rf_label = "dataset DTB3"
 
-    # Forward returns
     daily_rf_5d = (sofr / 252) * FORWARD_DAYS
     fwd_returns = pd.DataFrame(index=df.index)
     for col in target_etfs:
@@ -250,13 +256,11 @@ def compute_strategy_metrics(models, X_test, y_bin_test, y_fwd_test, test_dates,
 
     proba = predict_binary_tfts(models, X_test)
 
-    # Accuracy per ETF
     acc_per_etf = {}
     for j, name in enumerate(target_etfs):
         preds_j = (proba[:, j] > 0.5).astype(int)
         acc_per_etf[name] = round(float(np.mean(preds_j == y_bin_test[:, j])), 4)
 
-    # Strategy replay with fixed params
     (strat_rets, _, _, _, _, _, _) = execute_strategy(
         proba, y_fwd_test, test_dates, target_etfs,
         fee_bps=15,
@@ -273,6 +277,7 @@ def compute_strategy_metrics(models, X_test, y_bin_test, y_fwd_test, test_dates,
 
     return proba, acc_per_etf, ann_return_val, sharpe_val, max_dd_val, strat_rets
 
+# ── Global model functions (unchanged) ─────────────────────────────────────────
 def save_global_model(models, scaler, lookback, lookback_results, target_etfs, input_features, option, token):
     import tensorflow as tf
     import pickle
@@ -280,23 +285,18 @@ def save_global_model(models, scaler, lookback, lookback_results, target_etfs, i
     from huggingface_hub import HfApi
     import os
 
-    # Create a temporary directory
     with tempfile.TemporaryDirectory() as tmpdir:
-        # Build the local folder structure: option_{option}/global_model/
         local_root = os.path.join(tmpdir, f"option_{option}", "global_model")
         os.makedirs(local_root, exist_ok=True)
 
-        # Save each model's weights
         for etf, model in zip(target_etfs, models):
             weights_path = os.path.join(local_root, f"{etf}.weights.h5")
             model.save_weights(weights_path)
 
-        # Save scaler
         scaler_path = os.path.join(local_root, "scaler.pkl")
         with open(scaler_path, "wb") as f:
             pickle.dump(scaler, f)
 
-        # Save meta (includes architecture info)
         meta = {
             "lookback": lookback,
             "lookback_results": lookback_results,
@@ -309,7 +309,6 @@ def save_global_model(models, scaler, lookback, lookback_results, target_etfs, i
         with open(meta_path, "w") as f:
             json.dump(meta, f, indent=2)
 
-        # Upload the whole folder in a single commit
         api = HfApi()
         api.upload_folder(
             repo_id=HF_OUTPUT_REPO,
@@ -327,7 +326,6 @@ def load_global_model(option, token):
     from huggingface_hub import hf_hub_download
     from models import build_binary_tft
 
-    # Download meta first to know architecture
     meta_path = download_file_from_hf_dataset(f"option_{option}/global_model/meta.json", token)
     with open(meta_path, 'r') as f:
         meta = json.load(f)
@@ -341,14 +339,12 @@ def load_global_model(option, token):
 
     models = []
     for etf in target_etfs:
-        # Try to load weights-only file first (new format)
         try:
             weights_path = download_file_from_hf_dataset(f"option_{option}/global_model/{etf}.weights.h5", token)
             model = build_binary_tft(seq_len=lookback, num_features=num_features)
             model.load_weights(weights_path)
             models.append(model)
         except Exception as e:
-            # If weights file not found, try full model .h5 (old format)
             log.warning(f"Could not load weights for {etf}, trying full model .h5: {e}")
             try:
                 full_model_path = download_file_from_hf_dataset(f"option_{option}/global_model/{etf}.h5", token)
@@ -357,36 +353,29 @@ def load_global_model(option, token):
             except Exception as e2:
                 raise RuntimeError(f"Failed to load model for {etf}: {e2}")
 
-    # Download scaler
     scaler_path = download_file_from_hf_dataset(f"option_{option}/global_model/scaler.pkl", token)
     with open(scaler_path, 'rb') as f:
         scaler = pickle.load(f)
 
     return models, scaler, meta
 
-# ── Main functions for each mode ──────────────────────────────────────────────
 def train_global(option, force_refresh, token):
-    """Train a single global model on full history (start_year=2008)."""
     from sklearn.preprocessing import RobustScaler
-    from models import SEED, build_binary_tft
+    from models import SEED
     import tensorflow as tf
 
     log.info(f"Global training for Option {option.upper()}")
-    # Prepare data from 2008
     df, df_model, fwd_model, binary_targets, target_etfs, input_features, sofr, rf_label = prepare_data(
         option, start_year=2008, force_refresh=force_refresh)
 
-    # Scale features
     scaler = RobustScaler()
     scaler.fit(df_model[input_features].values)
     scaled = scaler.transform(df_model[input_features].values)
 
-    # Determine optimal lookback
     bin_proxy = binary_targets[target_etfs[0]].values
     lookback_candidates = [20, 30, 40, 50, 60]
     best_lookback, lookback_results = optimize_lookback(scaled, bin_proxy, lookback_candidates, SEED)
 
-    # Create sequences
     bin_vals = binary_targets[target_etfs].values
     fwd_vals = fwd_model[target_etfs].values
     dates = df_model.index
@@ -395,19 +384,16 @@ def train_global(option, force_refresh, token):
 
     etf_names = [e.replace('_Ret', '') for e in target_etfs]
 
-    # Train models (one per ETF)
     models, epochs_per = train_models(X_train, y_bin_train, X_val, y_bin_val, etf_names, epochs=150, seed=SEED)
 
-    # Compute metrics (for info)
     proba, acc_per_etf, ann_return, sharpe, max_dd, strat_rets = compute_strategy_metrics(
         models, X_test, y_bin_test, y_fwd_test, test_dates, etf_names, sofr)
 
     log.info(f"Global model metrics: AnnReturn={ann_return*100:.2f}%, Sharpe={sharpe:.2f}, MaxDD={max_dd*100:.2f}%")
 
-    # Save model and scaler to HF
     save_global_model(models, scaler, best_lookback, lookback_results, etf_names, input_features, option, token)
 
-    # Also save a signals.json for the latest (maybe useful)
+    # Optional signals.json for latest state
     last_scores = proba[-1]
     best_idx = np.argmax(last_scores)
     next_signal = etf_names[best_idx]
@@ -439,38 +425,28 @@ def train_global(option, force_refresh, token):
         f"Global signals {datetime.now().strftime('%Y-%m-%d')}",
         token,
     )
-
     log.info("Global model training complete")
 
 def predict_global(option, year, sweep_date, force_refresh, token):
-    """Load global model and generate sweep JSON for a specific year."""
     from models import predict_binary_tfts
-    from sklearn.preprocessing import RobustScaler
-    import tensorflow as tf
     from strategy import execute_strategy, calculate_metrics
     from utils import get_next_trading_day
 
     log.info(f"Global prediction for Option {option.upper()}, year {year}")
-    # Load global model
     models, scaler, meta = load_global_model(option, token)
     lookback = meta['lookback']
     target_etfs = meta['target_etfs']
     input_features = meta['input_features']
 
-    # Load data only up to the end of the target year
     end_date = pd.Timestamp(f"{year}-12-31")
     df_full, df_model, fwd_model, binary_targets, _, _, sofr, rf_label = prepare_data(
         option, start_year=2008, force_refresh=force_refresh)
     df_model_year = df_model[df_model.index <= end_date]
-
     if len(df_model_year) == 0:
         log.warning(f"No data in df_model for year {year}")
         return
 
-    # Scale features for the whole df_model
     X_full_scaled = scaler.transform(df_model[input_features].values)
-
-    # Create sequences for the entire df_model
     dates = df_model.index
     X_seq = []
     seq_dates = []
@@ -480,25 +456,19 @@ def predict_global(option, year, sweep_date, force_refresh, token):
     X_seq = np.array(X_seq, dtype=np.float32)
     seq_dates = pd.DatetimeIndex(seq_dates)
 
-    # Keep only those in the target year
     mask = (seq_dates >= pd.Timestamp(f"{year}-01-01")) & (seq_dates <= end_date)
     X_test_year = X_seq[mask]
     test_dates_year = seq_dates[mask]
-
     if len(X_test_year) == 0:
         log.warning(f"No test sequences found for year {year}")
         return
 
-    # Get corresponding y_fwd and y_bin
     y_fwd_full = fwd_model[target_etfs].loc[seq_dates]
     y_bin_full = binary_targets[target_etfs].loc[seq_dates]
     y_fwd_test = y_fwd_full.loc[test_dates_year].values
     y_bin_test = y_bin_full.loc[test_dates_year].values
 
-    # Predict
     proba = predict_binary_tfts(models, X_test_year)
-
-    # Compute strategy metrics for the year
     daily_ret_test = df_full.loc[test_dates_year][target_etfs].fillna(0.0).values
 
     (strat_rets, _, _, _, _, _, _) = execute_strategy(
@@ -515,14 +485,12 @@ def predict_global(option, year, sweep_date, force_refresh, token):
     sharpe_val     = round(float(strat_metrics['sharpe']),     6)
     max_dd_val     = round(float(strat_metrics['max_dd']),     6)
 
-    # Last signal for this year
     last_scores = proba[-1]
     best_idx = np.argmax(last_scores)
     next_signal = target_etfs[best_idx]
     conviction_z = float((last_scores[best_idx] - 0.5) * 2)
     conviction_label = "High" if last_scores[best_idx] > 0.7 else "Medium" if last_scores[best_idx] > 0.55 else "Low"
 
-    # Build sweep data
     sweep_data = {
         "next_signal": next_signal,
         "conviction_z": conviction_z,
@@ -536,8 +504,6 @@ def predict_global(option, year, sweep_date, force_refresh, token):
         "etf_scores": {name: float(score) for name, score in zip(target_etfs, last_scores)},
         "model_type": "global",
     }
-
-    # Push sweep file
     sweep_subdir = f"global_sweep/option_{option}"
     sweep_fname = f"{sweep_subdir}/signals_{year}_{sweep_date}.json"
     push_file_to_hf_dataset(
@@ -546,33 +512,28 @@ def predict_global(option, year, sweep_date, force_refresh, token):
         f"[global sweep] {year} {sweep_date} → {next_signal}",
         token,
     )
-    log.info(f"✅ Global sweep cache pushed: {sweep_fname}  signal={next_signal}  z={conviction_z:.3f}")
+    log.info(f"✅ Global sweep cache pushed: {sweep_fname}")
 
+# ── Per‑year training (only writes sweep JSON) ─────────────────────────────────
 def train_year(option, force_refresh, start_year, sweep_date, token):
-    """Original per-year training and sweep."""
-    import numpy as np
-    import pandas as pd
     from sklearn.preprocessing import RobustScaler
-    from models import SEED, build_binary_tft, train_all_binary_tfts, predict_binary_tfts
-    from strategy import execute_strategy, calculate_metrics, compute_signal_conviction
+    from models import SEED
+    from strategy import compute_signal_conviction
     from utils import get_next_trading_day
     import tensorflow as tf
 
     df, df_model, fwd_model, binary_targets, target_etfs, input_features, sofr, rf_label = prepare_data(
         option, start_year, force_refresh)
 
-    # Scale features
     scaler = RobustScaler()
     approx_train_end = int((len(df_model) - 60 - 1) * TRAIN_PCT)
     scaler.fit(df_model[input_features].values[:approx_train_end])
     scaled = scaler.transform(df_model[input_features].values)
 
-    # Optimize lookback
     bin_proxy = binary_targets[target_etfs[0]].values
     lookback_candidates = [20, 30, 40, 50, 60]
     best_lookback, lookback_results = optimize_lookback(scaled, bin_proxy, lookback_candidates, SEED)
 
-    # Create sequences
     bin_vals = binary_targets[target_etfs].values
     fwd_vals = fwd_model[target_etfs].values
     dates = df_model.index
@@ -581,127 +542,47 @@ def train_year(option, force_refresh, start_year, sweep_date, token):
 
     etf_names = [e.replace('_Ret', '') for e in target_etfs]
 
-    # Train models
     models, epochs_per = train_models(X_train, y_bin_train, X_val, y_bin_val, etf_names, epochs=150, seed=SEED)
 
-    # Compute metrics
     proba, acc_per_etf, ann_return_val, sharpe_val, max_dd_val, strat_rets = compute_strategy_metrics(
         models, X_test, y_bin_test, y_fwd_test, test_dates, etf_names, sofr)
 
-    # Last signal
     last_scores = proba[-1]
     best_idx, conviction_z, conviction_label = compute_signal_conviction(last_scores)
     next_signal = etf_names[best_idx]
-    next_date = get_next_trading_day(test_dates[-1])
 
-    # Build outputs
-    signals_payload = {
+    # Only write the sweep JSON (no other files)
+    sweep_subdir = f"sweep/option_{option}"
+    sweep_fname = f"{sweep_subdir}/signals_{start_year}_{sweep_date}.json"
+    sweep_data = {
         "next_signal": next_signal,
-        "next_date": str(next_date),
         "conviction_z": round(float(conviction_z), 4),
         "conviction_label": conviction_label,
-        "etf_scores": {name: round(float(score), 4) for name, score in zip(etf_names, last_scores)},
-        "sofr": round(sofr, 6),
-        "rf_label": rf_label,
-        "data_start": str(df.index[0].date()),
-        "data_end": str(df.index[-1].date()),
-        "test_start": str(test_dates[0].date()),
-        "test_end": str(test_dates[-1].date()),
-        "n_test_days": len(test_dates),
-        "lookback_days": best_lookback,
-        "start_year": start_year,
         "ann_return": ann_return_val,
         "sharpe": sharpe_val,
         "max_dd": max_dd_val,
-        "run_timestamp_utc": datetime.now(timezone.utc).isoformat(),
-    }
-
-    # model_outputs.npz
-    daily_ret_test = df.reindex(test_dates)[target_etfs].fillna(0.0).values
-    spy_ret_test = df.reindex(test_dates)['SPY_Ret'].fillna(0.0).values if 'SPY_Ret' in df.columns else np.zeros(len(test_dates))
-    agg_ret_test = df.reindex(test_dates)['AGG_Ret'].fillna(0.0).values if 'AGG_Ret' in df.columns else np.zeros(len(test_dates))
-    npz_buf = {
-        'proba': proba.astype(np.float32),
-        'daily_ret_test': daily_ret_test.astype(np.float32),
-        'y_fwd_test': y_fwd_test.astype(np.float32),
-        'spy_ret_test': spy_ret_test.astype(np.float32),
-        'agg_ret_test': agg_ret_test.astype(np.float32),
-        'test_dates': np.array([str(d.date()) for d in test_dates]),
-        'target_etfs': np.array(target_etfs),
-        'sofr': np.array([sofr]),
-        'all_test_start': np.array([str(test_dates[0].date())]),
-        'all_test_end': np.array([str(test_dates[-1].date())]),
-    }
-    npz_io = io.BytesIO()
-    np.savez_compressed(npz_io, **npz_buf)
-    npz_bytes = npz_io.getvalue()
-
-    # training_meta.json
-    meta_payload = {
         "lookback_days": best_lookback,
-        "lookback_search": lookback_results,
-        "epochs_per_etf": epochs_per,
-        "accuracy_per_etf": acc_per_etf,
-        "train_size": len(X_train),
-        "val_size": len(X_val),
-        "test_size": len(X_test),
-        "n_features": len(input_features),
-        "n_targets": len(target_etfs),
-        "target_etfs": target_etfs,
-        "split": "80/10/10",
-        "forward_days": FORWARD_DAYS,
-        "run_timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "start_year": start_year,
+        "sweep_date": sweep_date,
+        "etf_scores": {name: round(float(score), 4) for name, score in zip(etf_names, last_scores)},
     }
-
-    output_subdir = f"option_{option}"
-    # Push main outputs
-    push_file_to_hf_dataset(f"{output_subdir}/model_outputs.npz", npz_bytes,
-                            f"Update model outputs {datetime.now().strftime('%Y-%m-%d')} start_year={start_year}", token)
-    push_file_to_hf_dataset(f"{output_subdir}/signals.json",
-                            json.dumps(signals_payload, indent=2).encode(),
-                            f"Update signals {datetime.now().strftime('%Y-%m-%d')} → {next_signal}", token)
-    push_file_to_hf_dataset(f"{output_subdir}/training_meta.json",
-                            json.dumps(meta_payload, indent=2).encode(),
-                            f"Update training meta {datetime.now().strftime('%Y-%m-%d')}", token)
-
-    # Sweep file if year is in SWEEP_YEARS (adjust as needed)
-    SWEEP_YEARS = [2008, 2014, 2016, 2019, 2021]
-    if start_year in SWEEP_YEARS:
-        sweep_subdir = f"sweep/option_{option}"
-        sweep_fname = f"{sweep_subdir}/signals_{start_year}_{sweep_date}.json"
-        sweep_data = {
-            "next_signal": next_signal,
-            "conviction_z": round(float(conviction_z), 4),
-            "conviction_label": conviction_label,
-            "ann_return": ann_return_val,
-            "sharpe": sharpe_val,
-            "max_dd": max_dd_val,
-            "lookback_days": best_lookback,
-            "start_year": start_year,
-            "sweep_date": sweep_date,
-            "etf_scores": {name: round(float(score), 4) for name, score in zip(etf_names, last_scores)},
-        }
-        push_file_to_hf_dataset(sweep_fname, json.dumps(sweep_data, indent=2).encode(),
-                                f"[sweep] {start_year} {sweep_date} → {next_signal}", token)
-        log.info(f"✅ Sweep cache pushed: {sweep_fname}  signal={next_signal}")
-
-    log.info(f"Per-year training complete for option {option}, start_year={start_year}")
+    push_file_to_hf_dataset(
+        sweep_fname,
+        json.dumps(sweep_data, indent=2).encode(),
+        f"[sweep] {start_year} {sweep_date} → {next_signal}",
+        token,
+    )
+    log.info(f"✅ Sweep cache pushed: {sweep_fname}  signal={next_signal}")
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--option", choices=["a", "b"], default="a",
-                        help="Which ETF universe to train: a (FI/Commodities) or b (Equity)")
-    parser.add_argument("--force-refresh", action="store_true",
-                        help="Force full dataset rebuild")
-    parser.add_argument("--start-year", type=int, default=None,
-                        help="Override training start year (for per-year mode)")
-    parser.add_argument("--sweep-date", default=None,
-                        help="Date tag for sweep cache file (YYYYMMDD)")
-    parser.add_argument("--mode", choices=["train-year", "train-global", "predict-global"],
-                        default="train-year", help="Mode of operation")
-    parser.add_argument("--year", type=int, default=None,
-                        help="Year for prediction (predict-global mode)")
+    parser.add_argument("--option", choices=["a", "b"], default="a")
+    parser.add_argument("--force-refresh", action="store_true")
+    parser.add_argument("--start-year", type=int, default=None)
+    parser.add_argument("--sweep-date", default=None)
+    parser.add_argument("--mode", choices=["train-year", "train-global", "predict-global"], default="train-year")
+    parser.add_argument("--year", type=int, default=None)
     args = parser.parse_args()
 
     token = os.getenv("HF_TOKEN")

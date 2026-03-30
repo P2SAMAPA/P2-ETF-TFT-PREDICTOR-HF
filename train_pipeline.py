@@ -415,18 +415,18 @@ def train_global(option, force_refresh, token):
 def train_year(option, force_refresh, start_year, sweep_date, token):
     """
     Train per-year model for specific year and save to yearwise_sweep/option_{option}/
-    Same logic as predict_global() but trains on specific year instead of using global model
+    All files uploaded in a single commit to avoid rate limits.
     """
     from models import build_binary_tft, predict_binary_tfts
     from strategy import execute_strategy, calculate_metrics
     from sklearn.preprocessing import StandardScaler
+    from huggingface_hub import CommitOperationAdd, HfApi
     import tensorflow as tf
     
     log.info(f"Training per-year model for Option {option.upper()}, year {start_year}")
     
     # Prepare data for the specific year (with buffer for lookback)
-    # We need data before start_year for the lookback window
-    buffer_years = 2  # Get extra data for lookback
+    buffer_years = 2
     data_start_year = max(2008, start_year - buffer_years)
     
     df_full, df_model, fwd_model, binary_targets, target_etfs, input_features, sofr, rf_label = prepare_data(
@@ -452,7 +452,7 @@ def train_year(option, force_refresh, start_year, sweep_date, token):
     X_scaled = scaler.fit_transform(df_year[input_features].values)
     
     # Build sequences
-    lookback = 60  # Same as global model
+    lookback = 60
     X_seq, y_seq = [], []
     
     for i in range(lookback, len(X_scaled)):
@@ -476,144 +476,176 @@ def train_year(option, force_refresh, start_year, sweep_date, token):
     # Build path for yearwise sweep
     base_path = f"yearwise_sweep/option_{option}"
     
-    # Train models for each ETF
-    models = []
-    for i, etf in enumerate(target_etfs):
-        log.info(f"Training model for {etf} ({start_year})")
-        model = build_binary_tft(seq_len=lookback, num_features=len(input_features))
-        
-        # Compile
-        model.compile(
-            optimizer=tf.keras.optimizers.Adam(learning_rate=0.001),
-            loss='binary_crossentropy',
-            metrics=['accuracy']
-        )
-        
-        # Callbacks
-        early_stop = tf.keras.callbacks.EarlyStopping(
-            monitor='val_loss', patience=10, restore_best_weights=True
-        )
-        
-        # Train
-        history = model.fit(
-            X_train, y_train[:, i],
-            validation_data=(X_val, y_val[:, i]),
-            epochs=100,
-            batch_size=32,
-            callbacks=[early_stop],
-            verbose=0
-        )
-        
-        models.append(model)
-        
-        # Save weights
-        with tempfile.NamedTemporaryFile(suffix=".weights.h5", delete=False) as tmp_weights:
+    # 🔴 CRITICAL: Collect all files for single commit
+    operations = []
+    temp_files = []  # Track temp files for cleanup
+    
+    try:
+        # Train models for each ETF
+        models = []
+        for i, etf in enumerate(target_etfs):
+            log.info(f"Training model for {etf} ({start_year})")
+            model = build_binary_tft(seq_len=lookback, num_features=len(input_features))
+            
+            # Compile
+            model.compile(
+                optimizer=tf.keras.optimizers.Adam(learning_rate=0.001),
+                loss='binary_crossentropy',
+                metrics=['accuracy']
+            )
+            
+            # Callbacks
+            early_stop = tf.keras.callbacks.EarlyStopping(
+                monitor='val_loss', patience=10, restore_best_weights=True
+            )
+            
+            # Train
+            history = model.fit(
+                X_train, y_train[:, i],
+                validation_data=(X_val, y_val[:, i]),
+                epochs=100,
+                batch_size=32,
+                callbacks=[early_stop],
+                verbose=0
+            )
+            
+            models.append(model)
+            
+            # Save weights to temp file
+            tmp_weights = tempfile.NamedTemporaryFile(suffix=".weights.h5", delete=False)
             model.save_weights(tmp_weights.name)
             tmp_weights.flush()
+            tmp_weights.close()
+            temp_files.append(tmp_weights.name)
+            
+            # Read and add to operations
             with open(tmp_weights.name, 'rb') as f:
                 weights_bytes = f.read()
+            
+            operations.append(CommitOperationAdd(
+                path_in_repo=f"{base_path}/{etf}_{start_year}.weights.h5",
+                path_or_fileobj=weights_bytes,
+            ))
+            log.info(f"Prepared {etf}_{start_year}.weights.h5 for upload")
         
-        push_file_to_hf_dataset(
-            f"{base_path}/{etf}_{start_year}.weights.h5",
-            weights_bytes,
-            f"Year model {option} {start_year} {datetime.now().strftime('%Y-%m-%d')}",
-            token
+        # Save scaler to temp file
+        scaler_bytes = io.BytesIO()
+        pickle.dump(scaler, scaler_bytes)
+        scaler_bytes.seek(0)
+        
+        operations.append(CommitOperationAdd(
+            path_in_repo=f"{base_path}/scaler_{start_year}.pkl",
+            path_or_fileobj=scaler_bytes.getvalue(),
+        ))
+        
+        # Save meta
+        meta = {
+            'lookback': lookback,
+            'num_features': len(input_features),
+            'target_etfs': target_etfs,
+            'input_features': input_features,
+            'option': option,
+            'year': start_year,
+            'train_date': datetime.now().isoformat(),
+            'train_samples': len(X_train),
+            'val_samples': len(X_val)
+        }
+        
+        operations.append(CommitOperationAdd(
+            path_in_repo=f"{base_path}/meta_{start_year}.json",
+            path_or_fileobj=json.dumps(meta, indent=2).encode(),
+        ))
+        
+        # Generate predictions for metrics
+        proba = predict_binary_tfts(models, X_seq)
+        
+        # Get dates for predictions
+        pred_dates = df_year.index[lookback:lookback + len(proba)]
+        
+        # Get actual returns for strategy calculation
+        y_fwd_year = fwd_model[target_etfs].loc[pred_dates].values
+        daily_ret_year = df_full.loc[pred_dates][target_etfs].fillna(0.0).values
+        
+        # Run strategy
+        strat_rets, _, _, _, _, _, _ = execute_strategy(
+            proba,
+            y_fwd_year,
+            pred_dates,
+            target_etfs,
+            fee_bps=15,
+            stop_loss_pct=-0.12,
+            z_reentry=1.0,
+            sofr=sofr,
+            z_min_entry=0.5,
+            daily_ret_override=daily_ret_year
         )
-    
-    # Save scaler
-    scaler_bytes = io.BytesIO()
-    pickle.dump(scaler, scaler_bytes)
-    push_file_to_hf_dataset(
-        f"{base_path}/scaler_{start_year}.pkl",
-        scaler_bytes.getvalue(),
-        f"Year model {option} {start_year} {datetime.now().strftime('%Y-%m-%d')}",
-        token
-    )
-    
-    # Save meta
-    meta = {
-        'lookback': lookback,
-        'num_features': len(input_features),
-        'target_etfs': target_etfs,
-        'input_features': input_features,
-        'option': option,
-        'year': start_year,
-        'train_date': datetime.now().isoformat(),
-        'train_samples': len(X_train),
-        'val_samples': len(X_val)
-    }
-    
-    push_file_to_hf_dataset(
-        f"{base_path}/meta_{start_year}.json",
-        json.dumps(meta, indent=2).encode(),
-        f"Year model {option} {start_year} {datetime.now().strftime('%Y-%m-%d')}",
-        token
-    )
-    
-    # Generate predictions for the entire year to calculate metrics
-    proba = predict_binary_tfts(models, X_seq)
-    
-    # Get dates for predictions (aligned with sequences)
-    pred_dates = df_year.index[lookback:lookback + len(proba)]
-    
-    # Get actual returns for strategy calculation
-    y_fwd_year = fwd_model[target_etfs].loc[pred_dates].values
-    daily_ret_year = df_full.loc[pred_dates][target_etfs].fillna(0.0).values
-    
-    # Run strategy
-    strat_rets, _, _, _, _, _, _ = execute_strategy(
-        proba,
-        y_fwd_year,
-        pred_dates,
-        target_etfs,
-        fee_bps=15,
-        stop_loss_pct=-0.12,
-        z_reentry=1.0,
-        sofr=sofr,
-        z_min_entry=0.5,
-        daily_ret_override=daily_ret_year
-    )
-    
-    metrics = calculate_metrics(strat_rets, sofr)
-    
-    ann_return = round(metrics['ann_return'], 6)
-    sharpe = round(metrics['sharpe'], 6)
-    max_dd = round(metrics['max_dd'], 6)
-    
-    # Final signal (last prediction)
-    last_scores = proba[-1]
-    best_idx = np.argmax(last_scores)
-    next_signal = target_etfs[best_idx]
-    
-    # Save signals
-    sweep_data = {
-        "next_signal": next_signal,
-        "ann_return": ann_return,
-        "sharpe": sharpe,
-        "max_dd": max_dd,
-        "lookback_days": lookback,
-        "year": start_year,
-        "sweep_date": sweep_date,
-        "etf_scores": {
-            name: float(score)
-            for name, score in zip(target_etfs, last_scores)
-        },
-        "model_type": "yearwise",
-        "train_samples": len(X_train),
-        "val_samples": len(X_val)
-    }
-    
-    # Save to yearwise_sweep/option_{option}/
-    fname = f"{base_path}/signals_{start_year}_{sweep_date}.json"
-    
-    push_file_to_hf_dataset(
-        fname,
-        json.dumps(sweep_data, indent=2).encode(),
-        f"[yearwise sweep] {option} {start_year}",
-        token
-    )
-    
-    log.info(f"✅ Year {start_year} model complete: {fname}")
+        
+        metrics = calculate_metrics(strat_rets, sofr)
+        
+        ann_return = round(metrics['ann_return'], 6)
+        sharpe = round(metrics['sharpe'], 6)
+        max_dd = round(metrics['max_dd'], 6)
+        
+        # Final signal
+        last_scores = proba[-1]
+        best_idx = np.argmax(last_scores)
+        next_signal = target_etfs[best_idx]
+        
+        # Save signals
+        sweep_data = {
+            "next_signal": next_signal,
+            "ann_return": ann_return,
+            "sharpe": sharpe,
+            "max_dd": max_dd,
+            "lookback_days": lookback,
+            "year": start_year,
+            "sweep_date": sweep_date,
+            "etf_scores": {
+                name: float(score)
+                for name, score in zip(target_etfs, last_scores)
+            },
+            "model_type": "yearwise",
+            "train_samples": len(X_train),
+            "val_samples": len(X_val)
+        }
+        
+        operations.append(CommitOperationAdd(
+            path_in_repo=f"{base_path}/signals_{start_year}_{sweep_date}.json",
+            path_or_fileobj=json.dumps(sweep_data, indent=2).encode(),
+        ))
+        
+        # 🔴 CRITICAL: Single commit for all files
+        log.info(f"Uploading {len(operations)} files in single commit...")
+        api = HfApi()
+        
+        # Retry logic for the entire commit
+        max_retries = 5
+        for attempt in range(max_retries):
+            try:
+                api.create_commit(
+                    repo_id=HF_OUTPUT_REPO,
+                    repo_type="dataset",
+                    token=token,
+                    commit_message=f"[yearwise sweep] {option} {start_year} {sweep_date}",
+                    operations=operations,
+                )
+                log.info(f"✅ Year {start_year} complete: All {len(operations)} files uploaded in single commit")
+                break
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    wait = 2 ** attempt
+                    log.warning(f"Commit attempt {attempt+1} failed: {e}. Retrying in {wait}s...")
+                    time.sleep(wait)
+                else:
+                    raise RuntimeError(f"Failed to commit after {max_retries} attempts: {e}")
+        
+    finally:
+        # Cleanup temp files
+        for temp_file in temp_files:
+            try:
+                os.unlink(temp_file)
+            except:
+                pass
 
 
 # ─────────────────────────────────────────────────────────────────────────────

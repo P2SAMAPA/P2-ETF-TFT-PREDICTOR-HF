@@ -2,7 +2,7 @@ name: Consensus Sweep (All Years)
 
 on:
   schedule:
-    - cron: "0 1 * * 2-6"    # 01:00 UTC = 8pm EST Mon–Fri (nightly auto-sweep)
+    - cron: "0 1 * * 2-6"    # 01:00 UTC = 8pm EST Mon–Fri
   workflow_dispatch:
 
 jobs:
@@ -11,9 +11,9 @@ jobs:
     timeout-minutes: 180
     strategy:
       fail-fast: false
-      max-parallel: 10
+      max-parallel: 5  # Reduced to avoid HF rate limits
       matrix:
-        year: [2008, 2009, 2010, 2011, 2012, 2013, 2014, 2015, 2016, 2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025]
+        year: [2008, 2009, 2010, 2011, 2012, 2013, 2014, 2015, 2016, 2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025, 2026]  # Added 2026
         option: [a, b]
     env:
       HF_TOKEN:     ${{ secrets.HF_TOKEN }}

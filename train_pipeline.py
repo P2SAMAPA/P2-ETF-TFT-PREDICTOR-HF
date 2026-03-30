@@ -368,12 +368,16 @@ def train_global(option, force_refresh, token):
         
         models.append(model)
         
-        # Save weights to option-specific folder
-        weights_bytes = io.BytesIO()
-        model.save_weights(weights_bytes)
+        # 🔴 CRITICAL FIX: save_weights requires actual file path with .weights.h5 suffix
+        with tempfile.NamedTemporaryFile(suffix=".weights.h5", delete=False) as tmp_weights:
+            model.save_weights(tmp_weights.name)
+            tmp_weights.flush()
+            with open(tmp_weights.name, 'rb') as f:
+                weights_bytes = f.read()
+        
         push_file_to_hf_dataset(
             f"{base_path}/{etf}.weights.h5",
-            weights_bytes.getvalue(),
+            weights_bytes,
             f"Global model {option} {datetime.now().strftime('%Y-%m-%d')}",
             token
         )

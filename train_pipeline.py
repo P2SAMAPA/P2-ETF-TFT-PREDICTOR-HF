@@ -416,18 +416,31 @@ def train_year(option, force_refresh, start_year, sweep_date, token):
     """
     Train per-year model for specific year and save to yearwise_sweep/option_{option}/
     All files uploaded in a single commit to avoid rate limits.
+    
+    For 2026 (current year), uses data up to today and buffers from previous year for lookback.
     """
     from models import build_binary_tft, predict_binary_tfts
     from strategy import execute_strategy, calculate_metrics
     from sklearn.preprocessing import StandardScaler
     from huggingface_hub import CommitOperationAdd, HfApi
     import tensorflow as tf
+    from datetime import datetime
     
     log.info(f"Training per-year model for Option {option.upper()}, year {start_year}")
     
-    # Prepare data for the specific year (with buffer for lookback)
-    buffer_years = 2
-    data_start_year = max(2008, start_year - buffer_years)
+    # 🔴 CRITICAL: Handle 2026 (current year) specially
+    current_year = datetime.now().year
+    is_current_year = (start_year == current_year)
+    
+    if is_current_year:
+        # For current year, we need buffer from previous year for lookback
+        buffer_years = 3  # More buffer for current year
+        data_start_year = max(2008, start_year - buffer_years)
+        log.info(f"Current year {start_year} detected - using extended buffer from {data_start_year}")
+    else:
+        # Historical years - normal buffer
+        buffer_years = 2
+        data_start_year = max(2008, start_year - buffer_years)
     
     df_full, df_model, fwd_model, binary_targets, target_etfs, input_features, sofr, rf_label = prepare_data(
         option, data_start_year, force_refresh
@@ -445,7 +458,13 @@ def train_year(option, force_refresh, start_year, sweep_date, token):
         log.warning(f"No data for year {start_year}, skipping")
         return
     
-    log.info(f"Training on {len(df_year)} samples for year {start_year}")
+    # 🔴 For current year, check if we have enough data
+    min_required_samples = 60 + 20  # lookback + some buffer
+    if is_current_year and len(df_year) < min_required_samples:
+        log.warning(f"Current year {start_year} has only {len(df_year)} samples, need {min_required_samples}. Waiting for more data.")
+        return
+    
+    log.info(f"Training on {len(df_year)} samples for year {start_year} (current year: {is_current_year})")
     
     # Scale data (fit on year data only)
     scaler = StandardScaler()
@@ -466,7 +485,7 @@ def train_year(option, force_refresh, start_year, sweep_date, token):
     X_seq = np.array(X_seq, dtype=np.float32)
     y_seq = np.array(y_seq, dtype=np.int32)
     
-    # Train/val split (80/20)
+    # Train/val split (80/20) - for current year, this gives us train on earlier part, val on recent
     n = len(X_seq)
     train_end = int(n * 0.8)
     
@@ -478,7 +497,7 @@ def train_year(option, force_refresh, start_year, sweep_date, token):
     
     # 🔴 CRITICAL: Collect all files for single commit
     operations = []
-    temp_files = []  # Track temp files for cleanup
+    temp_files = []
     
     try:
         # Train models for each ETF
@@ -528,7 +547,7 @@ def train_year(option, force_refresh, start_year, sweep_date, token):
             ))
             log.info(f"Prepared {etf}_{start_year}.weights.h5 for upload")
         
-        # Save scaler to temp file
+        # Save scaler
         scaler_bytes = io.BytesIO()
         pickle.dump(scaler, scaler_bytes)
         scaler_bytes.seek(0)
@@ -538,7 +557,7 @@ def train_year(option, force_refresh, start_year, sweep_date, token):
             path_or_fileobj=scaler_bytes.getvalue(),
         ))
         
-        # Save meta
+        # Save meta with current year flag
         meta = {
             'lookback': lookback,
             'num_features': len(input_features),
@@ -546,9 +565,11 @@ def train_year(option, force_refresh, start_year, sweep_date, token):
             'input_features': input_features,
             'option': option,
             'year': start_year,
+            'is_current_year': is_current_year,
             'train_date': datetime.now().isoformat(),
             'train_samples': len(X_train),
-            'val_samples': len(X_val)
+            'val_samples': len(X_val),
+            'total_samples_2026': len(df_year) if is_current_year else None
         }
         
         operations.append(CommitOperationAdd(
@@ -600,6 +621,7 @@ def train_year(option, force_refresh, start_year, sweep_date, token):
             "lookback_days": lookback,
             "year": start_year,
             "sweep_date": sweep_date,
+            "is_current_year": is_current_year,
             "etf_scores": {
                 name: float(score)
                 for name, score in zip(target_etfs, last_scores)
@@ -626,7 +648,7 @@ def train_year(option, force_refresh, start_year, sweep_date, token):
                     repo_id=HF_OUTPUT_REPO,
                     repo_type="dataset",
                     token=token,
-                    commit_message=f"[yearwise sweep] {option} {start_year} {sweep_date}",
+                    commit_message=f"[yearwise sweep] {option} {start_year} {sweep_date} {'YTD' if is_current_year else ''}",
                     operations=operations,
                 )
                 log.info(f"✅ Year {start_year} complete: All {len(operations)} files uploaded in single commit")
@@ -646,8 +668,6 @@ def train_year(option, force_refresh, start_year, sweep_date, token):
                 os.unlink(temp_file)
             except:
                 pass
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # ENTRY
 # ─────────────────────────────────────────────────────────────────────────────

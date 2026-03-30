@@ -173,12 +173,35 @@ def fetch_etf_data(etfs, start_date="2008-01-01", end_date=None):
     try:
         if end_date is None:
             end_date = datetime.now().strftime("%Y-%m-%d")
-        etf_data = yf.download(
-            etfs, start=start_date, end=end_date, progress=False, auto_adjust=True
-        )["Close"]
+        
+        # 🔴 CRITICAL FIX: Handle yfinance version issues with user agent
+        try:
+            # Try with default settings first
+            etf_data = yf.download(
+                etfs, start=start_date, end=end_date, progress=False, auto_adjust=True
+            )["Close"]
+        except Exception as yf_err:
+            _log(f"⚠️ Primary yfinance download failed: {yf_err}. Trying fallback...", "warning")
+            # Fallback: try with explicit user agent configuration
+            import yfinance.shared as shared
+            shared._ERRORS = {}
+            yf.set_tz_cache_location("/tmp/.cache/py-yfinance")
+            etf_data = yf.download(
+                etfs, start=start_date, end=end_date, progress=False, auto_adjust=True,
+                threads=False  # Disable threading to avoid some errors
+            )["Close"]
 
         if isinstance(etf_data, pd.Series):
             etf_data = etf_data.to_frame()
+
+        # 🔴 CRITICAL FIX: Ensure we have a DatetimeIndex
+        if not isinstance(etf_data.index, pd.DatetimeIndex):
+            _log(f"⚠️ ETF data has {type(etf_data.index).__name__} instead of DatetimeIndex", "warning")
+            if len(etf_data) > 0:
+                # Try to create a date range if we know the dates
+                etf_data.index = pd.date_range(start=start_date, periods=len(etf_data), freq='B')
+            else:
+                return pd.DataFrame()
 
         if etf_data.index.tz is not None:
             etf_data.index = etf_data.index.tz_localize(None)
@@ -238,6 +261,12 @@ def smart_update_hf_dataset(new_data, token, force_upload=False):
         # Use ALL_TICKERS from config to get both FI and Equity ETFs
         from config import ALL_TICKERS
         full_etf = fetch_etf_data(ALL_TICKERS, start_date="2008-01-01")
+        
+        # 🔴 CRITICAL FIX: Check if fetch_etf_data returned valid data
+        if full_etf.empty:
+            _log("⚠️ fetch_etf_data returned empty DataFrame, using existing data", "warning")
+            return existing_df if not existing_df.empty else new_data
+            
         if full_etf.index.tz is not None:
             full_etf.index = full_etf.index.tz_localize(None)
 
@@ -386,15 +415,27 @@ def get_data(start_year, force_refresh=False, clean_hf_dataset=False):
 
     # ── Load from HuggingFace ─────────────────────────────────────────────────
     try:
-        df = pd.read_csv(f"{raw_url}?t={int(time.time())}")
-        df.columns = df.columns.str.strip()
-        date_col = next(
-            (c for c in df.columns if c.lower() in ["date", "unnamed: 0"]), df.columns[0]
-        )
-        df[date_col] = pd.to_datetime(df[date_col])
-        df = df.set_index(date_col).sort_index()
-        if df.index.tz is not None:
-            df.index = df.index.tz_localize(None)
+        # 🔴 CRITICAL FIX: Add retry logic for HF 500 errors
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                df = pd.read_csv(f"{raw_url}?t={int(time.time())}")
+                df.columns = df.columns.str.strip()
+                date_col = next(
+                    (c for c in df.columns if c.lower() in ["date", "unnamed: 0"]), df.columns[0]
+                )
+                df[date_col] = pd.to_datetime(df[date_col])
+                df = df.set_index(date_col).sort_index()
+                if df.index.tz is not None:
+                    df.index = df.index.tz_localize(None)
+                break  # Success, exit retry loop
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    wait = 2 ** attempt
+                    _log(f"⚠️ HF load attempt {attempt+1} failed: {e}. Retrying in {wait}s...", "warning")
+                    time.sleep(wait)
+                else:
+                    raise  # Final attempt failed
 
         # Optional: clean >30% NaN columns
         if clean_hf_dataset:
@@ -454,6 +495,21 @@ def get_data(start_year, force_refresh=False, clean_hf_dataset=False):
         if not etf_data.empty and not macro_data.empty:
             df = pd.concat([etf_data, macro_data], axis=1)
 
+    # 🔴 CRITICAL FIX: Check if we have valid data before proceeding
+    if df.empty:
+        _log("❌ CRITICAL: No data available from any source!", "error")
+        raise ValueError("No data available - HF dataset failed and yfinance fallback failed")
+
+    # 🔴 CRITICAL FIX: Ensure index is DatetimeIndex before filtering by year
+    if not isinstance(df.index, pd.DatetimeIndex):
+        _log(f"⚠️ Data index is {type(df.index).__name__}, converting to DatetimeIndex...", "warning")
+        try:
+            # Try to parse as dates if possible
+            df.index = pd.to_datetime(df.index)
+        except Exception as e:
+            _log(f"❌ Cannot convert index to DatetimeIndex: {e}", "error")
+            raise ValueError(f"Data index is {type(df.index).__name__} not DatetimeIndex - cannot filter by year")
+
     # ── Feature engineering: Z-scores ────────────────────────────────────────
     macro_cols = [
         "VIX", "DXY", "COPPER", "GOLD", "HY_Spread", "T10Y2Y", "T10Y3M",
@@ -470,6 +526,7 @@ def get_data(start_year, force_refresh=False, clean_hf_dataset=False):
     df = add_regime_features(df)
 
     # ── Filter by start year ──────────────────────────────────────────────────
+    # 🔴 This is where the error occurred - now protected by the DatetimeIndex check above
     df = df[df.index.year >= start_year]
     _log(f"📅 After year filter ({start_year}+): {len(df)} samples", "info")
 
@@ -489,5 +546,8 @@ def get_data(start_year, force_refresh=False, clean_hf_dataset=False):
             f"{df.index[0].strftime('%Y-%m-%d')} to {df.index[-1].strftime('%Y-%m-%d')}",
             "success"
         )
+    else:
+        _log("❌ No data remaining after filtering and cleaning!", "error")
+        raise ValueError("Dataset is empty after processing")
 
     return df

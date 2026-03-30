@@ -185,7 +185,114 @@ def load_global_model(option, token):
 
     return models, scaler, meta
 
+def predict_global(option, year, sweep_date, force_refresh, token):
+    from models import predict_binary_tfts
+    from strategy import execute_strategy, calculate_metrics
 
+    log.info(f"Global prediction for Option {option.upper()}, year {year}")
+
+    # Load global model
+    models, scaler, meta = load_global_model(option, token)
+
+    lookback = meta['lookback']
+    target_etfs = meta['target_etfs']
+    input_features = meta['input_features']
+
+    # Prepare data
+    df_full, df_model, fwd_model, binary_targets, _, _, sofr, rf_label = prepare_data(
+        option, 2008, force_refresh
+    )
+
+    # Scale full dataset
+    X_full_scaled = scaler.transform(df_model[input_features].values)
+    dates = df_model.index
+
+    # Build sequences
+    X_seq, seq_dates = [], []
+    for i in range(lookback, len(X_full_scaled) - 1):
+        X_seq.append(X_full_scaled[i - lookback:i])
+        seq_dates.append(dates[i + 1])
+
+    X_seq = np.array(X_seq, dtype=np.float32)
+    seq_dates = pd.DatetimeIndex(seq_dates)
+
+    # Filter for requested year
+    start = pd.Timestamp(f"{year}-01-01")
+    end = pd.Timestamp(f"{year}-12-31")
+
+    mask = (seq_dates >= start) & (seq_dates <= end)
+
+    X_test_year = X_seq[mask]
+    test_dates_year = seq_dates[mask]
+
+    if len(X_test_year) == 0:
+        log.warning(f"No test sequences for year {year}")
+        return
+
+    # Targets
+    y_fwd_full = fwd_model[target_etfs].loc[seq_dates]
+    y_bin_full = binary_targets[target_etfs].loc[seq_dates]
+
+    y_fwd_test = y_fwd_full.loc[test_dates_year].values
+    y_bin_test = y_bin_full.loc[test_dates_year].values
+
+    # Predictions
+    proba = predict_binary_tfts(models, X_test_year)
+
+    # Strategy
+    daily_ret_test = df_full.loc[test_dates_year][target_etfs].fillna(0.0).values
+
+    strat_rets, _, _, _, _, _, _ = execute_strategy(
+        proba,
+        y_fwd_test,
+        test_dates_year,
+        target_etfs,
+        fee_bps=15,
+        stop_loss_pct=-0.12,
+        z_reentry=1.0,
+        sofr=sofr,
+        z_min_entry=0.5,
+        daily_ret_override=daily_ret_test
+    )
+
+    metrics = calculate_metrics(strat_rets, sofr)
+
+    ann_return = round(metrics['ann_return'], 6)
+    sharpe = round(metrics['sharpe'], 6)
+    max_dd = round(metrics['max_dd'], 6)
+
+    # Final signal
+    last_scores = proba[-1]
+    best_idx = np.argmax(last_scores)
+
+    next_signal = target_etfs[best_idx]
+
+    sweep_data = {
+        "next_signal": next_signal,
+        "ann_return": ann_return,
+        "sharpe": sharpe,
+        "max_dd": max_dd,
+        "lookback_days": lookback,
+        "start_year": year,
+        "sweep_date": sweep_date,
+        "etf_scores": {
+            name: float(score)
+            for name, score in zip(target_etfs, last_scores)
+        },
+        "model_type": "global"
+    }
+
+    # 🔥 THIS is what saves to HF
+    fname = f"global_sweep/option_{option}/signals_{year}_{sweep_date}.json"
+
+    push_file_to_hf_dataset(
+        fname,
+        json.dumps(sweep_data, indent=2).encode(),
+        f"[global sweep] {year}",
+        token
+    )
+
+    log.info(f"✅ Saved: {fname}")
 # ─────────────────────────────────────────────────────────────────────────────
 # ENTRY
 # ─────────────────────────────────────────────────────────────────────────────

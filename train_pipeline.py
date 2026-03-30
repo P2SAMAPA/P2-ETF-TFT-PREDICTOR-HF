@@ -344,6 +344,13 @@ def train_global(option, force_refresh, token):
         log.info(f"Training model for {etf}")
         model = build_binary_tft(seq_len=lookback, num_features=len(input_features))
         
+        # 🔴 CRITICAL FIX: Compile the model before training
+        model.compile(
+            optimizer=tf.keras.optimizers.Adam(learning_rate=0.001),
+            loss='binary_crossentropy',
+            metrics=['accuracy']
+        )
+        
         # Callbacks
         early_stop = tf.keras.callbacks.EarlyStopping(
             monitor='val_loss', patience=10, restore_best_weights=True

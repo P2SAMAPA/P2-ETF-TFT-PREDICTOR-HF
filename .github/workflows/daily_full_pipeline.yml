@@ -1,0 +1,99 @@
+name: Daily Data Update & Full Retraining
+
+on:
+  schedule:
+    - cron: "0 6 * * 1-5"   # 6 AM UTC Mon-Fri (1 AM EST)
+  workflow_dispatch:
+
+env:
+  HF_TOKEN: ${{ secrets.HF_TOKEN }}
+  FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+
+jobs:
+  # STEP 1: Update Data
+  update_data:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+      - run: pip install --no-cache-dir -r requirements-training.txt
+      - name: Update ETF Data
+        run: python -c "from data_manager import get_data; get_data(2008, force_refresh=True)"
+
+  # STEP 2: Train Global Models (Option A & B)
+  train_global_a:
+    needs: update_data  # Wait for data update
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+      - run: pip install --no-cache-dir -r requirements-training.txt
+      - name: Train Global Model A
+        run: python train_pipeline.py --option a --mode train-global
+
+  train_global_b:
+    needs: update_data  # Wait for data update
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+      - run: pip install --no-cache-dir -r requirements-training.txt
+      - name: Train Global Model B
+        run: python train_pipeline.py --option b --mode train-global
+
+  # STEP 3: Global Consensus (All Years 2008-2026)
+  global_consensus:
+    needs: [train_global_a, train_global_b]  # Wait for both global models
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        year: [2008, 2009, 2010, 2011, 2012, 2013, 2014, 2015, 2016, 2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025, 2026]
+        option: [a, b]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+      - run: pip install --no-cache-dir -r requirements-training.txt
+      - name: Global Consensus ${{ matrix.option }} ${{ matrix.year }}
+        run: |
+          SWEEP_DATE=$(date -u -d "-5 hours" +%Y%m%d 2>/dev/null || date -u +%Y%m%d)
+          python train_pipeline.py --option ${{ matrix.option }} --year ${{ matrix.year }} --sweep-date $SWEEP_DATE --mode predict-global
+
+  # STEP 4: Yearwise Sweep (All Years including 2026 YTD)
+  yearwise_sweep:
+    needs: global_consensus  # Wait for global consensus (optional, can parallel)
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      max-parallel: 5  # Limit parallel to avoid HF rate limits
+      matrix:
+        year: [2008, 2009, 2010, 2011, 2012, 2013, 2014, 2015, 2016, 2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025, 2026]
+        option: [a, b]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+      - run: pip install --no-cache-dir -r requirements-training.txt
+      - name: Yearwise Sweep ${{ matrix.option }} ${{ matrix.year }}
+        run: |
+          SWEEP_DATE=$(date -u -d "-5 hours" +%Y%m%d 2>/dev/null || date -u +%Y%m%d)
+          python train_pipeline.py --option ${{ matrix.option }} --start-year ${{ matrix.year }} --sweep-date $SWEEP_DATE

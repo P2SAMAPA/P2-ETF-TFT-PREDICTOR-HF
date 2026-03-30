@@ -309,3 +309,38 @@ if __name__ == "__main__":
         raise RuntimeError("HF_TOKEN missing")
 
     log.info("Pipeline start")
+
+    if args.mode == "train-global":
+        train_global(args.option, args.force_refresh, token)
+
+    elif args.mode == "predict-global":
+        if args.year is None:
+            raise ValueError("--year required for predict-global")
+
+        sweep_date = args.sweep_date or (
+            datetime.now(timezone.utc) - timedelta(hours=5)
+        ).strftime("%Y%m%d")
+
+        predict_global(
+            args.option,
+            args.year,
+            sweep_date,
+            args.force_refresh,
+            token
+        )
+
+    else:  # train-year
+        if args.start_year is None:
+            args.start_year = 2008
+
+        sweep_date = args.sweep_date or (
+            datetime.now(timezone.utc) - timedelta(hours=5)
+        ).strftime("%Y%m%d")
+
+        train_year(
+            args.option,
+            args.force_refresh,
+            args.start_year,
+            sweep_date,
+            token
+        )

@@ -25,22 +25,29 @@ if 'approach' not in st.session_state:
 def get_latest_sweep_files(option_key, approach):
     api = HfApi()
     try:
-        prefix = "sweep" if approach == "Per-Year Models" else "global_sweep"
-        base = f"{prefix}/option_{option_key}/signals_"
-        files = api.list_repo_files(repo_id=HF_OUTPUT_REPO, repo_type="dataset")
+        # 🔴 FIX 1: Map approach to folder names - support both old 'sweep' and new 'yearwise_sweep'
+        if approach == "Per-Year Models":
+            prefixes = ["yearwise_sweep", "sweep"]  # Try new first, then old
+        else:
+            prefixes = ["global_sweep"]
+            
         year_files = {}
-        for f in files:
-            if f.startswith(base) and f.endswith(".json"):
-                parts = f.replace(".json", "").split("_")
-                if len(parts) >= 3:
-                    year_str = parts[-2]
-                    date_str = parts[-1]
-                    try:
-                        year = int(year_str)
-                        if year not in year_files or date_str > year_files[year][1]:
-                            year_files[year] = (f, date_str)
-                    except:
-                        pass
+        files = api.list_repo_files(repo_id=HF_OUTPUT_REPO, repo_type="dataset")
+        
+        for prefix in prefixes:
+            base = f"{prefix}/option_{option_key}/signals_"
+            for f in files:
+                if f.startswith(base) and f.endswith(".json"):
+                    parts = f.replace(".json", "").split("_")
+                    if len(parts) >= 3:
+                        year_str = parts[-2]
+                        date_str = parts[-1]
+                        try:
+                            year = int(year_str)
+                            if year not in year_files or date_str > year_files[year][1]:
+                                year_files[year] = (f, date_str)
+                        except:
+                            pass
         return year_files
     except Exception as e:
         st.error(f"Error listing files: {e}")
@@ -56,6 +63,36 @@ def load_sweep_json(file_path):
         st.warning(f"Could not load {file_path}: {e}")
         return None
 
+def clean_etf_name(name):
+    """🔴 FIX 2: Strip _Ret suffix from ETF names"""
+    if name and isinstance(name, str):
+        return name.replace('_Ret', '')
+    return name
+
+def calculate_conviction_z(scores):
+    """🔴 FIX 3: Calculate conviction_z from etf_scores if missing"""
+    if not scores:
+        return None, None
+    
+    values = list(scores.values())
+    if not values:
+        return None, None
+    
+    max_score = max(values)
+    mean_score = np.mean(values)
+    std_score = np.std(values) + 1e-9
+    z_score = (max_score - mean_score) / std_score
+    
+    # Determine label
+    if z_score > 1.5:
+        label = "Strong"
+    elif z_score > 0.8:
+        label = "Moderate"
+    else:
+        label = "Weak"
+    
+    return z_score, label
+
 def compute_combined_consensus(year_files, decay_alpha=0.9, perf_weight=0.7, freq_weight=0.3):
     """
     Consensus using:
@@ -68,15 +105,30 @@ def compute_combined_consensus(year_files, decay_alpha=0.9, perf_weight=0.7, fre
     for year, (file_path, _) in year_files.items():
         data = load_sweep_json(file_path)
         if data and 'etf_scores' in data:
+            # 🔴 FIX 4: Clean ETF names and calculate missing fields
+            raw_scores = data['etf_scores']
+            data['etf_scores'] = {clean_etf_name(k): v for k, v in raw_scores.items()}
+            
+            # Calculate conviction_z if missing
+            if 'conviction_z' not in data or data['conviction_z'] is None or data['conviction_z'] == 'N/A':
+                z, _ = calculate_conviction_z(data['etf_scores'])
+                data['conviction_z'] = z
+            
+            # Clean next_signal
+            if 'next_signal' in data:
+                data['next_signal'] = clean_etf_name(data['next_signal'])
+            
             ann_ret = data.get('ann_return')
             conv_z = data.get('conviction_z')
             sharpe = data.get('sharpe')
             max_dd = data.get('max_dd')
-            if None not in (ann_ret, conv_z, sharpe, max_dd):
+            
+            # Only require ann_return and sharpe (conv_z might be None)
+            if ann_ret is not None and sharpe is not None and max_dd is not None:
                 years_data.append({
                     'year': year,
                     'ann_return': ann_ret,
-                    'conviction_z': conv_z,
+                    'conviction_z': conv_z if conv_z is not None else 0,
                     'sharpe': sharpe,
                     'max_dd': max_dd,
                     'etf_scores': data['etf_scores'],
@@ -215,7 +267,7 @@ with st.sidebar:
 st.title("ETF Temporal Fusion Transformer Predictor")
 tab1, tab2 = st.tabs(["Single Year", "Consensus Sweep"])
 
-# Tab 1: Single Year (unchanged)
+# Tab 1: Single Year (with fixes)
 with tab1:
     st.subheader("Single‑Year Prediction")
     years = list(range(2008, 2026))
@@ -226,25 +278,53 @@ with tab1:
         data = load_sweep_json(file_path)
         if data:
             st.success(f"Data for {selected_year} (run {date_tag})")
-            next_signal = data.get('next_signal', 'N/A')
-            conv_z = data.get('conviction_z', 'N/A')
-            conv_label = data.get('conviction_label', 'N/A')
-            next_date = data.get('next_date', 'Not available')
+            
+            # 🔴 FIX: Clean and process data
+            next_signal = clean_etf_name(data.get('next_signal', 'N/A'))
+            
+            # Calculate conviction if missing
+            scores = data.get('etf_scores', {})
+            if scores:
+                scores = {clean_etf_name(k): v for k, v in scores.items()}
+                data['etf_scores'] = scores
+            
+            if 'conviction_z' not in data or data['conviction_z'] is None or data['conviction_z'] == 'N/A':
+                conv_z, conv_label = calculate_conviction_z(scores)
+                data['conviction_z'] = conv_z if conv_z is not None else 'N/A'
+                data['conviction_label'] = conv_label if conv_label else 'N/A'
+            else:
+                conv_z = data['conviction_z']
+                # Determine label if not present
+                if 'conviction_label' not in data:
+                    if conv_z > 1.5:
+                        data['conviction_label'] = "Strong"
+                    elif conv_z > 0.8:
+                        data['conviction_label'] = "Moderate"
+                    else:
+                        data['conviction_label'] = "Weak"
+            
+            conv_z_display = f"{data['conviction_z']:.2f}" if isinstance(data['conviction_z'], (int, float)) else data['conviction_z']
+            
             col1, col2, col3 = st.columns(3)
             with col1:
                 st.metric("📈 Next Trading Day Signal", next_signal)
             with col2:
-                st.metric("Conviction Z‑score", f"{conv_z:.2f}" if isinstance(conv_z, (int, float)) else conv_z)
+                st.metric("Conviction Z‑score", conv_z_display)
             with col3:
-                st.metric("Conviction Label", conv_label)
-            st.caption(f"*For trading date: {next_date}*")
+                st.metric("Conviction Label", data.get('conviction_label', 'N/A'))
+            
+            # Show model type info
+            model_type = data.get('model_type', 'unknown')
+            st.caption(f"*Model type: {model_type}*")
+            
             st.markdown("---")
-            scores = data.get('etf_scores', {})
+            
             if scores:
                 df_scores = pd.DataFrame(list(scores.items()), columns=['ETF', 'Score'])
                 df_scores = df_scores.sort_values('Score', ascending=True)
                 fig = px.bar(df_scores, x='Score', y='ETF', orientation='h', title="ETF Conviction Scores")
                 st.plotly_chart(fig, use_container_width=True)
+            
             st.subheader("Strategy Metrics for this Year")
             col1, col2, col3 = st.columns(3)
             with col1:
@@ -256,9 +336,9 @@ with tab1:
         else:
             st.warning(f"Could not load data for {selected_year}")
     else:
-        st.info(f"No sweep data available for {selected_year}")
+        st.info(f"No sweep data available for {selected_year}. Available years: {list(year_files.keys())}")
 
-# Tab 2: Consensus Sweep (new combined method)
+# Tab 2: Consensus Sweep (with fixes)
 with tab2:
     st.subheader("Weighted Consensus Across All Years")
     st.markdown("**Combined method:**")
@@ -269,7 +349,9 @@ with tab2:
     year_files = get_latest_sweep_files(option_key, st.session_state.approach)
     if not year_files:
         st.warning("No sweep files found. Please run the consensus sweep workflow first.")
+        st.info(f"Looking for: {st.session_state.approach} with option {option_key}")
     else:
+        st.info(f"Found {len(year_files)} years of data: {sorted(year_files.keys())}")
         final_scores, df_weights = compute_combined_consensus(year_files, decay_alpha=0.9, perf_weight=0.7, freq_weight=0.3)
         if final_scores:
             top_etf = max(final_scores, key=final_scores.get)
@@ -297,4 +379,5 @@ with tab2:
                 }))
                 st.caption("Weight = base performance weight (positive years only) × decay factor (α^(latest_year - year)). Zero for negative return years.")
         else:
-            st.error("Could not compute consensus – missing data.")
+            st.error("Could not compute consensus – missing data or no valid years found.")
+            st.info("Debug: Check that sweep files contain 'ann_return', 'sharpe', 'max_dd', and 'etf_scores' fields.")

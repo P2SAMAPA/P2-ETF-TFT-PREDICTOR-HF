@@ -1,7 +1,7 @@
 """
 train_pipeline.py — FINAL CORRECTED VERSION
-Global model training writes ONLY to option_{option}/global_model/
-No root-level global_model folder.
+Global model training writes ONLY to global_model/ (root level)
+No option_{option}/global_model subfolder structure.
 """
 
 import os, sys, json, logging, argparse, numpy as np, pandas as pd
@@ -152,9 +152,10 @@ def prepare_data(option, start_year, force_refresh):
 def load_global_model(option, token):
     import tensorflow as tf, pickle
     from models import build_binary_tft
+    from config import OPTION_A_ETFS, OPTION_B_ETFS
 
-    # FIXED PATH
-    base = f"option_{option}/global_model"
+    # FIXED PATH - look in root global_model/ instead of option_{option}/global_model/
+    base = "global_model"
 
     meta_path = download_file_from_hf_dataset(f"{base}/meta.json", token)
 
@@ -163,7 +164,18 @@ def load_global_model(option, token):
 
     lookback = meta['lookback']
     num_features = meta.get('num_features', len(meta['input_features']))
-    target_etfs = meta['target_etfs']
+    all_target_etfs = meta['target_etfs']
+
+    # Filter ETFs by option (a or b)
+    if option == 'a':
+        valid_labels = set(OPTION_A_ETFS)
+    else:
+        valid_labels = set(OPTION_B_ETFS)
+    
+    target_etfs = [etf for etf in all_target_etfs if any(label in etf for label in valid_labels)]
+    
+    if not target_etfs:
+        raise ValueError(f"No ETFs found for option {option} in global model. Available: {all_target_etfs}")
 
     models = []
 
@@ -172,7 +184,8 @@ def load_global_model(option, token):
             w_path = download_file_from_hf_dataset(f"{base}/{etf}.weights.h5", token)
             model = build_binary_tft(seq_len=lookback, num_features=num_features)
             model.load_weights(w_path)
-        except:
+        except Exception as e:
+            log.warning(f"Failed to load weights for {etf}, trying full model: {e}")
             full_path = download_file_from_hf_dataset(f"{base}/{etf}.h5", token)
             model = tf.keras.models.load_model(full_path)
 
@@ -182,8 +195,12 @@ def load_global_model(option, token):
 
     with open(scaler_path, 'rb') as f:
         scaler = pickle.load(f)
+    
+    # Update meta to only include ETFs for this option
+    meta['target_etfs'] = target_etfs
 
     return models, scaler, meta
+
 
 def predict_global(option, year, sweep_date, force_refresh, token):
     from models import predict_binary_tfts
@@ -195,7 +212,7 @@ def predict_global(option, year, sweep_date, force_refresh, token):
     models, scaler, meta = load_global_model(option, token)
 
     lookback = meta['lookback']
-    target_etfs = meta['target_etfs']
+    target_etfs = meta['target_etfs']  # Now filtered to this option only
     input_features = meta['input_features']
 
     # Prepare data
@@ -282,7 +299,7 @@ def predict_global(option, year, sweep_date, force_refresh, token):
         "model_type": "global"
     }
 
-    # 🔥 THIS is what saves to HF
+    # 🔥 THIS is what saves to HF - fixed path to match expected structure
     fname = f"global_sweep/option_{option}/signals_{year}_{sweep_date}.json"
 
     push_file_to_hf_dataset(
@@ -293,6 +310,117 @@ def predict_global(option, year, sweep_date, force_refresh, token):
     )
 
     log.info(f"✅ Saved: {fname}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TRAINING FUNCTIONS (Placeholder - implement based on your needs)
+# ─────────────────────────────────────────────────────────────────────────────
+def train_global(option, force_refresh, token):
+    """Train global model for given option and upload to global_model/"""
+    from models import build_binary_tft
+    from sklearn.preprocessing import StandardScaler
+    import tensorflow as tf
+    
+    log.info(f"Training global model for Option {option.upper()}")
+    
+    # Prepare data
+    df_full, df_model, fwd_model, binary_targets, target_etfs, input_features, sofr, rf_label = prepare_data(
+        option, 2008, force_refresh
+    )
+    
+    # Scale data
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(df_model[input_features].values)
+    
+    # Build sequences
+    lookback = 60  # or from config
+    X_seq, y_seq = [], []
+    
+    for i in range(lookback, len(X_scaled)):
+        X_seq.append(X_scaled[i-lookback:i])
+        y_seq.append(binary_targets.iloc[i].values)
+    
+    X_seq = np.array(X_seq, dtype=np.float32)
+    y_seq = np.array(y_seq, dtype=np.int32)
+    
+    # Train/val split
+    n = len(X_seq)
+    train_end = int(n * TRAIN_PCT)
+    val_end = int(n * (TRAIN_PCT + VAL_PCT))
+    
+    X_train, y_train = X_seq[:train_end], y_seq[:train_end]
+    X_val, y_val = X_seq[train_end:val_end], y_seq[train_end:val_end]
+    
+    # Build and train models
+    models = []
+    for i, etf in enumerate(target_etfs):
+        log.info(f"Training model for {etf}")
+        model = build_binary_tft(seq_len=lookback, num_features=len(input_features))
+        
+        # Callbacks
+        early_stop = tf.keras.callbacks.EarlyStopping(
+            monitor='val_loss', patience=10, restore_best_weights=True
+        )
+        
+        # Train
+        model.fit(
+            X_train, y_train[:, i],
+            validation_data=(X_val, y_val[:, i]),
+            epochs=100,
+            batch_size=32,
+            callbacks=[early_stop],
+            verbose=0
+        )
+        
+        models.append(model)
+        
+        # Save weights
+        weights_bytes = io.BytesIO()
+        model.save_weights(weights_bytes)
+        push_file_to_hf_dataset(
+            f"global_model/{etf}.weights.h5",
+            weights_bytes.getvalue(),
+            f"Global model {option} {datetime.now().strftime('%Y-%m-%d')}",
+            token
+        )
+    
+    # Save scaler
+    scaler_bytes = io.BytesIO()
+    pickle.dump(scaler, scaler_bytes)
+    push_file_to_hf_dataset(
+        f"global_model/scaler.pkl",
+        scaler_bytes.getvalue(),
+        f"Global model {option} {datetime.now().strftime('%Y-%m-%d')}",
+        token
+    )
+    
+    # Save meta
+    meta = {
+        'lookback': lookback,
+        'num_features': len(input_features),
+        'target_etfs': target_etfs,
+        'input_features': input_features,
+        'option': option,
+        'train_date': datetime.now().isoformat()
+    }
+    
+    push_file_to_hf_dataset(
+        f"global_model/meta.json",
+        json.dumps(meta, indent=2).encode(),
+        f"Global model {option} {datetime.now().strftime('%Y-%m-%d')}",
+        token
+    )
+    
+    log.info(f"✅ Global model training complete for Option {option}")
+
+
+def train_year(option, force_refresh, start_year, sweep_date, token):
+    """Train per-year model (placeholder - implement based on your needs)"""
+    log.info(f"Training year model for Option {option.upper()}, starting {start_year}")
+    # Implementation depends on your specific per-year training logic
+    pass
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # ENTRY
 # ─────────────────────────────────────────────────────────────────────────────

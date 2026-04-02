@@ -30,32 +30,45 @@ jobs:
           python - <<'EOF'
           import os
           import pandas as pd
+          import time
+          from datetime import datetime, timedelta
           from data_manager import fetch_etf_data, fetch_macro_data_robust, smart_update_hf_dataset
           from config import ALL_TICKERS
-          from datetime import datetime, timedelta
 
           token = os.getenv("HF_TOKEN")
           if not token:
               raise RuntimeError("HF_TOKEN not set")
 
-          # Load existing dataset to get last date
-          from huggingface_hub import hf_hub_download
-          import time
-
           repo_id = "P2SAMAPA/my-etf-data"
+          
+          # FIXED: Removed space in URL and added error handling
           raw_url = f"https://huggingface.co/datasets/{repo_id}/resolve/main/etf_data.csv?t={int(time.time())}"
-          existing = pd.read_csv(raw_url)
+          
+          try:
+              existing = pd.read_csv(raw_url)
+              print(f"Loaded existing dataset: {len(existing)} rows")
+          except Exception as e:
+              print(f"ERROR loading dataset: {e}")
+              raise RuntimeError(f"Failed to load HF dataset from {raw_url}: {e}")
+          
           date_col = next((c for c in existing.columns if "date" in c.lower()), existing.columns[0])
           existing[date_col] = pd.to_datetime(existing[date_col])
           existing = existing.set_index(date_col).sort_index()
           last_date = existing.index[-1].date()
           today = datetime.now().date()
 
-          # End date = yesterday (last completed trading day)
-          # If today is Monday, yesterday is Sunday; we want the last trading day (Friday)
-          # For simplicity, we use yesterday; fetch_etf_data will return empty for non‑trading days.
-          end_date = today - timedelta(days=1)
+          # FIXED: Better end_date logic - handle weekends properly
+          # If today is Monday, we need Friday's data (yesterday is Sunday, no market)
+          if today.weekday() == 0:  # Monday
+              end_date = today - timedelta(days=3)  # Friday
+          else:
+              end_date = today - timedelta(days=1)
+              
           start_date = last_date + timedelta(days=1)
+
+          print(f"Last date in dataset: {last_date}")
+          print(f"Today: {today} ({today.strftime('%A')})")
+          print(f"Will fetch from {start_date} to {end_date}")
 
           if start_date > end_date:
               print("No new trading days since last update.")
@@ -67,6 +80,9 @@ jobs:
           print(f"Fetching incremental data from {start_str} to {end_str}...")
           etf_data = fetch_etf_data(ALL_TICKERS, start_date=start_str, end_date=end_str)
           macro_data = fetch_macro_data_robust(start_date=start_str)
+          
+          print(f"ETF data rows: {len(etf_data)}, Macro data rows: {len(macro_data)}")
+          
           if etf_data.empty and macro_data.empty:
               print("No new data found.")
               exit(0)

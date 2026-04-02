@@ -41,7 +41,7 @@ jobs:
 
           repo_id = "P2SAMAPA/my-etf-data"
           
-          # FIXED: Removed space in URL and added error handling
+          # FIXED: Removed space in URL
           raw_url = f"https://huggingface.co/datasets/{repo_id}/resolve/main/etf_data.csv?t={int(time.time())}"
           
           try:
@@ -54,8 +54,30 @@ jobs:
           date_col = next((c for c in existing.columns if "date" in c.lower()), existing.columns[0])
           existing[date_col] = pd.to_datetime(existing[date_col])
           existing = existing.set_index(date_col).sort_index()
+          
+          # CRITICAL FIX: Check if last row has actual data, not just date index
           last_date = existing.index[-1].date()
+          
+          # Get ETF columns (those ending in _Ret, _MA20, _Vol)
+          etf_data_cols = [c for c in existing.columns if any(c.endswith(suffix) for suffix in ['_Ret', '_MA20', '_Vol'])]
+          
+          if len(etf_data_cols) > 0:
+              last_row_data = existing.iloc[-1][etf_data_cols]
+              last_row_has_data = last_row_data.notna().any()  # True if ANY ETF has data
+              print(f"Last row ({last_date}) has data in {last_row_data.notna().sum()}/{len(etf_data_cols)} ETF columns")
+          else:
+              last_row_has_data = False
+              print("Warning: No ETF data columns found")
+          
           today = datetime.now().date()
+
+          # FIXED: If last row is empty (ghost row), re-fetch from that date
+          if last_row_has_data:
+              start_date = last_date + timedelta(days=1)
+              print(f"Last row has data, fetching from next day: {start_date}")
+          else:
+              start_date = last_date  # Re-fetch the empty last date
+              print(f"Last row is EMPTY (ghost row), re-fetching from: {start_date}")
 
           # FIXED: Better end_date logic - handle weekends properly
           # If today is Monday, we need Friday's data (yesterday is Sunday, no market)
@@ -63,10 +85,7 @@ jobs:
               end_date = today - timedelta(days=3)  # Friday
           else:
               end_date = today - timedelta(days=1)
-              
-          start_date = last_date + timedelta(days=1)
 
-          print(f"Last date in dataset: {last_date}")
           print(f"Today: {today} ({today.strftime('%A')})")
           print(f"Will fetch from {start_date} to {end_date}")
 

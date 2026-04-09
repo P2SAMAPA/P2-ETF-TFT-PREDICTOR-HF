@@ -6,7 +6,7 @@ OPTION_A_ETFS = ["TLT", "VCIT", "LQD", "HYG", "VNQ", "GLD", "SLV"]
 # Option B: Equity Sectors (new)
 # Note: SPY is excluded because it's used as the benchmark
 OPTION_B_ETFS = [
-    "QQQ", "XLK", "XLF", "XLE", "XLV", "XLI",
+    "QQQ", "XLK", "XLF", "XLE", "XLV", "XLI", "XLB", "XLRE",
     "XLY", "XLP", "XLU", "GDX", "XME"
 ]
 

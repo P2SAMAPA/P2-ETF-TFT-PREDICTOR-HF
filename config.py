@@ -7,7 +7,7 @@ OPTION_A_ETFS = ["TLT", "VCIT", "LQD", "HYG", "VNQ", "GLD", "SLV"]
 # Note: SPY is excluded because it's used as the benchmark
 OPTION_B_ETFS = [
     "QQQ", "XLK", "XLF", "XLE", "XLV", "XLI", "XLB", "XLRE",
-    "XLY", "XLP", "XLU", "GDX", "XME"
+    "XLY", "XLP", "XLU", "GDX", "XME", "IWF", "IWM", "XSD", "XBI"
 ]
 
 # Benchmarks (shared)
